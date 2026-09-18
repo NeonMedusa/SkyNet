@@ -288,6 +288,8 @@ pub const ToolCallAccumulator = struct {
 
 const StreamChoice = struct {
     delta: StreamDelta = .{},
+    /// 终止原因（"stop"/"tool_calls"/"length" 等）；非空表示本流已完整生成
+    finish_reason: ?[]const u8 = null,
 };
 
 const StreamUsageDetails = struct {
@@ -313,6 +315,8 @@ pub const SseParser = struct {
     allocator: Allocator,
     line: std.ArrayListUnmanaged(u8) = .empty,
     finished: bool = false,
+    /// 是否见过 finish_reason（部分兼容服务不发 [DONE]，两者任一均视为正常结束）
+    saw_finish_reason: bool = false,
     /// 工具调用分片累积器（可选）
     tool_calls: ?*ToolCallAccumulator = null,
     /// token 用量输出（可选，最后一个 chunk 带回）
@@ -364,6 +368,9 @@ pub const SseParser = struct {
         }
 
         if (parsed.value.choices.len == 0) return;
+        if (parsed.value.choices[0].finish_reason) |fr| {
+            if (fr.len > 0) self.saw_finish_reason = true;
+        }
         const d = parsed.value.choices[0].delta;
         if (d.content) |c| {
             if (c.len > 0) on_delta(ctx, .content, c);
@@ -397,6 +404,8 @@ pub const AIError = error{
     InvalidUri,
     ServerError,
     Canceled,
+    /// 连接中途被关闭（EOF）且响应流未经 [DONE]/finish_reason 正常终止
+    StreamTruncated,
 };
 
 pub const ModelInfo = struct {
@@ -657,6 +666,12 @@ pub const AI = struct {
             const n = reader.readSliceShort(&read_buf) catch return error.NetworkError;
             if (n == 0) break;
             try parser.feed(read_buf[0..n], ctx, on_delta);
+        }
+        // 对端关闭连接（EOF）且流未经 [DONE]/finish_reason 正常终止 → 判定为截断。
+        // 否则"纯思考/部分内容被截断"会被当成正常结束：用户只看到输出停住、无任何提示。
+        if (!parser.finished and !parser.saw_finish_reason) {
+            if (cancel.load(.acquire)) return error.Canceled;
+            return error.StreamTruncated;
         }
     }
 
@@ -1041,6 +1056,45 @@ test "SSE 解析：思考字段（reasoning_content 与 reasoning）" {
 
     try std.testing.expectEqualStrings("让我想想", collector.reasoning.items);
     try std.testing.expectEqualStrings("答案", collector.content.items);
+}
+
+test "SSE 解析：finish_reason 终止标志（截断检测前提）" {
+    var collector = TestCollector{};
+    defer collector.deinit();
+
+    var parser = SseParser{ .allocator = std.testing.allocator };
+    defer parser.deinit();
+
+    // 只有思考增量：两个终止标志都未置位 —— 此时若连接断开应判定为截断
+    try parser.feed("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"想\"}}]}\n", &collector, TestCollector.append);
+    try std.testing.expect(!parser.finished);
+    try std.testing.expect(!parser.saw_finish_reason);
+
+    // 显式 null / 空串不算完成
+    try parser.feed("data: {\"choices\":[{\"delta\":{},\"finish_reason\":null}]}\n", &collector, TestCollector.append);
+    try parser.feed("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"\"}]}\n", &collector, TestCollector.append);
+    try std.testing.expect(!parser.saw_finish_reason);
+
+    // finish_reason 置位（部分兼容服务只发它、不发 [DONE]）
+    try parser.feed("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n", &collector, TestCollector.append);
+    try std.testing.expect(parser.saw_finish_reason);
+
+    // [DONE] 仍正常置 finished（与 finish_reason 两者任一即可判定完成）
+    try parser.feed("data: [DONE]\n\n", &collector, TestCollector.append);
+    try std.testing.expect(parser.finished);
+}
+
+test "SSE 解析：[DONE] 单独出现也判定完成（保持兼容）" {
+    var collector = TestCollector{};
+    defer collector.deinit();
+
+    var parser = SseParser{ .allocator = std.testing.allocator };
+    defer parser.deinit();
+
+    try parser.feed("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n", &collector, TestCollector.append);
+    try parser.feed("data: [DONE]\n", &collector, TestCollector.append);
+    try std.testing.expect(parser.finished);
+    try std.testing.expect(!parser.saw_finish_reason);
 }
 
 test "工具调用分片累积" {

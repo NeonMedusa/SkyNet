@@ -2723,7 +2723,10 @@ const AppState = struct {
 
         if (err) |e| {
             var err_buf: [256]u8 = undefined;
-            const err_msg = std.fmt.bufPrint(&err_buf, "AI 请求失败: {}", .{e}) catch "AI 请求失败";
+            const err_msg: []const u8 = switch (e) {
+                error.StreamTruncated => "连接中断：响应流未正常结束，本次回复可能不完整（可重发消息重试）",
+                else => std.fmt.bufPrint(&err_buf, "AI 请求失败: {}", .{e}) catch "AI 请求失败",
+            };
             self.addMessage(err_msg, .{ .fg = .red });
             if (error_detail.len > 0) {
                 // 只取首行、截断到 ~200 字符
@@ -2738,7 +2741,10 @@ const AppState = struct {
                 const detail_msg = std.fmt.bufPrint(&detail_buf, "服务端返回: {s}", .{line}) catch "服务端返回错误详情";
                 self.addMessage(detail_msg, .{ .fg = .dark_gray });
             }
-            self.addMessage("请检查: 1) 提供商服务是否已启动（如 LM Studio）/ 网络是否可用  2) API Key 是否正确  3) URL 与模型名称是否正确", .{ .fg = .dark_gray });
+            // 截断属瞬时网络/网关问题，配置检查清单不适用
+            if (e != error.StreamTruncated) {
+                self.addMessage("请检查: 1) 提供商服务是否已启动（如 LM Studio）/ 网络是否可用  2) API Key 是否正确  3) URL 与模型名称是否正确", .{ .fg = .dark_gray });
+            }
         }
     }
 
@@ -7585,6 +7591,57 @@ test "集成：HTTP 400 错误路径（需本地 mock 服务器 127.0.0.1:18124�
     }
     if (!saw_server_error) return error.SkipZigTest;
     try std.testing.expect(saw_detail);
+}
+
+test "集成：响应流被截断（需 mock 18126，中途断开无 [DONE]/finish_reason）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    // mock 脚本会在启动时写标记文件；没有标记就不连接（避免无谓的报错噪声）
+    std.Io.Dir.cwd().access(io, "test/mock_18126.running", .{}) catch return error.SkipZigTest;
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    defer {
+        state.config.deinit(std.testing.allocator);
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+        state.stream_buf.deinit(std.testing.allocator);
+        state.stream_reasoning_buf.deinit(std.testing.allocator);
+        state.clearStreamEventsLocked();
+        state.stream_events.deinit(std.testing.allocator);
+    }
+
+    _ = state.config.appendProvider(std.testing.allocator, .{ .name = "mock126", .endpoint = "http://127.0.0.1:18126/v1" });
+    state.config.setCurrentProvider(std.testing.allocator, "mock126");
+    state.config.setCurrentModel(std.testing.allocator, "mock-model");
+
+    state.askAI("触发截断");
+
+    var guard: usize = 0;
+    while (state.streamStatus() != .idle and guard < 1000) : (guard += 1) {
+        state.pumpStream();
+        Io.sleep(io, Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(StreamStatus.idle, state.streamStatus());
+
+    // 关键断言：必须显式报"连接中断/截断"，而不是静默地当成正常结束
+    var saw_truncated = false;
+    var saw_checklist = false;
+    var saw_failed = false;
+    for (state.messages.items) |m| {
+        if (std.mem.indexOf(u8, m.content, "响应流未正常结束") != null) saw_truncated = true;
+        if (std.mem.indexOf(u8, m.content, "请检查: 1)") != null) saw_checklist = true;
+        if (std.mem.indexOf(u8, m.content, "AI 请求失败") != null) saw_failed = true;
+    }
+    try std.testing.expect(saw_truncated);
+    try std.testing.expect(!saw_failed); // 截断使用友好文案，不走通用失败格式
+    try std.testing.expect(!saw_checklist); // 截断属瞬时问题，不显示配置检查清单
 }
 
 test "工具块：内容构建与底色渲染" {

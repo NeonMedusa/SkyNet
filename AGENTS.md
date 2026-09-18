@@ -12,19 +12,21 @@ zig fmt src/*.zig              # 提交前格式化
 zig build -Doptimize=ReleaseSafe
 ```
 
-### Mock 集成测试（三个本地 SSE mock）
+### Mock 集成测试（四个本地 SSE mock）
 
 | 脚本 | 端口 | 用途 |
 |---|---|---|
 | `test/mock_openai_sse.ps1` | 18123 | 工具循环 3 轮（ls → bash → 最终回答） |
 | `test/mock_openai_400_gzip.ps1` | 18124 | gzip 压缩的服务端 400 错误体 |
 | `test/mock_summary.ps1` | 18125 | compaction 摘要请求（返回 `MOCK_SUMMARY`） |
+| `test/mock_openai_truncated.ps1` | 18126 | 响应流中途断开（无 [DONE]/finish_reason）→ 验证 StreamTruncated 检测 |
 
 启动（在工作目录执行，脚本会写 `test/mock_*.running` 标记）：
 
 ```powershell
 Start-Process pwsh -ArgumentList '-NoProfile','-File','test/mock_openai_sse.ps1'
 Start-Process pwsh -ArgumentList '-NoProfile','-File','test/mock_summary.ps1'
+Start-Process pwsh -ArgumentList '-NoProfile','-File','test/mock_openai_truncated.ps1'
 ```
 
 清理时注意**排除当前进程**，否则会误杀自己：
