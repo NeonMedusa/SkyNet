@@ -1,0 +1,12 @@
+zig-out/
+.zig-cache/
+zig-pkg/
+.zed/
+saves/
+config/
+tmp/
+logs/
+nul
+skynet*.db*
+config.json
+test/*.running
