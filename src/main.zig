@@ -363,6 +363,9 @@ fn extractInputSelection(text: []const u8, a: usize, b: usize) []const u8 {
 /// 外部写入轮询间隔（毫秒）
 const external_poll_interval_ms = 500;
 
+/// 每帧最多处理的事件数（防止输入洪峰饿死重绘；超出部分留到下一帧）
+const max_events_per_frame: usize = 1024;
+
 // ── 旧工具输出折叠（控制上下文占用）──
 // 折叠/压缩的纯计算在 context.zig（保护窗口、批量阈值、区间选择等）
 const StreamStatus = enum(u8) { idle, running, done, failed, canceled };
@@ -4913,137 +4916,153 @@ pub fn main(init: std.process.Init) !void {
             state.refreshDragSelection();
         }
 
-        const event = try backend.interface().pollEvent(poll_timeout);
-
-        switch (event) {
-            .key => |key| {
-                // 按键重置光标闪烁相位（保持短暂实心）
-                state.blink_anchor_ms = std.Io.Timestamp.now(state.io, .awake).toMilliseconds();
-                switch (state.mode) {
-                    .model_select => state.handleModelSelectKey(key),
-                    .provider_models => state.handleProviderModelsKey(key),
-                    .provider_add => state.handleProviderAddKey(key),
-                    .provider_confirm => state.handleProviderConfirmKey(key),
-                    .compact_confirm => state.handleCompactConfirmKey(key),
-                    .thinking_select => state.handleThinkingSelectKey(key),
-                    .preset_select => state.handlePresetSelectKey(key),
-                    .session_select => state.handleSessionSelectKey(key),
-                    .session_confirm => state.handleSessionConfirmKey(key),
-                    .help_select => state.handleHelpSelectKey(key),
-                    else => state.handleNormalKey(key),
-                }
-            },
-            .paste => |text| {
-                // 终端包裹的粘贴内容（bracketed paste）：替换选中内容并插入
-                switch (state.mode) {
-                    .normal => {
-                        if (state.sel_active) {
-                            if (state.sel_area == .input) {
-                                state.deleteInputSelection();
-                            } else {
-                                state.clearSelection();
-                            }
-                        }
-                        const inserted = insertPastedText(state.allocator, &state.input, text);
-                        if (inserted < text.len) {
-                            state.setToast("粘贴内容超过输入框上限，已截断");
-                        }
-                    },
-                    .provider_add => {
-                        // 表单字段同样支持粘贴（密钥/地址通常靠粘贴输入）
-                        const inserted = insertPastedText(state.allocator, state.providerFormActiveInput(), text);
-                        if (inserted < text.len) {
-                            state.setToast("粘贴内容超过字段上限，已截断");
-                        }
-                    },
-                    else => {},
-                }
-            },
-            .mouse => |m| {
-                if (state.mode == .normal) {
-                    switch (m.kind) {
-                        .down => {
-                            if (m.button == .left) {
-                                if (thoughtRowAt(&state, m.y)) |tmsg| {
-                                    toggleThought(&state, tmsg);
-                                } else if (state.pointFromScreenStrict(m.x, m.y)) |p| {
-                                    state.sel_area = .messages;
-                                    state.sel_anchor = p;
-                                    state.sel_current = p;
-                                    state.sel_active = true;
-                                    state.sel_dragging = true;
-                                    state.drag_x = m.x;
-                                    state.drag_y = m.y;
-                                    state.auto_scroll_dir = 0;
-                                } else if (state.pointFromInputStrict(m.x, m.y)) |p| {
-                                    // 单击定位输入光标（不改变视口），同时作为选区锚点
-                                    state.input.setCursor(p.off);
-                                    state.blink_anchor_ms = std.Io.Timestamp.now(state.io, .awake).toMilliseconds();
-                                    state.sel_area = .input;
-                                    state.sel_anchor = p;
-                                    state.sel_current = p;
-                                    state.sel_active = true;
-                                    state.sel_dragging = true;
-                                    state.drag_x = m.x;
-                                    state.drag_y = m.y;
-                                    state.auto_scroll_dir = 0;
-                                } else {
-                                    state.clearSelection();
-                                }
-                            }
-                        },
-                        .moved => {
-                            if (state.sel_dragging) {
-                                state.drag_x = m.x;
-                                state.drag_y = m.y;
-                                const p = switch (state.sel_area) {
-                                    .messages => state.pointFromScreen(m.x, m.y),
-                                    .input => state.pointFromInputClamped(m.x, m.y),
-                                };
-                                if (p) |pt| state.sel_current = pt;
-                                state.updateAutoScrollDir();
-                            }
-                        },
-                        .up => {
-                            if (state.sel_dragging) {
-                                state.stopDragging();
-                                // 单击（未拖动）视为清除选择
-                                if (state.sel_anchor.msg == state.sel_current.msg and
-                                    state.sel_anchor.source == state.sel_current.source and
-                                    state.sel_anchor.off == state.sel_current.off)
-                                {
-                                    state.clearSelection();
-                                }
-                            }
-                        },
-                        .scroll_up => {
-                            // 滚轮按鼠标所在区域路由：输入框上方滚输入框，否则滚消息
-                            if (state.input_box_top > 0 and m.y >= state.input_box_top) {
-                                state.input.scrollView(true, state.input_wrap_width, state.input_content_rows);
-                            } else {
-                                state.scroll_offset +|= 3;
-                            }
-                        },
-                        .scroll_down => {
-                            if (state.input_box_top > 0 and m.y >= state.input_box_top) {
-                                state.input.scrollView(false, state.input_wrap_width, state.input_content_rows);
-                            } else {
-                                state.scroll_offset -|= 3;
-                            }
-                        },
-                        else => {},
-                    }
-                }
-            },
-            .resize => |size| {
-                try terminal.resize(.{ .width = size.width, .height = size.height });
-                state.terminal_height = size.height;
-            },
-            else => {},
+        // 一次绘制后连续排空已缓冲的事件：快速拖动鼠标时终端会按字符格逐个
+        // 上报移动事件（一次读取里排入多个），若每帧只处理一个，选中高亮就会
+        // 逐个事件"追赶"鼠标。首个事件按 poll_timeout 等待，其余非阻塞取走；
+        // resize 会重排终端缓冲，处理完立即跳出本帧（下帧重绘后继续）。
+        var wait_ms = poll_timeout;
+        var drained: usize = 0;
+        while (drained < max_events_per_frame) : (drained += 1) {
+            const event = try backend.interface().pollEvent(wait_ms);
+            wait_ms = 0;
+            if (event == .none) break;
+            try handleTerminalEvent(&state, &terminal, event);
+            if (event == .resize) break;
         }
     }
 
     try terminal.showCursor();
+}
+
+/// 处理单个终端事件（从 runTui 主循环抽出：主循环一次绘制后批量排空事件，
+/// 见那里的排空注释；本函数只做分发与状态更新）。
+fn handleTerminalEvent(state: *AppState, terminal: *Terminal, event: tui.Event) !void {
+    switch (event) {
+        .key => |key| {
+            // 按键重置光标闪烁相位（保持短暂实心）
+            state.blink_anchor_ms = std.Io.Timestamp.now(state.io, .awake).toMilliseconds();
+            switch (state.mode) {
+                .model_select => state.handleModelSelectKey(key),
+                .provider_models => state.handleProviderModelsKey(key),
+                .provider_add => state.handleProviderAddKey(key),
+                .provider_confirm => state.handleProviderConfirmKey(key),
+                .compact_confirm => state.handleCompactConfirmKey(key),
+                .thinking_select => state.handleThinkingSelectKey(key),
+                .preset_select => state.handlePresetSelectKey(key),
+                .session_select => state.handleSessionSelectKey(key),
+                .session_confirm => state.handleSessionConfirmKey(key),
+                .help_select => state.handleHelpSelectKey(key),
+                else => state.handleNormalKey(key),
+            }
+        },
+        .paste => |text| {
+            // 终端包裹的粘贴内容（bracketed paste）：替换选中内容并插入
+            switch (state.mode) {
+                .normal => {
+                    if (state.sel_active) {
+                        if (state.sel_area == .input) {
+                            state.deleteInputSelection();
+                        } else {
+                            state.clearSelection();
+                        }
+                    }
+                    const inserted = insertPastedText(state.allocator, &state.input, text);
+                    if (inserted < text.len) {
+                        state.setToast("粘贴内容超过输入框上限，已截断");
+                    }
+                },
+                .provider_add => {
+                    // 表单字段同样支持粘贴（密钥/地址通常靠粘贴输入）
+                    const inserted = insertPastedText(state.allocator, state.providerFormActiveInput(), text);
+                    if (inserted < text.len) {
+                        state.setToast("粘贴内容超过字段上限，已截断");
+                    }
+                },
+                else => {},
+            }
+        },
+        .mouse => |m| {
+            if (state.mode == .normal) {
+                switch (m.kind) {
+                    .down => {
+                        if (m.button == .left) {
+                            if (thoughtRowAt(state, m.y)) |tmsg| {
+                                toggleThought(state, tmsg);
+                            } else if (state.pointFromScreenStrict(m.x, m.y)) |p| {
+                                state.sel_area = .messages;
+                                state.sel_anchor = p;
+                                state.sel_current = p;
+                                state.sel_active = true;
+                                state.sel_dragging = true;
+                                state.drag_x = m.x;
+                                state.drag_y = m.y;
+                                state.auto_scroll_dir = 0;
+                            } else if (state.pointFromInputStrict(m.x, m.y)) |p| {
+                                // 单击定位输入光标（不改变视口），同时作为选区锚点
+                                state.input.setCursor(p.off);
+                                state.blink_anchor_ms = std.Io.Timestamp.now(state.io, .awake).toMilliseconds();
+                                state.sel_area = .input;
+                                state.sel_anchor = p;
+                                state.sel_current = p;
+                                state.sel_active = true;
+                                state.sel_dragging = true;
+                                state.drag_x = m.x;
+                                state.drag_y = m.y;
+                                state.auto_scroll_dir = 0;
+                            } else {
+                                state.clearSelection();
+                            }
+                        }
+                    },
+                    .moved => {
+                        if (state.sel_dragging) {
+                            state.drag_x = m.x;
+                            state.drag_y = m.y;
+                            const p = switch (state.sel_area) {
+                                .messages => state.pointFromScreen(m.x, m.y),
+                                .input => state.pointFromInputClamped(m.x, m.y),
+                            };
+                            if (p) |pt| state.sel_current = pt;
+                            state.updateAutoScrollDir();
+                        }
+                    },
+                    .up => {
+                        if (state.sel_dragging) {
+                            state.stopDragging();
+                            // 单击（未拖动）视为清除选择
+                            if (state.sel_anchor.msg == state.sel_current.msg and
+                                state.sel_anchor.source == state.sel_current.source and
+                                state.sel_anchor.off == state.sel_current.off)
+                            {
+                                state.clearSelection();
+                            }
+                        }
+                    },
+                    .scroll_up => {
+                        // 滚轮按鼠标所在区域路由：输入框上方滚输入框，否则滚消息
+                        if (state.input_box_top > 0 and m.y >= state.input_box_top) {
+                            state.input.scrollView(true, state.input_wrap_width, state.input_content_rows);
+                        } else {
+                            state.scroll_offset +|= 3;
+                        }
+                    },
+                    .scroll_down => {
+                        if (state.input_box_top > 0 and m.y >= state.input_box_top) {
+                            state.input.scrollView(false, state.input_wrap_width, state.input_content_rows);
+                        } else {
+                            state.scroll_offset -|= 3;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        },
+        .resize => |size| {
+            try terminal.resize(.{ .width = size.width, .height = size.height });
+            state.terminal_height = size.height;
+        },
+        else => {},
+    }
 }
 
 /// 复制字符串并清洗非法 UTF-8（输入合法时等价于 dupe）
