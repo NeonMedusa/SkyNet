@@ -418,10 +418,10 @@ const StreamJob = struct {
     session_id: []const u8 = "",
     behavior: config_mod.Behavior = .{},
     environ_map: ?*const std.process.Environ.Map = null,
-    /// 数据库路径（工作线程中途压缩时自建连接用；arena 所有，含终止符）
+    /// 数据库路径（工作线程实时落库/中途压缩时自建连接用；arena 所有，含终止符）
     db_path: [:0]const u8 = "",
-    /// 历史快照长度（前缀均已在库中；其后为当前回合消息）
-    history_base_len: usize = 0,
+    /// 会话的数字 id（worker 实时落库用；0 = 不落库，回退到 finalize 批量写）
+    session_id_num: i64 = 0,
     /// 中途压缩参数快照
     auto_compact_pct: u64 = 0,
     context_window: u64 = 0,
@@ -468,8 +468,9 @@ const AppState = struct {
     allocator: std.mem.Allocator = undefined,
     config: config_mod.Config = .{},
     db: ?db_mod.Db = null,
-    /// 数据库路径（工作线程中途压缩时自建连接用）
-    db_path: []const u8 = "skynet.db",
+    /// 数据库路径（仅当 db 为 null 时的兜底；worker 自建连接优先用 db.path）。
+    /// 留空 = 未显式指定：worker 不会去猜默认路径（防止误开无关库）。
+    db_path: []const u8 = "",
     session_id: i64 = 0,
     history: std.ArrayListUnmanaged(ai.Message) = .{ .items = &.{}, .capacity = 0 },
 
@@ -2175,8 +2176,10 @@ const AppState = struct {
         // 思考强度是全局设置：拷进 job arena，避免主线程改动导致悬空
         job.behavior.reasoning_effort = try arena.dupe(u8, self.config.thinking);
         job.environ_map = self.environ_map;
-        job.db_path = try arena.dupeZ(u8, self.db_path);
-        job.history_base_len = self.history.items.len;
+        // worker 自建连接时用实际打开的库路径（测试/CLI 可能不是默认路径）
+        const db_path: []const u8 = if (self.db) |*d| d.path else self.db_path;
+        job.db_path = try arena.dupeZ(u8, db_path);
+        job.session_id_num = self.session_id;
         job.auto_compact_pct = self.auto_compact_pct;
         job.context_window = self.contextWindowCurrent();
         job.keep_recent_tokens = self.keep_recent_tokens;
@@ -2588,9 +2591,16 @@ const AppState = struct {
             for (job.transcript.items) |entry| {
                 if (std.mem.eql(u8, entry.msg.role, "assistant") and entry.msg.content.len > 0) has_final = true;
             }
+            var worker_persisted_max: i64 = 0;
 
             for (job.transcript.items) |entry| {
                 const m = entry.msg;
+                // 实时落库路径：worker 已写入，只补进主线程历史（避免重复写库）
+                if (m.db_id != 0) {
+                    if (m.db_id > worker_persisted_max) worker_persisted_max = m.db_id;
+                    self.appendHistoryMessage(m);
+                    continue;
+                }
                 // 工具调用 → JSON 文本落库
                 var calls_json: []const u8 = "";
                 var calls_buf: ?[]u8 = null;
@@ -2634,10 +2644,13 @@ const AppState = struct {
                     .cached_tokens = @intCast(entry.usage.cached_tokens),
                     .output_tokens = @intCast(entry.usage.output_tokens),
                 });
+                if (db_id > worker_persisted_max) worker_persisted_max = db_id;
                 var hist = m;
                 hist.db_id = db_id;
                 self.appendHistoryMessage(hist);
             }
+            // worker 落库的行不算"外部写入"：同步游标，避免外部轮询把它们当新消息重复加载
+            if (worker_persisted_max > self.last_seen_msg_id) self.last_seen_msg_id = worker_persisted_max;
 
             // 取消/出错时当前回合可能未入转录：用显示消息兜底落库
             if (!has_final) {
@@ -3992,26 +4005,26 @@ fn estimateJobRequestTokens(job: *const StreamJob) usize {
     return estimateTokens(bytes);
 }
 
-/// 工具循环中途压缩：只压缩 job.history 里「已落库的前缀」（当前回合消息没有行 id，不参与）。
+/// 回合中途压缩：worker 已实时落库，整段 job.history（含当前回合）都可参与压缩。
 /// 返回 true 表示发生了压缩（job.compacted_midturn 置位）。
 fn compactJobHistory(job: *StreamJob, db: *db_mod.Db) bool {
     if (job.auto_compact_pct == 0 or job.context_window == 0) return false;
-    if (job.history_base_len < 2) return false;
+    if (job.history.len < 2) return false;
     const est = estimateJobRequestTokens(job);
     if (est * 100 < job.context_window * job.auto_compact_pct) return false;
 
-    const prefix = job.history[0..job.history_base_len];
+    const hist = job.history;
     const keep_bytes = (if (job.keep_recent_tokens > 0) job.keep_recent_tokens else 20_000) * 4;
-    const range = selectCompactionRange(prefix, keep_bytes) orelse return false;
+    const range = selectCompactionRange(hist, keep_bytes) orelse return false;
 
     const arena = job.arena.allocator();
     const prev_summary: []const u8 = if (range.summarize_start > 1 and
-        isCheckpointMessage(prefix[range.summarize_start - 1]))
-        prefix[range.summarize_start - 1].content
+        isCheckpointMessage(hist[range.summarize_start - 1]))
+        hist[range.summarize_start - 1].content
     else
         "";
 
-    const payload = buildCompactionPayload(arena, prefix, range, prev_summary) catch return false;
+    const payload = buildCompactionPayload(arena, hist, range, prev_summary) catch return false;
 
     // 摘要请求：一次性路由 id + 不写缓存
     var seed: [16]u8 = undefined;
@@ -4039,9 +4052,9 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db) bool {
     client.streamMessage(&msgs, &.{}, &cancel, &collector, SummaryCollector.cb, null) catch return false;
     if (collector.list.items.len == 0) return false;
 
-    // 保留区首条已落库消息的行 id
+    // 保留区首条已落库消息的行 id（实时落库后当前回合消息也有 id）
     var tail_start: i64 = 0;
-    for (prefix[range.retain_start..]) |m| {
+    for (hist[range.retain_start..]) |m| {
         if (m.db_id > 0) {
             tail_start = m.db_id;
             break;
@@ -4051,14 +4064,14 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db) bool {
 
     // 摘要入库为 role='summary' 消息（worker 用自己的连接）
     const summary_msg_id = db.insertMessage(.{
-        .session_id = job.app.session_id,
+        .session_id = job.session_id_num,
         .role = "summary",
         .content = collector.list.items,
         .model = job.model,
         .provider = job.provider_name,
     }) catch 0;
     _ = db.insertCompaction(
-        job.app.session_id,
+        job.session_id_num,
         if (summary_msg_id != 0) "" else collector.list.items,
         summary_msg_id,
         tail_start,
@@ -4066,10 +4079,10 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db) bool {
         job.model,
     ) catch return false;
 
-    // 重建 job.history：system + checkpoint + 保留前缀 + 当前回合消息
+    // 重建 job.history：system + checkpoint + 保留区
     var new_hist = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
-    if (prefix.len > 0 and std.mem.eql(u8, prefix[0].role, "system")) {
-        new_hist.append(arena, prefix[0]) catch return false;
+    if (hist.len > 0 and std.mem.eql(u8, hist[0].role, "system")) {
+        new_hist.append(arena, hist[0]) catch return false;
     }
     const wrapper = std.fmt.allocPrint(
         arena,
@@ -4077,14 +4090,13 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db) bool {
         .{collector.list.items},
     ) catch return false;
     new_hist.append(arena, .{ .role = "user", .content = wrapper }) catch return false;
-    new_hist.appendSlice(arena, prefix[range.retain_start..]) catch return false;
-    // 当前回合消息（无行 id）不参与后续压缩：基准长度只到它们之前
-    const base_after = new_hist.items.len;
-    new_hist.appendSlice(arena, job.history[job.history_base_len..]) catch return false;
+    new_hist.appendSlice(arena, hist[range.retain_start..]) catch return false;
     job.history = new_hist.toOwnedSlice(arena) catch return false;
 
-    job.history_base_len = base_after;
     job.compacted_midturn = true;
+    // 旧锚点对应压缩前的前缀：失效，避免后续轮次用错估算
+    job.anchor_len = 0;
+    job.anchor_tokens = 0;
     return true;
 }
 
@@ -4791,6 +4803,14 @@ pub fn main(init: std.process.Init) !void {
     }
     // 启动即显示上下文估算（加载路径里也会刷新）
     state.refreshEstimatedUsage();
+
+    // 清理过期的 bash 截断临时文件（保留最近 7 天：会话历史里的 stub 可能仍引用）
+    _ = tools_mod.cleanupStaleBashTempFiles(
+        io,
+        init.environ_map,
+        std.Io.Timestamp.now(io, .awake).toMilliseconds(),
+        7 * 24 * 60 * 60 * 1000,
+    );
 
     if (state.config.providers.items.len > 0) {
         if (state.config.current_model.len > 0) {
@@ -5611,6 +5631,68 @@ fn waitDrained(app: *AppState) void {
     }
 }
 
+/// 把转录中的一条消息立即落库（实时落库：程序意外退出也不会丢已产出的消息）。
+/// 成功时把行 id 写回转录条目与 job.history 对应位置（供回合中途压缩取 tail 边界）。
+/// 数据库不可用或写入失败时静默跳过：finalize 会按 db_id == 0 重试批量落库。
+fn persistTranscriptEntry(job: *StreamJob, db: *db_mod.Db, entry_idx: usize, hist_idx: usize) void {
+    if (entry_idx >= job.transcript.items.len or hist_idx >= job.history.len) return;
+    const entry = &job.transcript.items[entry_idx];
+    const m = &entry.msg;
+    if (m.db_id != 0) return;
+
+    const arena = job.arena.allocator();
+    var calls_json: []const u8 = "";
+    if (m.tool_calls) |calls| {
+        calls_json = toolCallsToJson(arena, calls) catch "";
+    }
+    // 工具结果：取出渲染元数据（工具名 / diff 正文 / 错误标志）
+    var t_name: []const u8 = "";
+    var t_display: []const u8 = "";
+    var t_error: i64 = 0;
+    if (std.mem.eql(u8, m.role, "tool")) {
+        if (m.tool_call_id) |cid| {
+            for (job.tool_meta.items) |tm| {
+                if (std.mem.eql(u8, tm.id, cid)) {
+                    t_name = tm.name;
+                    t_display = tm.display;
+                    t_error = if (tm.is_error) 1 else 0;
+                    break;
+                }
+            }
+        }
+    }
+    const id = db.insertMessage(.{
+        .session_id = job.session_id_num,
+        .role = m.role,
+        .content = m.content,
+        .model = job.model,
+        .provider = job.provider_name,
+        .reasoning = entry.reasoning,
+        .reasoning_ms = entry.reasoning_ms,
+        .tool_calls = calls_json,
+        .tool_call_id = m.tool_call_id orelse "",
+        .tool_name = t_name,
+        .tool_display = t_display,
+        .tool_full = "",
+        .is_error = t_error,
+        .input_tokens = @intCast(entry.usage.input_tokens),
+        .cached_tokens = @intCast(entry.usage.cached_tokens),
+        .output_tokens = @intCast(entry.usage.output_tokens),
+    }) catch return;
+    if (id == 0) return;
+    entry.msg.db_id = id;
+    job.history[hist_idx].db_id = id;
+}
+
+/// 取（必要时打开）worker 自己的数据库连接；不可用时返回 null（回退到 finalize 批量落库）
+fn ensureWorkerDb(job: *StreamJob, slot: *?db_mod.Db) ?*db_mod.Db {
+    if (slot.*) |*d| return d;
+    if (job.db_path.len == 0 or job.session_id_num == 0) return null;
+    if (std.mem.eql(u8, job.db_path, ":memory:")) return null;
+    slot.* = db_mod.Db.openFile(job.app.allocator, job.io, job.db_path) catch return null;
+    return &slot.*.?;
+}
+
 fn streamWorker(job: *StreamJob) void {
     const app = job.app;
     const arena = job.arena.allocator();
@@ -5623,9 +5705,9 @@ fn streamWorker(job: *StreamJob) void {
     });
     client.environ_map = job.environ_map;
 
-    // 中途压缩用独立连接（主线程连接不跨线程使用）
-    var compact_db: ?db_mod.Db = null;
-    defer if (compact_db) |*d| d.deinit();
+    // 实时落库/中途压缩共用一条 worker 连接（主线程连接不跨线程使用）
+    var worker_db: ?db_mod.Db = null;
+    defer if (worker_db) |*d| d.deinit();
 
     // 持续循环，直到模型不再返回工具调用（自然结束）、出错或被用户取消
     while (true) {
@@ -5635,13 +5717,11 @@ fn streamWorker(job: *StreamJob) void {
         job.reasoning_start_ms = 0;
         job.reasoning_end_ms = 0;
 
-        // 工具循环会迅速堆积上下文：发下一轮前检查并按需压缩（只动已落库前缀）
-        if (job.auto_compact_pct > 0 and job.db_path.len > 0) {
-            if (compact_db == null) {
-                compact_db = db_mod.Db.openFile(app.allocator, job.io, job.db_path) catch null;
-            }
-            if (compact_db) |*cdb| {
-                _ = compactJobHistory(job, cdb);
+        // 工具循环会迅速堆积上下文：发下一轮前检查并按需压缩
+        // （消息已实时落库，整段历史含当前回合都可参与）
+        if (job.auto_compact_pct > 0) {
+            if (ensureWorkerDb(job, &worker_db)) |wdb| {
+                _ = compactJobHistory(job, wdb);
             }
         }
 
@@ -5659,9 +5739,13 @@ fn streamWorker(job: *StreamJob) void {
         job.round_usage = client.usage;
 
         if (result) |_| {} else |err| {
-            // 失败/取消：保留已累积的内容与工具调用后退出
+            // 失败/取消：保留已累积的内容与工具调用后退出（同样实时落库）
             if (job.content.items.len > 0 or tool_calls.items.items.len > 0) {
-                appendAssistantTurn(job, arena, tool_calls.items.items) catch {};
+                if (appendAssistantTurn(job, arena, tool_calls.items.items)) |_| {
+                    if (ensureWorkerDb(job, &worker_db)) |wdb| {
+                        persistTranscriptEntry(job, wdb, job.transcript.items.len - 1, job.history.len - 1);
+                    }
+                } else |_| {}
             }
             // 取走服务端错误详情（若有）
             if (client.takeErrorBody()) |body| {
@@ -5680,7 +5764,11 @@ fn streamWorker(job: *StreamJob) void {
         const has_content = job.content.items.len > 0;
         const has_calls = tool_calls.items.items.len > 0;
         if (has_content or has_calls) {
-            appendAssistantTurn(job, arena, tool_calls.items.items) catch {};
+            if (appendAssistantTurn(job, arena, tool_calls.items.items)) |_| {
+                if (ensureWorkerDb(job, &worker_db)) |wdb| {
+                    persistTranscriptEntry(job, wdb, job.transcript.items.len - 1, job.history.len - 1);
+                }
+            } else |_| {}
         }
         if (!has_calls) {
             app.setStreamStatus(.done);
@@ -5699,7 +5787,7 @@ fn streamWorker(job: *StreamJob) void {
             const args_summary = summarizeToolArgs(arena, tc.arguments) catch "";
             pushStreamEvent(app, .tool_start, tc.name, args_summary, tc.arguments, "", false);
 
-            const exec_result = tools_mod.execute(arena, job.io, job.cwd, tc.name, tc.arguments) catch |e| blk: {
+            const exec_result = tools_mod.executeWithEnv(arena, job.io, job.cwd, tc.name, tc.arguments, job.environ_map) catch |e| blk: {
                 const msg = std.fmt.allocPrint(arena, "Tool execution failed: {s}", .{@errorName(e)}) catch "Tool execution failed";
                 break :blk tools_mod.Result{ .content = @constCast(msg), .is_error = true };
             };
@@ -5731,6 +5819,10 @@ fn streamWorker(job: *StreamJob) void {
             };
             job.transcript.append(arena, .{ .msg = tool_msg }) catch break;
             job.history = extendHistory(arena, job.history, &[_]ai.Message{tool_msg}) catch break;
+            // 工具结果立即落库：意外退出也能保住已执行的结果
+            if (ensureWorkerDb(job, &worker_db)) |wdb| {
+                persistTranscriptEntry(job, wdb, job.transcript.items.len - 1, job.history.len - 1);
+            }
         }
 
         waitDrained(app);
@@ -8554,7 +8646,7 @@ test "集成：compaction（需本地 mock 服务器 127.0.0.1:18125）" {
     try std.testing.expect(out2.err == null);
 }
 
-test "中途压缩：工具循环中压缩已落库前缀（需 mock 18125）" {
+test "中途压缩：工具循环中压缩整段历史（含当前回合，需 mock 18125）" {
     var threaded: std.Io.Threaded = undefined;
     threaded = .init(std.testing.allocator, .{});
     const io = threaded.io();
@@ -8597,59 +8689,90 @@ test "中途压缩：工具循环中压缩已落库前缀（需 mock 18125）" {
         .api_key = "x",
         .provider_name = "mock",
         .db_path = db_path,
+        .session_id_num = sid,
         .history = &.{},
         .auto_compact_pct = 50,
         .context_window = 500,
-        .keep_recent_tokens = 1,
+        .keep_recent_tokens = 1100, // keep_bytes = 4400：收下 t2(2000)+a2(2036)，t1 超预算
     };
     const arena = job.arena.allocator();
 
-    // 已落库前缀：system + mu0/ma0（可压缩区）+ mu1/ma1（保留区）
+    // 全部消息均已实时落库（模拟 worker 边产出边写库）：
+    // 旧回合 sys/u0/a0 + 当前回合 u1/a1/t1/a2/t2
+    const Turn = struct {
+        fn u(arena2: Allocator, st: *AppState, text: []const u8) !ai.Message {
+            const txt = try arena2.dupe(u8, text);
+            const row = st.persistMessage(.{ .role = "user", .content = txt });
+            return .{ .role = "user", .content = txt, .db_id = row };
+        }
+        fn a(arena2: Allocator, st: *AppState, text: []const u8, call_id: []const u8) !ai.Message {
+            const txt = try arena2.dupe(u8, text);
+            const calls = if (call_id.len > 0)
+                try cloneToolCalls(arena2, &[_]ai.ToolCall{.{ .id = try arena2.dupe(u8, call_id), .name = "read", .arguments = "{}" }})
+            else
+                null;
+            var calls_json: []const u8 = "";
+            var buf: ?[]u8 = null;
+            defer if (buf) |b| alloc.free(b);
+            if (calls) |cs| {
+                buf = try toolCallsToJson(alloc, cs);
+                calls_json = buf.?;
+            }
+            const row = st.persistMessage(.{ .role = "assistant", .content = txt, .tool_calls = calls_json });
+            return .{ .role = "assistant", .content = txt, .tool_calls = calls, .db_id = row };
+        }
+        fn t(arena2: Allocator, st: *AppState, text: []const u8, call_id: []const u8) !ai.Message {
+            const c = try arena2.dupe(u8, text);
+            const cid = try arena2.dupe(u8, call_id);
+            const row = st.persistMessage(.{ .role = "tool", .content = c, .tool_call_id = cid, .tool_name = "read" });
+            return .{ .role = "tool", .content = c, .tool_call_id = cid, .db_id = row };
+        }
+    };
+
     var hist = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
     const sys_row = state.persistMessage(.{ .role = "system", .content = system_prompt });
     try hist.append(arena, .{ .role = "system", .content = try arena.dupe(u8, system_prompt), .db_id = sys_row });
-    const arr_u0 = "mu0" ** 2000;
-    const mu0 = try arena.dupe(u8, arr_u0);
-    const r_u0 = state.persistMessage(.{ .role = "user", .content = mu0 });
-    try hist.append(arena, .{ .role = "user", .content = mu0, .db_id = r_u0 });
-    const arr_a0 = "ma0" ** 2000;
-    const ma0 = try arena.dupe(u8, arr_a0);
-    const r_a0 = state.persistMessage(.{ .role = "assistant", .content = ma0 });
-    try hist.append(arena, .{ .role = "assistant", .content = ma0, .db_id = r_a0 });
-    const arr_u1 = "mu1" ** 1000;
-    const mu1 = try arena.dupe(u8, arr_u1);
-    const r_u1 = state.persistMessage(.{ .role = "user", .content = mu1 });
-    try hist.append(arena, .{ .role = "user", .content = mu1, .db_id = r_u1 });
-    const arr_a1 = "ma1" ** 1000;
-    const ma1 = try arena.dupe(u8, arr_a1);
-    const r_a1 = state.persistMessage(.{ .role = "assistant", .content = ma1 });
-    try hist.append(arena, .{ .role = "assistant", .content = ma1, .db_id = r_a1 });
+    const old_u = "uuuu" ** 500;
+    const old_a = "aaaa" ** 500;
+    try hist.append(arena, try Turn.u(arena, &state, old_u));
+    try hist.append(arena, try Turn.a(arena, &state, old_a, ""));
+    const cur_u = "vvvv" ** 125;
+    const a1 = "bbbb" ** 500;
+    const t1 = "cccc" ** 500;
+    const a2 = "dddd" ** 500;
+    const t2 = "eeee" ** 500;
+    try hist.append(arena, try Turn.u(arena, &state, cur_u)); // 当前回合 user
+    try hist.append(arena, try Turn.a(arena, &state, a1, "c1"));
+    try hist.append(arena, try Turn.t(arena, &state, t1, "c1"));
+    try hist.append(arena, try Turn.a(arena, &state, a2, "c2"));
+    try hist.append(arena, try Turn.t(arena, &state, t2, "c2"));
     job.history = try hist.toOwnedSlice(arena);
-    job.history_base_len = job.history.len;
 
-    // 当前回合消息（无行 id）
-    const mu2 = try arena.dupe(u8, "mu2 当前回合");
-    var with_turn = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
-    try with_turn.appendSlice(arena, job.history);
-    try with_turn.append(arena, .{ .role = "user", .content = mu2 });
-    job.history = try with_turn.toOwnedSlice(arena);
+    // 设置旧锚点：压缩后应失效
+    job.anchor_len = 2;
+    job.anchor_tokens = 999;
 
-    // 触发中途压缩
+    // 触发中途压缩（keep_bytes=3000：收下 t2(2000)，a2 超预算 → 保留区以 assistant 开头）
     const did = compactJobHistory(job, &state.db.?);
     try std.testing.expect(did);
     try std.testing.expect(job.compacted_midturn);
 
-    // history = system + checkpoint + 保留区(mu1,ma1) + 当前回合(mu2)
-    try std.testing.expectEqual(@as(usize, 5), job.history.len);
+    // history = system + checkpoint + [a2, t2]：当前回合前半段（u1/a1/t1）进摘要
+    try std.testing.expectEqual(@as(usize, 4), job.history.len);
     try std.testing.expectEqualStrings("system", job.history[0].role);
     try std.testing.expect(isCheckpointMessage(job.history[1]));
-    try std.testing.expectEqualStrings(mu1, job.history[2].content);
-    try std.testing.expectEqualStrings(ma1, job.history[3].content);
-    try std.testing.expectEqualStrings("mu2 当前回合", job.history[4].content);
-    try std.testing.expectEqual(@as(usize, 4), job.history_base_len);
+    try std.testing.expectEqualStrings(a2, job.history[2].content);
+    try std.testing.expectEqualStrings(t2, job.history[3].content);
+    try std.testing.expect(job.history[2].db_id != 0);
+    // 锚点失效（旧锚点对应压缩前的前缀）
+    try std.testing.expectEqual(@as(usize, 0), job.anchor_len);
+    try std.testing.expectEqual(@as(u64, 0), job.anchor_tokens);
 
+    // checkpoint：摘要入库且 tail 指向保留区首条（a2 的行 id）
     const cp = (try state.db.?.latestCompaction(sid)).?;
     try std.testing.expect(cp.summary_message_id != 0);
+    try std.testing.expectEqual(job.history[2].db_id, cp.tail_start_id);
+    // 摘要文本覆盖当前回合前半段（payload 含 u1/a1）——mock 返回固定 MOCK_SUMMARY
     var mid_summary_ok = false;
     for (try state.db.?.loadMessages(sid)) |r| {
         if (r.id == cp.summary_message_id and std.mem.indexOf(u8, r.content, "MOCK_SUMMARY") != null) {
@@ -8657,10 +8780,135 @@ test "中途压缩：工具循环中压缩已落库前缀（需 mock 18125）" {
         }
     }
     try std.testing.expect(mid_summary_ok);
-    try std.testing.expectEqual(r_u1, cp.tail_start_id);
 
-    // 再压一次：前缀内已无可压缩内容
+    // 重启视角：按 checkpoint 重建的历史 = system + checkpoint + [a2,t2]
+    var reloaded = AppState{};
+    reloaded.io = io;
+    reloaded.allocator = alloc;
+    reloaded.session_id = sid;
+    defer {
+        for (reloaded.history.items) |m| freeMessage(alloc, m);
+        reloaded.history.deinit(alloc);
+        for (reloaded.messages.items) |m| reloaded.freeDisplayMessage(m);
+        reloaded.messages.deinit(alloc);
+    }
+    const rows = try state.db.?.loadMessages(sid);
+    reloaded.applyLoadedMessagesWithCheckpoint(rows, cp, true);
+    try std.testing.expectEqual(@as(usize, 4), reloaded.history.items.len);
+    try std.testing.expectEqualStrings("assistant", reloaded.history.items[2].role);
+    try std.testing.expectEqualStrings(a2, reloaded.history.items[2].content);
+    try std.testing.expectEqualStrings(t2, reloaded.history.items[3].content);
+
+    // 再压一次：保留区（a2,t2）之后没有可压缩内容 → 不再触发
     try std.testing.expect(!compactJobHistory(job, &state.db.?));
+}
+
+test "实时落库：persistTranscriptEntry 写入 DB 并回填 db_id（幂等）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    const db_path: [:0]const u8 = "skynet_test_eager.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_eager.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_eager.db-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_eager.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_eager.db-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer if (state.db) |*d| d.deinit();
+    const sid = try state.db.?.createSession("");
+    state.session_id = sid;
+
+    const job = try alloc.create(StreamJob);
+    defer {
+        job.arena.deinit();
+        alloc.destroy(job);
+    }
+    job.* = .{
+        .app = &state,
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .io = io,
+        .cwd = ".",
+        .model = "m",
+        .endpoint = "",
+        .api_key = "",
+        .provider_name = "p",
+        .db_path = db_path,
+        .session_id_num = sid,
+        .history = &.{},
+    };
+    const arena = job.arena.allocator();
+
+    // assistant：带工具调用 + 思考 + 单轮用量
+    const calls = try cloneToolCalls(arena, &[_]ai.ToolCall{.{ .id = "call_9", .name = "bash", .arguments = "{\"command\":\"echo hi\"}" }});
+    var hist = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
+    try hist.append(arena, .{ .role = "assistant", .content = try arena.dupe(u8, "先跑一下"), .tool_calls = calls });
+    job.history = try hist.toOwnedSlice(arena);
+    try job.transcript.append(arena, .{
+        .msg = job.history[0],
+        .reasoning = try arena.dupe(u8, "想一想"),
+        .reasoning_ms = 42,
+        .usage = .{ .input_tokens = 100, .output_tokens = 7, .cached_tokens = 88 },
+    });
+
+    persistTranscriptEntry(job, &state.db.?, 0, 0);
+    const aid = job.transcript.items[0].msg.db_id;
+    try std.testing.expect(aid != 0);
+    try std.testing.expectEqual(aid, job.history[0].db_id); // 历史副本同步回填
+
+    const rows = try state.db.?.loadMessages(sid);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("assistant", rows[0].role);
+    try std.testing.expectEqualStrings("先跑一下", rows[0].content);
+    try std.testing.expectEqualStrings("想一想", rows[0].reasoning);
+    try std.testing.expectEqual(@as(i64, 42), rows[0].reasoning_ms);
+    try std.testing.expectEqual(@as(i64, 100), rows[0].input_tokens);
+    try std.testing.expectEqual(@as(i64, 88), rows[0].cached_tokens);
+    try std.testing.expectEqual(@as(i64, 7), rows[0].output_tokens);
+    try std.testing.expect(std.mem.indexOf(u8, rows[0].tool_calls, "call_9") != null);
+
+    // 幂等：已有 db_id 时不重复写入
+    persistTranscriptEntry(job, &state.db.?, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), (try state.db.?.loadMessages(sid)).len);
+
+    // tool 结果：渲染元数据（tool_name / is_error）随行落库
+    try job.tool_meta.append(arena, .{ .id = "call_9", .name = "bash", .display = "", .is_error = true });
+    var hist2 = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
+    try hist2.appendSlice(arena, job.history);
+    try hist2.append(arena, .{ .role = "tool", .content = try arena.dupe(u8, "boom"), .tool_call_id = try arena.dupe(u8, "call_9") });
+    job.history = try hist2.toOwnedSlice(arena);
+    try job.transcript.append(arena, .{ .msg = job.history[1] });
+    persistTranscriptEntry(job, &state.db.?, 1, 1);
+    try std.testing.expect(job.history[1].db_id != 0);
+
+    var saw_tool = false;
+    for (try state.db.?.loadMessages(sid)) |r| {
+        if (std.mem.eql(u8, r.role, "tool")) {
+            saw_tool = true;
+            try std.testing.expectEqualStrings("bash", r.tool_name);
+            try std.testing.expectEqual(@as(i64, 1), r.is_error);
+            try std.testing.expectEqualStrings("call_9", r.tool_call_id);
+        }
+    }
+    try std.testing.expect(saw_tool);
+
+    // 会话 id 为 0（无法落库）：worker 不开连接，db_id 保持 0 → 回退 finalize 批量落库
+    var slot: ?db_mod.Db = null;
+    job.session_id_num = 0;
+    try std.testing.expect(ensureWorkerDb(job, &slot) == null);
+    try std.testing.expect(slot == null);
+    job.session_id_num = sid;
+    try std.testing.expect(ensureWorkerDb(job, &slot) != null);
+    if (slot) |*d| d.deinit();
 }
 
 test "手动压缩：小会话自适应缩小保留窗口（需 mock 18125）" {

@@ -32,20 +32,20 @@ pub const Preset = struct {
     affinity: Affinity = .none,
     cache_key: bool = false,
     retention: CacheRetention = .none,
-    include_usage: bool = false,
+    include_usage: bool = true,
 };
 
 pub const presets = [_]Preset{
-    .{ .id = "openai", .display = "OpenAI", .endpoint = "https://api.openai.com/v1", .api_key_env = "OPENAI_API_KEY", .affinity = .openai, .cache_key = true, .retention = .short, .include_usage = true },
-    .{ .id = "opencode", .display = "OpenCode Zen", .endpoint = "https://opencode.ai/zen/v1", .api_key_env = "OPENCODE_API_KEY", .affinity = .opencode, .include_usage = true },
-    .{ .id = "opencode-go", .display = "OpenCode Zen Go", .endpoint = "https://opencode.ai/zen/go/v1", .api_key_env = "OPENCODE_API_KEY", .affinity = .opencode, .include_usage = true },
-    .{ .id = "openrouter", .display = "OpenRouter", .endpoint = "https://openrouter.ai/api/v1", .api_key_env = "OPENROUTER_API_KEY", .affinity = .openrouter, .cache_key = true, .retention = .short, .include_usage = true },
+    .{ .id = "openai", .display = "OpenAI", .endpoint = "https://api.openai.com/v1", .api_key_env = "OPENAI_API_KEY", .affinity = .openai, .cache_key = true, .retention = .short },
+    .{ .id = "opencode", .display = "OpenCode Zen", .endpoint = "https://opencode.ai/zen/v1", .api_key_env = "OPENCODE_API_KEY", .affinity = .opencode },
+    .{ .id = "opencode-go", .display = "OpenCode Zen Go", .endpoint = "https://opencode.ai/zen/go/v1", .api_key_env = "OPENCODE_API_KEY", .affinity = .opencode },
+    .{ .id = "openrouter", .display = "OpenRouter", .endpoint = "https://openrouter.ai/api/v1", .api_key_env = "OPENROUTER_API_KEY", .affinity = .openrouter, .cache_key = true, .retention = .short },
     .{ .id = "deepseek", .display = "DeepSeek", .endpoint = "https://api.deepseek.com/v1", .api_key_env = "DEEPSEEK_API_KEY" },
     .{ .id = "moonshot", .display = "Moonshot / Kimi", .endpoint = "https://api.moonshot.cn/v1", .api_key_env = "MOONSHOT_API_KEY" },
     .{ .id = "zai", .display = "Z.ai (GLM)", .endpoint = "https://api.z.ai/api/paas/v4", .api_key_env = "ZHIPU_API_KEY" },
-    .{ .id = "groq", .display = "Groq", .endpoint = "https://api.groq.com/openai/v1", .api_key_env = "GROQ_API_KEY", .include_usage = true },
+    .{ .id = "groq", .display = "Groq", .endpoint = "https://api.groq.com/openai/v1", .api_key_env = "GROQ_API_KEY" },
     .{ .id = "mistral", .display = "Mistral", .endpoint = "https://api.mistral.ai/v1", .api_key_env = "MISTRAL_API_KEY", .cache_key = true, .retention = .short },
-    .{ .id = "xai", .display = "xAI (Grok)", .endpoint = "https://api.x.ai/v1", .api_key_env = "XAI_API_KEY", .cache_key = true, .retention = .short, .include_usage = true },
+    .{ .id = "xai", .display = "xAI (Grok)", .endpoint = "https://api.x.ai/v1", .api_key_env = "XAI_API_KEY", .cache_key = true, .retention = .short },
     .{ .id = "google", .display = "Google (OpenAI 兼容)", .endpoint = "https://generativelanguage.googleapis.com/v1beta/openai", .api_key_env = "GEMINI_API_KEY" },
     .{ .id = "cerebras", .display = "Cerebras", .endpoint = "https://api.cerebras.ai/v1", .api_key_env = "CEREBRAS_API_KEY", .cache_key = true, .retention = .short },
     .{ .id = "fireworks", .display = "Fireworks", .endpoint = "https://api.fireworks.ai/inference/v1", .api_key_env = "FIREWORKS_API_KEY", .affinity = .fireworks },
@@ -109,8 +109,10 @@ pub const Behavior = struct {
     /// 是否在 body 里发 prompt_cache_key
     cache_key: bool = false,
     retention: CacheRetention = .none,
-    /// 是否请求流式 usage（stream_options.include_usage）
-    include_usage: bool = false,
+    /// 是否请求流式 usage（stream_options.include_usage）。
+    /// 默认开启（几乎所有 OpenAI 兼容网关都接受 stream_options；不认的会忽略未知字段）。
+    /// 没有真实 usage 时无法显示缓存命中率、压缩阈值只能退化为估算。
+    include_usage: bool = true,
     extra_headers: []const HeaderKV = &.{},
     /// 思考强度："" 不发 / "off" / "low" / "high" / "max"
     reasoning_effort: []const u8 = "",
@@ -144,6 +146,12 @@ pub fn behavior(p: *const Provider) Behavior {
     } else if (b.cache_key and b.retention == .none) {
         b.retention = .short;
     }
+    // 流式 usage 覆盖：on/off 强制；空/"auto" 保持预设默认（当前默认全开）
+    if (std.mem.eql(u8, p.opt_include_usage, "on")) {
+        b.include_usage = true;
+    } else if (std.mem.eql(u8, p.opt_include_usage, "off")) {
+        b.include_usage = false;
+    }
     b.extra_headers = p.opt_headers;
     return b;
 }
@@ -162,6 +170,9 @@ pub const Provider = struct {
     opt_prompt_cache_key: []u8 = &.{},
     /// 显式缓存保留策略：""/"auto" = 自动，"none"/"short"/"long"
     opt_cache_retention: []u8 = &.{},
+    /// 显式开关流式 usage：""/"auto" = 自动（默认发），"on"/"off" 强制
+    /// （个别网关不认 stream_options 时设为 "off"）
+    opt_include_usage: []u8 = &.{},
     /// 显式指定上下文窗口大小（0 = 用启发式表）
     opt_context_window: u64 = 0,
     opt_headers: []HeaderKV = &.{},
@@ -182,6 +193,7 @@ pub const Provider = struct {
         freeOptional(allocator, self.opt_session_affinity);
         freeOptional(allocator, self.opt_prompt_cache_key);
         freeOptional(allocator, self.opt_cache_retention);
+        freeOptional(allocator, self.opt_include_usage);
         freeHeaders(allocator, self.opt_headers);
         self.opt_headers = &.{};
     }
@@ -208,6 +220,7 @@ const OptionsJson = struct {
     session_affinity: []const u8 = "",
     prompt_cache_key: []const u8 = "",
     cache_retention: []const u8 = "",
+    include_usage: []const u8 = "",
     context_window: u64 = 0,
     headers: []const HeaderJson = &.{},
 };
@@ -243,6 +256,7 @@ pub const ProviderSpec = struct {
     opt_session_affinity: []const u8 = "",
     opt_prompt_cache_key: []const u8 = "",
     opt_cache_retention: []const u8 = "",
+    opt_include_usage: []const u8 = "",
     opt_context_window: u64 = 0,
     opt_headers: []const HeaderKV = &.{},
 };
@@ -256,6 +270,7 @@ const SaveOptions = struct {
     session_affinity: ?[]const u8 = null,
     prompt_cache_key: ?[]const u8 = null,
     cache_retention: ?[]const u8 = null,
+    include_usage: ?[]const u8 = null,
     context_window: ?i64 = null,
     headers: ?[]const SaveHeader = null,
 };
@@ -328,6 +343,8 @@ fn buildProvider(allocator: Allocator, spec: ProviderSpec) !Provider {
     errdefer freeOptional(allocator, p.opt_prompt_cache_key);
     p.opt_cache_retention = try dupeOptional(allocator, spec.opt_cache_retention);
     errdefer freeOptional(allocator, p.opt_cache_retention);
+    p.opt_include_usage = try dupeOptional(allocator, spec.opt_include_usage);
+    errdefer freeOptional(allocator, p.opt_include_usage);
     p.opt_headers = try dupeHeaders(allocator, spec.opt_headers);
     return p;
 }
@@ -382,6 +399,7 @@ pub const Config = struct {
                 .opt_session_affinity = pj.options.session_affinity,
                 .opt_prompt_cache_key = pj.options.prompt_cache_key,
                 .opt_cache_retention = pj.options.cache_retention,
+                .opt_include_usage = pj.options.include_usage,
                 .opt_context_window = pj.options.context_window,
                 .opt_headers = headers,
             });
@@ -484,6 +502,7 @@ pub const Config = struct {
                     .session_affinity = if (p.opt_session_affinity.len > 0) p.opt_session_affinity else null,
                     .prompt_cache_key = if (p.opt_prompt_cache_key.len > 0) p.opt_prompt_cache_key else null,
                     .cache_retention = if (p.opt_cache_retention.len > 0) p.opt_cache_retention else null,
+                    .include_usage = if (p.opt_include_usage.len > 0) p.opt_include_usage else null,
                     .context_window = if (p.opt_context_window > 0) @intCast(p.opt_context_window) else null,
                     .headers = save_headers,
                 },
@@ -538,6 +557,14 @@ test "预设表：可查找且字段合理" {
     try std.testing.expect(findPreset("no-such-preset") == null);
 }
 
+/// 所有预设默认请求流式 usage（无真实 usage 时缓存命中率/压缩阈值都不可用）
+fn allPresetsDefaultIncludeUsage() bool {
+    for (&presets) |*p| {
+        if (!p.include_usage) return false;
+    }
+    return true;
+}
+
 test "behavior：预设 + 覆盖 + 主机名兜底" {
     // 预设：OpenAI 方言 + 缓存 key
     var p = Provider{
@@ -552,12 +579,19 @@ test "behavior：预设 + 覆盖 + 主机名兜底" {
     try std.testing.expectEqual(CacheRetention.short, b.retention);
     try std.testing.expect(b.include_usage);
 
-    // 无预设但主机是 opencode.ai → 兜底 opencode 方言
+    // 无预设但主机是 opencode.ai → 兜底 opencode 方言；usage 默认仍开启
     p.preset = @constCast("");
     p.endpoint = @constCast("https://opencode.ai/zen/go/v1");
     b = behavior(&p);
     try std.testing.expectEqual(Affinity.opencode, b.affinity);
     try std.testing.expect(!b.cache_key);
+    try std.testing.expect(b.include_usage);
+
+    // 任意自定义端点（无预设）：usage 默认开启（默认全发，预设可显式关）
+    p.endpoint = @constCast("http://127.0.0.1:9999/v1");
+    b = behavior(&p);
+    try std.testing.expect(b.include_usage);
+    try std.testing.expect(allPresetsDefaultIncludeUsage());
 
     // 显式覆盖：关缓存 key、改方言、强制 long
     p.opt_session_affinity = @constCast("openrouter");
@@ -567,6 +601,18 @@ test "behavior：预设 + 覆盖 + 主机名兜底" {
     try std.testing.expectEqual(Affinity.openrouter, b.affinity);
     try std.testing.expect(!b.cache_key);
     try std.testing.expectEqual(CacheRetention.long, b.retention);
+
+    // 流式 usage 覆盖：off 可关（严格网关逃生门），on 可强制，auto/空 保持默认
+    p.opt_include_usage = @constCast("off");
+    b = behavior(&p);
+    try std.testing.expect(!b.include_usage);
+    p.opt_include_usage = @constCast("on");
+    b = behavior(&p);
+    try std.testing.expect(b.include_usage);
+    p.opt_include_usage = @constCast("auto");
+    b = behavior(&p);
+    try std.testing.expect(b.include_usage);
+    p.opt_include_usage = @constCast("");
 
     // 自定义头部透传
     const headers = [_]HeaderKV{.{ .name = "X-Test", .value = "1" }};
@@ -619,6 +665,7 @@ test "config：JSON 解析新字段并应用" {
         \\        "session_affinity": "openai",
         \\        "prompt_cache_key": "on",
         \\        "cache_retention": "long",
+        \\        "include_usage": "off",
         \\        "headers": [{ "name": "X-Org", "value": "acme" }]
         \\      }
         \\    }
@@ -633,5 +680,16 @@ test "config：JSON 解析新字段并应用" {
     try std.testing.expectEqualStrings("COMPANY_KEY", pj.api_key_env);
     try std.testing.expectEqualStrings("openai", pj.options.session_affinity);
     try std.testing.expectEqualStrings("long", pj.options.cache_retention);
+    try std.testing.expectEqualStrings("off", pj.options.include_usage);
     try std.testing.expectEqualStrings("X-Org", pj.options.headers[0].name);
+
+    // 解析出的 include_usage 覆盖经 behavior 生效
+    var p = Provider{
+        .name = @constCast("company-gw"),
+        .endpoint = @constCast("https://gw.example.com/v1"),
+        .api_key = @constCast(""),
+        .preset = @constCast("openrouter"),
+        .opt_include_usage = @constCast(pj.options.include_usage),
+    };
+    try std.testing.expect(!behavior(&p).include_usage);
 }

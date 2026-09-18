@@ -81,7 +81,7 @@ pub fn buildRequestBody(
 
     var root = std.json.ObjectMap{};
     try root.put(a, "model", .{ .string = model });
-    try root.put(a, "temperature", .{ .float = 0.7 });
+    // 不发送 temperature：使用服务端默认值（与 pi 一致；不同模型支持的取值范围不同）
     try root.put(a, "stream", .{ .bool = true });
 
     // 缓存亲和：prompt_cache_key / prompt_cache_retention / 流式 usage
@@ -118,7 +118,9 @@ pub fn buildRequestBody(
     }
 
     var msg_arr = std.json.Array.init(a);
-    for (messages) |m| try msg_arr.append(try messageToValue(a, m));
+    // 修复悬空工具调用（取消/中止导致结果缺失）后再序列化，避免服务端拒绝整个请求
+    const repaired = try repairDanglingToolCalls(a, messages);
+    for (repaired) |m| try msg_arr.append(try messageToValue(a, m));
     try root.put(a, "messages", .{ .array = msg_arr });
 
     if (tools.len > 0) {
@@ -143,6 +145,61 @@ pub fn buildRequestBody(
     errdefer out.deinit();
     std.json.Stringify.value(std.json.Value{ .object = root }, .{}, &out.writer) catch return error.OutOfMemory;
     return out.toOwnedSlice();
+}
+
+/// 悬空工具调用修复时使用的固定结果文案（稳定字符串，利于前缀缓存）
+pub const interrupted_tool_result = "[Tool execution was interrupted: no result was recorded. Re-invoke the tool if needed.]";
+
+/// 修复悬空工具调用：assistant 消息声明的每个 tool_call 都必须有对应 tool 结果，
+/// 否则多数服务端（OpenAI / Anthropic 兼容）会拒绝整个请求（取消/中止会留下这种消息）。
+/// 在既有结果之后为缺失的调用补一条固定文案的错误结果；无悬空时原样返回。
+///
+/// 注意：这是**请求层**的修复，落库内容不变——因此请求体可能与 DB 历史不同
+/// （补出的结果行不落库，靠固定文案在此处确定性重建）。做请求体对比/缓存分析时
+/// 请以本函数的输出（buildRequestBody 的产物）为准，而非直接序列化 DB 行。
+fn repairDanglingToolCalls(a: Allocator, messages: []const Message) error{OutOfMemory}![]const Message {
+    var has_calls = false;
+    for (messages) |m| {
+        if (std.mem.eql(u8, m.role, "assistant") and m.tool_calls != null) {
+            has_calls = true;
+            break;
+        }
+    }
+    if (!has_calls) return messages; // 快速路径：原样序列化
+
+    var out = std.ArrayListUnmanaged(Message){ .items = &.{}, .capacity = 0 };
+    var i: usize = 0;
+    while (i < messages.len) {
+        const m = messages[i];
+        try out.append(a, m);
+        i += 1;
+        if (!std.mem.eql(u8, m.role, "assistant")) continue;
+        const calls = m.tool_calls orelse continue;
+        if (calls.len == 0) continue;
+
+        // 紧随其后的工具结果属于本批次
+        const batch_start = out.items.len;
+        while (i < messages.len and std.mem.eql(u8, messages[i].role, "tool")) : (i += 1) {
+            try out.append(a, messages[i]);
+        }
+        for (calls) |c| {
+            var found = false;
+            for (out.items[batch_start..]) |r| {
+                if (std.mem.eql(u8, r.tool_call_id orelse "", c.id)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                try out.append(a, .{
+                    .role = "tool",
+                    .content = interrupted_tool_result,
+                    .tool_call_id = c.id,
+                });
+            }
+        }
+    }
+    return out.items;
 }
 
 fn messageToValue(a: Allocator, m: Message) error{OutOfMemory}!std.json.Value {
@@ -792,7 +849,7 @@ test "请求头：各家会话亲和方言 + 自定义头" {
 test "请求体：缓存参数与流式 usage" {
     const messages = [_]Message{.{ .role = "user", .content = "hi" }};
 
-    // 开启缓存 key（short）→ 只有 prompt_cache_key
+    // 开启缓存 key（short）→ 只有 prompt_cache_key；usage 默认开启（跟随服务端默认值）
     const short_body = try buildRequestBody(std.testing.allocator, "m", &messages, &.{}, "sess-1", .{
         .cache_key = true,
         .retention = .short,
@@ -800,17 +857,29 @@ test "请求体：缓存参数与流式 usage" {
     defer std.testing.allocator.free(short_body);
     try std.testing.expect(std.mem.indexOf(u8, short_body, "\"prompt_cache_key\":\"sess-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, short_body, "prompt_cache_retention") == null);
-    try std.testing.expect(std.mem.indexOf(u8, short_body, "stream_options") == null);
+    try std.testing.expect(std.mem.indexOf(u8, short_body, "\"include_usage\":true") != null);
 
-    // long + include_usage → 24h 保留 + stream_options
+    // 显式关闭 include_usage（个别网关不认 stream_options 时的逃生门）→ 不出现
+    const no_usage = try buildRequestBody(std.testing.allocator, "m", &messages, &.{}, "sess-1", .{
+        .cache_key = true,
+        .retention = .short,
+        .include_usage = false,
+    });
+    defer std.testing.allocator.free(no_usage);
+    try std.testing.expect(std.mem.indexOf(u8, no_usage, "stream_options") == null);
+
+    // long → 24h 保留 + stream_options
     const long_body = try buildRequestBody(std.testing.allocator, "m", &messages, &.{}, "sess-1", .{
         .cache_key = true,
         .retention = .long,
-        .include_usage = true,
     });
     defer std.testing.allocator.free(long_body);
     try std.testing.expect(std.mem.indexOf(u8, long_body, "\"prompt_cache_retention\":\"24h\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, long_body, "\"include_usage\":true") != null);
+
+    // 不发送 temperature：使用服务端默认值
+    try std.testing.expect(std.mem.indexOf(u8, short_body, "temperature") == null);
+    try std.testing.expect(std.mem.indexOf(u8, long_body, "temperature") == null);
 
     // 无 session_id → 不发 key；超长 key 截断到 64
     const no_sess = try buildRequestBody(std.testing.allocator, "m", &messages, &.{}, "", .{ .cache_key = true });
@@ -1015,6 +1084,71 @@ test "请求体：工具定义与工具消息" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_call_id\":\"call_1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":null") != null);
+}
+
+test "请求体：悬空工具调用自动补齐固定结果（取消/中止场景）" {
+    const alloc = std.testing.allocator;
+
+    // 场景 A：3 个调用只有 1 个结果（工具批次中途取消）→ 补 2 条固定文案结果
+    const messages = [_]Message{
+        .{ .role = "system", .content = "sys" },
+        .{ .role = "user", .content = "干活" },
+        .{
+            .role = "assistant",
+            .content = "",
+            .tool_calls = &.{
+                .{ .id = "c1", .name = "read", .arguments = "{}" },
+                .{ .id = "c2", .name = "bash", .arguments = "{}" },
+                .{ .id = "c3", .name = "grep", .arguments = "{}" },
+            },
+        },
+        .{ .role = "tool", .content = "结果1", .tool_call_id = "c1" },
+        // 注意：这里没有 c2/c3 的结果
+        .{ .role = "user", .content = "继续" },
+    };
+    const body = try buildRequestBody(alloc, "m", &messages, &.{}, "sess", .{});
+    defer alloc.free(body);
+    // 补齐：固定文案出现在请求体，且 tool_call_id 对得上
+    try std.testing.expect(std.mem.indexOf(u8, body, interrupted_tool_result) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_call_id\":\"c2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_call_id\":\"c3\"") != null);
+    // 原有结果保留且只出现一次
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"结果1\""));
+    // 补齐结果必须插在"继续"之前（工具结果紧跟批次）
+    const pos_c2 = std.mem.indexOf(u8, body, "\"tool_call_id\":\"c2\"").?;
+    const pos_next_user = std.mem.indexOf(u8, body, "继续").?;
+    try std.testing.expect(pos_c2 < pos_next_user);
+
+    // 场景 B：调用全部有结果 → 请求体不出现固定文案（不干扰正常路径）
+    const complete = [_]Message{
+        .{ .role = "assistant", .content = "", .tool_calls = &.{.{ .id = "c1", .name = "read", .arguments = "{}" }} },
+        .{ .role = "tool", .content = "ok", .tool_call_id = "c1" },
+    };
+    const body_b = try buildRequestBody(alloc, "m", &complete, &.{}, "sess", .{});
+    defer alloc.free(body_b);
+    try std.testing.expect(std.mem.indexOf(u8, body_b, interrupted_tool_result) == null);
+
+    // 场景 C：确定性（同输入两次构建逐字节相同，前缀缓存可用）
+    const body_c1 = try buildRequestBody(alloc, "m", &messages, &.{}, "sess", .{});
+    defer alloc.free(body_c1);
+    const body_c2 = try buildRequestBody(alloc, "m", &messages, &.{}, "sess", .{});
+    defer alloc.free(body_c2);
+    try std.testing.expectEqualStrings(body_c1, body_c2);
+
+    // 场景 D：多个悬空批次（连续两个被取消的工具轮）互不干扰
+    const two_batches = [_]Message{
+        .{ .role = "assistant", .content = "", .tool_calls = &.{.{ .id = "a1", .name = "read", .arguments = "{}" }} },
+        .{ .role = "assistant", .content = "", .tool_calls = &.{.{ .id = "b1", .name = "bash", .arguments = "{}" }} },
+        .{ .role = "user", .content = "再来" },
+    };
+    const body_d = try buildRequestBody(alloc, "m", &two_batches, &.{}, "sess", .{});
+    defer alloc.free(body_d);
+    try std.testing.expect(std.mem.indexOf(u8, body_d, "\"tool_call_id\":\"a1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body_d, "\"tool_call_id\":\"b1\"") != null);
+    // a1 的补齐结果在 b1 的 assistant 消息之前
+    const pos_a1 = std.mem.indexOf(u8, body_d, "\"tool_call_id\":\"a1\"").?;
+    const pos_b1_call = std.mem.indexOf(u8, body_d, "\"id\":\"b1\"").?;
+    try std.testing.expect(pos_a1 < pos_b1_call);
 }
 
 test "请求体：真实工具 schema（线程内构建，回归 arena UAF）" {

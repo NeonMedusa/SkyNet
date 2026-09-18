@@ -125,7 +125,7 @@ pub const CompactionRange = struct {
 };
 
 /// 选择压缩区间：system 与已有 checkpoint 永不进入摘要；
-/// 保留区按字节预算从新到旧累计，并对齐到 user 消息边界（避免孤立 tool 引用）。
+/// 保留区按字节预算从新到旧累计，起点对齐到不会被孤立的边界。
 pub fn selectCompactionRange(history: []const ai.Message, keep_bytes: usize) ?CompactionRange {
     if (history.len == 0) return null;
 
@@ -146,10 +146,13 @@ pub fn selectCompactionRange(history: []const ai.Message, keep_bytes: usize) ?Co
     }
     if (keep_start <= summarize_start) return null;
 
-    // 保留区必须以 user 开头：向后找到最近的 user；找不到则退到最后一个 user
+    // 保留区起点不能是 tool 消息（其对应的调用若被摘要，会产生孤立引用）；
+    // user / assistant 均可：assistant 带 tool_calls 时其结果紧随其后，协议自洽。
+    // 允许 assistant 开头使「超长工具循环的当前回合」也能被部分压缩。
     var retain = keep_start;
-    while (retain < history.len and !std.mem.eql(u8, history[retain].role, "user")) retain += 1;
+    while (retain < history.len and std.mem.eql(u8, history[retain].role, "tool")) retain += 1;
     if (retain >= history.len) {
+        // 极端情况（尾部全是 tool 结果）：退回对齐到最后一个 user
         var last_user: ?usize = null;
         var i = history.len;
         while (i > summarize_start) {
@@ -333,7 +336,7 @@ test "token 估算与折叠模拟" {
     try testing.expect(!sim_recent.triggered);
 }
 
-test "压缩区间选择（对齐 user 边界，跳过已有 checkpoint）" {
+test "压缩区间选择（跳过已有 checkpoint，保留边界不产生孤立引用）" {
     const msgs = [_]ai.Message{
         .{ .role = "system", .content = "sys" },
         .{ .role = "user", .content = "u1" },
@@ -342,10 +345,10 @@ test "压缩区间选择（对齐 user 边界，跳过已有 checkpoint）" {
         .{ .role = "user", .content = "u2" },
         .{ .role = "assistant", .content = "a2" },
     };
-    // 保留窗口极小 → 保留区对齐到最近的 user
+    // 保留窗口极小 → 收下 a2 后 u2 超预算，keep_start 落在 assistant（不再强推回 user）
     const r = selectCompactionRange(&msgs, 1).?;
     try testing.expectEqual(@as(usize, 1), r.summarize_start);
-    try testing.expectEqual(@as(usize, 4), r.retain_start);
+    try testing.expectEqual(@as(usize, 5), r.retain_start);
 
     // 窗口很大 → 无需压缩
     try testing.expect(selectCompactionRange(&msgs, 1 << 20) == null);
@@ -361,6 +364,44 @@ test "压缩区间选择（对齐 user 边界，跳过已有 checkpoint）" {
     const r2 = selectCompactionRange(&with_cp, 1).?;
     try testing.expectEqual(@as(usize, 2), r2.summarize_start);
     try testing.expectEqual(@as(usize, 4), r2.retain_start);
+}
+
+test "压缩区间选择：保留区可从 assistant 开始（当前回合可被部分压缩）" {
+    // 超长工具循环：回合内只有开头一个 user，其余是 assistant/tool 交替
+    // 单条字节：无调用助手/工具=4 左右，带调用的 assistant = 4 + (2 + 32) = 38
+    const turn = [_]ai.Message{
+        .{ .role = "system", .content = "sys" },
+        .{ .role = "user", .content = "u0" },
+        .{ .role = "assistant", .content = "a0" },
+        .{ .role = "user", .content = "u1" },
+        .{ .role = "assistant", .content = "aaaa", .tool_calls = &.{.{ .id = "c1", .name = "read", .arguments = "{}" }} },
+        .{ .role = "tool", .content = "tttt", .tool_call_id = "c1" },
+        .{ .role = "assistant", .content = "bbbb", .tool_calls = &.{.{ .id = "c2", .name = "read", .arguments = "{}" }} },
+        .{ .role = "tool", .content = "tttt", .tool_call_id = "c2" },
+    };
+    // 预算 42：收下 t2(4)+a2(38)，再往前 t1 超预算 → keep_start 落在 assistant（index 6）
+    const r = selectCompactionRange(&turn, 42).?;
+    try testing.expectEqual(@as(usize, 1), r.summarize_start);
+    try testing.expectEqual(@as(usize, 6), r.retain_start); // 当前回合前半段(u1,a1,t1)进入摘要
+
+    // keep_start 落在 tool 上时向前跳过（不能以 tool 开头），落到其后的 assistant
+    // 预算 50：收下 t2(4)+a2(38)+t1(4)=46，再往前 a1 超预算 → keep_start=5（tool t1）→ 跳到 6
+    const r2 = selectCompactionRange(&turn, 50).?;
+    try testing.expectEqual(@as(usize, 6), r2.retain_start);
+
+    // 尾部全是 tool（异常历史）：退回对齐到最后一个 user，保证不产生孤立引用
+    const tails = [_]ai.Message{
+        .{ .role = "system", .content = "sys" },
+        .{ .role = "user", .content = "u0" },
+        .{ .role = "assistant", .content = "a0" },
+        .{ .role = "user", .content = "u1" },
+        .{ .role = "assistant", .content = "a1" },
+        .{ .role = "tool", .content = "t1", .tool_call_id = "c1" },
+        .{ .role = "tool", .content = "t2", .tool_call_id = "c2" },
+    };
+    // 预算 3：收下 t2(2)，t1(2) 超预算 → keep_start=6（tool）→ 跳过剩余 tool → 退到 u1
+    const r3 = selectCompactionRange(&tails, 3).?;
+    try testing.expectEqual(@as(usize, 3), r3.retain_start);
 }
 
 test "按字符截断：UTF-8 边界安全" {

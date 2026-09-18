@@ -270,10 +270,22 @@ fn utf8BoundaryBack(data: []const u8, from: usize) usize {
 // ── 分发 ──
 
 pub fn execute(allocator: Allocator, io: Io, cwd: []const u8, name: []const u8, args_json: []const u8) error{OutOfMemory}!Result {
+    return executeWithEnv(allocator, io, cwd, name, args_json, null);
+}
+
+/// 带环境变量映射的版本（bash 截断时把全文写入系统临时目录需要 TEMP/TMPDIR）
+pub fn executeWithEnv(
+    allocator: Allocator,
+    io: Io,
+    cwd: []const u8,
+    name: []const u8,
+    args_json: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+) error{OutOfMemory}!Result {
     if (std.mem.eql(u8, name, "read")) return toolRead(allocator, io, cwd, args_json);
     if (std.mem.eql(u8, name, "write")) return toolWrite(allocator, io, cwd, args_json);
     if (std.mem.eql(u8, name, "edit")) return toolEdit(allocator, io, cwd, args_json);
-    if (std.mem.eql(u8, name, "bash")) return toolBash(allocator, io, cwd, args_json);
+    if (std.mem.eql(u8, name, "bash")) return toolBash(allocator, io, cwd, args_json, environ_map);
     if (std.mem.eql(u8, name, "grep")) return toolGrep(allocator, io, cwd, args_json);
     if (std.mem.eql(u8, name, "find")) return toolFind(allocator, io, cwd, args_json);
     if (std.mem.eql(u8, name, "ls")) return toolLs(allocator, io, cwd, args_json);
@@ -657,7 +669,13 @@ fn stripAnsiAlloc(allocator: Allocator, data: []const u8) error{OutOfMemory}![]u
     return out.toOwnedSlice(allocator);
 }
 
-fn toolBash(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8) error{OutOfMemory}!Result {
+fn toolBash(
+    allocator: Allocator,
+    io: Io,
+    cwd: []const u8,
+    args_json: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+) error{OutOfMemory}!Result {
     var args_arena = std.heap.ArenaAllocator.init(allocator);
     defer args_arena.deinit();
     const args = parseArgs(BashArgs, args_arena.allocator(), args_json) orelse
@@ -728,6 +746,21 @@ fn toolBash(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8
         cap.text = try allocator.dupe(u8, "(no output)");
     }
 
+    // 截断时把全文写入系统临时文件，并在提示里给出路径：
+    // 模型需要被截掉的部分时可以直接 read，而不是重跑命令（pi / opencode 同款兜底）
+    if (cap.notice.len > 0) {
+        if (try persistBashFullOutput(allocator, io, environ_map, stripped)) |path| {
+            defer allocator.free(path);
+            const amended = try std.fmt.allocPrint(
+                allocator,
+                "{s}\nFull output saved to: {s}",
+                .{ cap.notice, path },
+            );
+            allocator.free(cap.notice);
+            cap.notice = amended;
+        }
+    }
+
     var exit_note: ?[]u8 = null;
     defer if (exit_note) |n| allocator.free(n);
     switch (run_result.term) {
@@ -747,6 +780,90 @@ fn toolBash(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8
         cap.text = with_note;
     }
     return .{ .content = try finishCapped(allocator, cap.text, cap.notice), .is_error = false };
+}
+
+/// bash 截断全文落盘用的自增序号（同一毫秒内多次截断时避免重名）。
+/// 仅由 agent worker 线程访问（工具执行单线程）；若未来多线程并行调工具需改为原子。
+var bash_temp_seq: u32 = 0;
+
+/// bash 临时文件所在目录（TEMP/TMPDIR/TMP；缺失返回 null）
+fn bashTempDir(environ_map: ?*const std.process.Environ.Map) ?[]const u8 {
+    const map = environ_map orelse return null;
+    const dir = map.get("TEMP") orelse map.get("TMPDIR") orelse map.get("TMP") orelse return null;
+    return if (dir.len > 0) dir else null;
+}
+
+/// 把被截断的 bash 全文写入系统临时目录（TEMP/TMPDIR/TMP）。
+/// 返回分配的路径；环境变量缺失或写入失败时返回 null（调用方保留原提示）。
+fn persistBashFullOutput(
+    allocator: Allocator,
+    io: Io,
+    environ_map: ?*const std.process.Environ.Map,
+    data: []const u8,
+) error{OutOfMemory}!?[]u8 {
+    const dir = bashTempDir(environ_map) orelse return null;
+
+    var name_buf: [80]u8 = undefined;
+    const now_ms = Io.Timestamp.now(io, .awake).toMilliseconds();
+    bash_temp_seq +%= 1;
+    const name = std.fmt.bufPrint(&name_buf, "skynet-bash-{d}-{d}.txt", .{ now_ms, bash_temp_seq }) catch return null;
+    const path = try std.fs.path.join(allocator, &.{ dir, name });
+    errdefer allocator.free(path);
+
+    const parent = std.fs.path.dirname(path) orelse {
+        allocator.free(path);
+        return null;
+    };
+    var d = Dir.openDirAbsolute(io, parent, .{}) catch {
+        allocator.free(path);
+        return null;
+    };
+    defer d.close(io);
+    // POSIX 下 /tmp 默认 0644 会让同机其他用户读到工具输出：收紧到 0600（Windows 忽略该值）
+    const perms: std.Io.File.Permissions = if (@import("builtin").os.tag == .windows)
+        .default_file
+    else
+        @enumFromInt(0o600);
+    const f = d.createFile(io, std.fs.path.basename(path), .{ .truncate = true, .permissions = perms }) catch {
+        allocator.free(path);
+        return null;
+    };
+    defer f.close(io);
+    f.writeStreamingAll(io, data) catch {
+        allocator.free(path);
+        return null;
+    };
+    return path;
+}
+
+/// 删除过期的 bash 截断临时文件（文件名内嵌写入时间戳，无需 stat）。
+/// 保留 max_age_ms 内的文件——会话历史里的 stub 仍可能引用它们；
+/// 更早的按"临时"语义回收（用户重读旧会话时该路径可能已失效，属预期）。
+/// 返回删除数量。由 TUI 启动时调用；失败静默（清理是尽力而为）。
+pub fn cleanupStaleBashTempFiles(
+    io: Io,
+    environ_map: ?*const std.process.Environ.Map,
+    now_ms: i64,
+    max_age_ms: i64,
+) usize {
+    const dir = bashTempDir(environ_map) orelse return 0;
+    var d = Dir.openDirAbsolute(io, dir, .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+
+    var removed: usize = 0;
+    var it = d.iterate();
+    while (it.next(io) catch return removed) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        const name = entry.name;
+        if (!std.mem.startsWith(u8, name, "skynet-bash-") or !std.mem.endsWith(u8, name, ".txt")) continue;
+        const rest = name["skynet-bash-".len .. name.len - ".txt".len];
+        const dash = std.mem.indexOfScalar(u8, rest, '-') orelse continue;
+        const created = std.fmt.parseInt(i64, rest[0..dash], 10) catch continue;
+        if (now_ms - created <= max_age_ms) continue;
+        d.deleteFile(io, name) catch continue;
+        removed += 1;
+    }
+    return removed;
 }
 
 // ── 目录遍历与通配符 ──
@@ -1679,6 +1796,136 @@ test "tools: capTail 保留前导空行且不误报截断" {
         defer testing.allocator.free(cap.notice);
         try testing.expectEqualStrings("[Showing lines 2-2 of 2.]", cap.notice);
     }
+}
+
+test "tools: bash 截断时全文落临时文件（可用 read 续看，无需重跑）" {
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    defer threaded.deinit();
+
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+
+    // 自建临时目录作为 TEMP，避免污染系统目录
+    const tmp_dir = try std.fs.path.join(testing.allocator, &.{ cwd, "skynet_test_bash_tmp" });
+    defer testing.allocator.free(tmp_dir);
+    removeTree(io, testing.allocator, tmp_dir);
+    defer removeTree(io, testing.allocator, tmp_dir);
+    makeDirs(io, tmp_dir);
+
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("TEMP", tmp_dir);
+
+    // 输出 100KB（超过 50KB 上限）→ 截断且给出全文路径
+    const r = try executeWithEnv(
+        testing.allocator,
+        io,
+        cwd,
+        "bash",
+        "{\"command\":\"Write-Output ('x' * 100000)\"}",
+        &env,
+    );
+    defer testing.allocator.free(r.content);
+    defer if (r.display) |d| testing.allocator.free(d);
+    try testing.expect(!r.is_error);
+    const marker = "Full output saved to: ";
+    const pos = std.mem.indexOf(u8, r.content, marker) orelse {
+        // 非 Windows 环境（无 pwsh）时跳过：本测试依赖 pwsh 语法
+        return error.SkipZigTest;
+    };
+    const path = std.mem.trimEnd(u8, r.content[pos + marker.len ..], " \r\n");
+    try testing.expect(std.mem.indexOf(u8, path, "skynet-bash-") != null);
+
+    // 临时文件应保存全文（100000 个 x + 换行），远大于截断后的可见部分
+    const full = try readFile(io, testing.allocator, path, 1024 * 1024);
+    defer testing.allocator.free(full);
+    try testing.expect(full.len >= 100_000);
+    try testing.expect(std.mem.indexOf(u8, full, "xxxx") != null);
+    try testing.expect(std.mem.indexOf(u8, r.content, "[Showing lines") != null);
+
+    // 无 TEMP/TMPDIR 环境变量时优雅降级：不写文件、提示保留
+    {
+        var empty_env = std.process.Environ.Map.init(testing.allocator);
+        defer empty_env.deinit();
+        const r2 = try executeWithEnv(
+            testing.allocator,
+            io,
+            cwd,
+            "bash",
+            "{\"command\":\"Write-Output ('y' * 100000)\"}",
+            &empty_env,
+        );
+        defer testing.allocator.free(r2.content);
+        defer if (r2.display) |d| testing.allocator.free(d);
+        try testing.expect(std.mem.indexOf(u8, r2.content, "[Showing lines") != null);
+        try testing.expect(std.mem.indexOf(u8, r2.content, marker) == null);
+    }
+}
+
+test "tools: 过期 bash 临时文件启动清理" {
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    defer threaded.deinit();
+
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+
+    const tmp_dir = try std.fs.path.join(testing.allocator, &.{ cwd, "skynet_test_bash_cleanup" });
+    defer testing.allocator.free(tmp_dir);
+    removeTree(io, testing.allocator, tmp_dir);
+    defer removeTree(io, testing.allocator, tmp_dir);
+    makeDirs(io, tmp_dir);
+
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("TEMP", tmp_dir);
+
+    const now_ms: i64 = 1_000_000_000_000;
+    const age: i64 = 7 * 24 * 60 * 60 * 1000; // 7 天
+    const old_ts = now_ms - age - 1000; // 过期
+    const new_ts = now_ms - 60_000; // 未过期
+
+    var buf_old: [64]u8 = undefined;
+    const name_old = try std.fmt.bufPrint(&buf_old, "skynet-bash-{d}-1.txt", .{old_ts});
+    var buf_new: [64]u8 = undefined;
+    const name_new = try std.fmt.bufPrint(&buf_new, "skynet-bash-{d}-2.txt", .{new_ts});
+    const kept_names = [_][]const u8{
+        name_new,
+        "skynet-bash-abc-3.txt", // 时间戳不可解析 → 留
+        "other-999999000000-4.txt", // 前缀不符 → 留
+        "skynet-bash-999999000000-5.log", // 扩展名不符 → 留
+    };
+    {
+        var d = try Dir.openDirAbsolute(io, tmp_dir, .{});
+        defer d.close(io);
+        var f = try d.createFile(io, name_old, .{});
+        f.close(io);
+        for (kept_names) |n| {
+            var k = try d.createFile(io, n, .{});
+            k.close(io);
+        }
+    }
+
+    const removed = cleanupStaleBashTempFiles(io, &env, now_ms, age);
+    try testing.expectEqual(@as(usize, 1), removed);
+
+    var d = try Dir.openDirAbsolute(io, tmp_dir, .{ .iterate = true });
+    defer d.close(io);
+    var old_gone = true;
+    var kept_count: usize = 0;
+    var it = d.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (std.mem.eql(u8, entry.name, name_old)) old_gone = false;
+        kept_count += 1;
+    }
+    try testing.expect(old_gone);
+    try testing.expectEqual(kept_names.len, kept_count);
+
+    // 无 TEMP/TMPDIR → 不做任何事
+    var empty_env = std.process.Environ.Map.init(testing.allocator);
+    defer empty_env.deinit();
+    try testing.expectEqual(@as(usize, 0), cleanupStaleBashTempFiles(io, &empty_env, now_ms, 0));
 }
 
 test "tools: grep 重叠上下文不重复输出，且不以换行结尾时不多出幽灵行" {
