@@ -15,7 +15,7 @@ pub const ToolDef = struct {
 pub const tool_defs = [_]ToolDef{
     .{
         .name = "read",
-        .description = "Read the contents of a file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files.",
+        .description = "Read the contents of a file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Each line is prefixed with its absolute line number as \"N: text\" (1-indexed); the number prefix is not part of the file content, so do not include it when matching text for edit. Use offset/limit for large files.",
         .parameters =
         \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"integer","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"integer","description":"Maximum number of lines to read"}},"required":["path"]}
         ,
@@ -161,6 +161,30 @@ fn countLines(data: []const u8) usize {
     }
     if (scan < data.len) total += 1;
     return total;
+}
+
+/// 给每行加绝对行号前缀（"N: 内容"，1 起）：便于模型引用位置与后续 edit 定位。
+/// line_start 为 data 第一行的绝对行号；行尾换行原样保留，不新增/删除行。
+fn numberLines(allocator: Allocator, data: []const u8, line_start: usize) error{OutOfMemory}![]u8 {
+    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    var line_no = line_start;
+    while (i < data.len) : (line_no += 1) {
+        const nl = std.mem.indexOfScalarPos(u8, data, i, '\n');
+        const line_end = nl orelse data.len;
+        var num_buf: [24]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&num_buf, "{d}: ", .{line_no}) catch unreachable;
+        try out.appendSlice(allocator, prefix);
+        try out.appendSlice(allocator, data[i..line_end]);
+        if (nl) |n| {
+            try out.append(allocator, '\n');
+            i = n + 1;
+        } else {
+            i = data.len;
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// 头部截断：保留前面的完整行，超出部分丢弃。
@@ -337,9 +361,12 @@ fn toolRead(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8
         pos = (std.mem.indexOfScalarPos(u8, data, pos, '\n') orelse data.len - 1) + 1;
     }
     const sliced = data[@min(pos, data.len)..];
+    // 行号前缀（绝对行号，与 offset 语义一致）：便于模型引用行号/后续 edit 定位
+    const numbered = try numberLines(allocator, sliced, start_line + 1);
+    defer allocator.free(numbered);
 
     const max_lines: usize = if (args.limit > 0) @intCast(args.limit) else cap_lines;
-    const cap = try capHead(allocator, sliced, max_lines, cap_bytes, start_line + 1);
+    const cap = try capHead(allocator, numbered, max_lines, cap_bytes, start_line + 1);
     return .{ .content = try finishCapped(allocator, cap.text, cap.notice), .is_error = false };
 }
 
@@ -1477,12 +1504,12 @@ test "tools: read/write/edit/ls/find/grep 基础流程" {
         try testing.expect(std.mem.indexOf(u8, r.content, "Successfully wrote") != null);
     }
 
-    // read：offset/limit（附续读提示）
+    // read：offset/limit（附续读提示；行号前缀为绝对行号）
     {
         const r = try execute(testing.allocator, io, cwd, "read", "{\"path\":\"skynet_test_tools/src/a.txt\",\"offset\":2,\"limit\":1}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
-        try testing.expectEqualStrings("world\n\n[Showing lines 2-2 of 3. Use offset=3 to continue.]", r.content);
+        try testing.expectEqualStrings("2: world\n\n[Showing lines 2-2 of 3. Use offset=3 to continue.]", r.content);
     }
 
     // read：文件不存在 / 目录
@@ -2010,6 +2037,88 @@ test "tools: read 单行超字节上限时提示不再指向越界的 offset" {
     defer testing.allocator.free(r2.content);
     defer if (r2.display) |d| testing.allocator.free(d);
     try testing.expect(r2.is_error);
+}
+
+test "tools: read 行号前缀（绝对行号；offset/无尾换行/空文件边界）" {
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    defer threaded.deinit();
+
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+
+    const root_name = "skynet_test_read_lines";
+    const root = try std.fs.path.join(testing.allocator, &.{ cwd, root_name });
+    defer testing.allocator.free(root);
+    removeTree(io, testing.allocator, root);
+    defer removeTree(io, testing.allocator, root);
+    makeDirs(io, root);
+
+    // 整文件：每行 "N: 内容"，绝对行号从 1 起
+    {
+        const f = try std.fs.path.join(testing.allocator, &.{ root, "three.txt" });
+        defer testing.allocator.free(f);
+        try writeFileBytes(io, f, "alpha\nbeta\ngamma\n");
+        const r = try execute(testing.allocator, io, cwd, "read", "{\"path\":\"skynet_test_read_lines/three.txt\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expectEqualStrings("1: alpha\n2: beta\n3: gamma\n", r.content);
+    }
+
+    // offset=2 → 行号是文件绝对行号（2 起），不是从 1 重新计数
+    {
+        const r = try execute(testing.allocator, io, cwd, "read", "{\"path\":\"skynet_test_read_lines/three.txt\",\"offset\":2}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expectEqualStrings("2: beta\n3: gamma\n", r.content);
+    }
+
+    // 无尾换行的最后一行也要有行号且不丢内容
+    {
+        const f = try std.fs.path.join(testing.allocator, &.{ root, "noeol.txt" });
+        defer testing.allocator.free(f);
+        try writeFileBytes(io, f, "one\ntwo");
+        const r = try execute(testing.allocator, io, cwd, "read", "{\"path\":\"skynet_test_read_lines/noeol.txt\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expectEqualStrings("1: one\n2: two", r.content);
+    }
+
+    // 截断提示的行号与编号一致（limit=1 在 offset=2 处）
+    {
+        const r = try execute(testing.allocator, io, cwd, "read", "{\"path\":\"skynet_test_read_lines/three.txt\",\"offset\":2,\"limit\":1}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expectEqualStrings("2: beta\n\n[Showing lines 2-2 of 3. Use offset=3 to continue.]", r.content);
+    }
+
+    // 空文件：空内容、无提示、不报错
+    {
+        const f = try std.fs.path.join(testing.allocator, &.{ root, "empty.txt" });
+        defer testing.allocator.free(f);
+        try writeFileBytes(io, f, "");
+        const r = try execute(testing.allocator, io, cwd, "read", "{\"path\":\"skynet_test_read_lines/empty.txt\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+        try testing.expectEqualStrings("", r.content);
+    }
+
+    // 单行大文件（首行超 50KB）：编号仍存在，字节截断提示保留
+    {
+        const f = try std.fs.path.join(testing.allocator, &.{ root, "big.txt" });
+        defer testing.allocator.free(f);
+        const huge = try testing.allocator.alloc(u8, 90 * 1024);
+        defer testing.allocator.free(huge);
+        @memset(huge, 'x');
+        try writeFileBytes(io, f, huge);
+        const r = try execute(testing.allocator, io, cwd, "read", "{\"path\":\"skynet_test_read_lines/big.txt\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+        try testing.expect(std.mem.startsWith(u8, r.content, "1: x"));
+        try testing.expect(std.mem.indexOf(u8, r.content, "No further lines") != null);
+    }
 }
 
 test "tools: grep 锚点与空行（零宽匹配）" {
