@@ -1,0 +1,17 @@
+.{
+    .name = .SkyNet,
+    .version = "0.0.0",
+    .fingerprint = 0xf6ebf8bd01572893,
+    .minimum_zig_version = "0.16.0",
+    .license = .mit,
+    .dependencies = .{
+        .zigtui = .{ .path = "libs/zigtui" },
+        .fridge = .{ .path = "libs/fridge-main" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "libs",
+    },
+}

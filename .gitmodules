@@ -1,0 +1,4 @@
+[submodule "libs/zigtui"]
+	path = libs/zigtui
+	url = https://github.com/NeonMedusa/zigtui.git
+	branch = skynet

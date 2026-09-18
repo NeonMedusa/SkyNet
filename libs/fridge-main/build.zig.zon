@@ -1,0 +1,20 @@
+.{
+    .name = .fridge,
+    .fingerprint = 0xf2e94d898a886cdc,
+    .version = "0.9.5",
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+
+    .dependencies = .{
+        .sqlite_source = .{
+            .url = "https://sqlite.org/2025/sqlite-autoconf-3490100.tar.gz",
+            .hash = "N-V-__8AAPmiwQDYOF242Pnl0pUbyqdyr4Rq43HQqlgvoeZG",
+        },
+    },
+}
