@@ -153,6 +153,14 @@ O(全会话字符数) 降为 O(消息数)（3000 条实测 5.7ms → 0.44ms，De
    不确定的 API/平台行为优先查官方文档或 issue，而非猜测。
 8. **git 小知识**：Windows 下 `LF will be replaced by CRLF` 警告正常（仓库存 LF）；
    提交前 `zig fmt`。
+9. **ConPTY 输入记录携带的是 UTF-16 码元，不是原始字节**（误判曾导致两个真实 bug，
+   2026-09 修复）：conhost 的 `VtInputThread` 会先把伪控制台收到的 VT 流按 UTF-8
+   解码为 UTF-16 再写入输入记录（上游源码核实）。因此 `ReadConsoleInputW` 拿到的
+   `UnicodeChar` 应按码点语义处理：ASCII 码元值与字节相同可直接透传；**其余一律
+   走 UTF-8 编码**（U+0080–U+00FF 也**不能**当原始字节透传，否则单字节不成序列会被
+   静默丢弃）；**非 BMP 字符（emoji 等）以"前导+后继"两条记录到达**，需缓存前导
+   再合并（与微软 `terminalInput.cpp` 的 `_leadingSurrogate` 同逻辑）。修复与测试见
+   `libs/zigtui/src/backend/windows.zig` 的 `codeUnitToUtf8`。
 
 ### 3.2 必须遵守的契约（摘要，详情在 AGENTS.md）
 
