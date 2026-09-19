@@ -239,11 +239,22 @@ const CurrentJson = struct {
     model: []const u8 = "",
 };
 
+const WidthOverridesJson = struct {
+    /// 强制 2 列的名单（码点范围或字面字符，空白/逗号分隔）
+    wide: []const u8 = "",
+    /// 强制 1 列的名单（真宽字符除外）
+    narrow: []const u8 = "",
+};
+
 const ConfigJson = struct {
     providers: []const ProviderJson = &.{},
     current: CurrentJson = .{},
     /// 全局思考强度：` / off / low / high / max
     thinking: []const u8 = "",
+    /// 模糊宽度策略（①←≤…等 EAW=Ambiguous 字符）："" = auto / wide / narrow
+    ambiguous_width: []const u8 = "",
+    /// 用户宽度覆盖名单（在策略之外按字符覆盖）
+    width_overrides: WidthOverridesJson = .{},
 };
 
 /// 新增/更新提供商用的字段集合
@@ -289,10 +300,17 @@ const SaveCurrent = struct {
     model: []const u8,
 };
 
+const SaveWidthOverrides = struct {
+    wide: ?[]const u8 = null,
+    narrow: ?[]const u8 = null,
+};
+
 const SaveConfig = struct {
     providers: []const SaveProvider,
     current: SaveCurrent,
     thinking: ?[]const u8 = null,
+    ambiguous_width: ?[]const u8 = null,
+    width_overrides: ?SaveWidthOverrides = null,
 };
 
 fn dupeOptional(allocator: Allocator, s: []const u8) ![]u8 {
@@ -357,6 +375,11 @@ pub const Config = struct {
     current_model: []u8 = &.{},
     /// 全局思考强度：` 不发 / off / low / high / max
     thinking: []u8 = &.{},
+    /// 模糊宽度策略："" = auto（平台/区域猜测）/ wide / narrow
+    ambiguous_width: []u8 = &.{},
+    /// 用户宽度覆盖名单（原始字符串，启动时解析；格式见 README）
+    width_overrides_wide: []u8 = &.{},
+    width_overrides_narrow: []u8 = &.{},
 
     pub fn load(self: *Config, io: Io, allocator: Allocator) void {
         self.loadFile(io, allocator, "config.json");
@@ -377,6 +400,17 @@ pub const Config = struct {
         }) catch return;
         defer parsed.deinit();
         const v = parsed.value;
+
+        // 模糊宽度策略与提供商无关，独立加载
+        if (v.ambiguous_width.len > 0) {
+            self.setAmbiguousWidth(allocator, v.ambiguous_width);
+        }
+        if (v.width_overrides.wide.len > 0) {
+            self.setWidthOverridesWide(allocator, v.width_overrides.wide);
+        }
+        if (v.width_overrides.narrow.len > 0) {
+            self.setWidthOverridesNarrow(allocator, v.width_overrides.narrow);
+        }
 
         for (v.providers) |pj| {
             if (pj.endpoint.len == 0) continue;
@@ -437,6 +471,26 @@ pub const Config = struct {
         const copy = allocator.dupe(u8, value) catch return;
         allocator.free(self.thinking);
         self.thinking = copy;
+    }
+
+    /// 设置模糊宽度策略（""/auto/wide/narrow；未知值在应用时按 auto 处理）
+    pub fn setAmbiguousWidth(self: *Config, allocator: Allocator, value: []const u8) void {
+        const copy = allocator.dupe(u8, value) catch return;
+        allocator.free(self.ambiguous_width);
+        self.ambiguous_width = copy;
+    }
+
+    /// 设置宽度覆盖名单（wide：强制 2 列；narrow：强制 1 列。格式见 README）
+    pub fn setWidthOverridesWide(self: *Config, allocator: Allocator, value: []const u8) void {
+        const copy = allocator.dupe(u8, value) catch return;
+        allocator.free(self.width_overrides_wide);
+        self.width_overrides_wide = copy;
+    }
+
+    pub fn setWidthOverridesNarrow(self: *Config, allocator: Allocator, value: []const u8) void {
+        const copy = allocator.dupe(u8, value) catch return;
+        allocator.free(self.width_overrides_narrow);
+        self.width_overrides_narrow = copy;
     }
 
     pub fn appendProvider(self: *Config, allocator: Allocator, spec: ProviderSpec) bool {
@@ -520,6 +574,14 @@ pub const Config = struct {
                 .model = self.current_model,
             },
             .thinking = if (self.thinking.len > 0) self.thinking else null,
+            .ambiguous_width = if (self.ambiguous_width.len > 0) self.ambiguous_width else null,
+            .width_overrides = if (self.width_overrides_wide.len > 0 or self.width_overrides_narrow.len > 0)
+                .{
+                    .wide = if (self.width_overrides_wide.len > 0) self.width_overrides_wide else null,
+                    .narrow = if (self.width_overrides_narrow.len > 0) self.width_overrides_narrow else null,
+                }
+            else
+                null,
         }) catch return;
 
         const dir = Io.Dir.cwd();
@@ -540,6 +602,12 @@ pub const Config = struct {
         self.current_model = &.{};
         allocator.free(self.thinking);
         self.thinking = &.{};
+        allocator.free(self.ambiguous_width);
+        self.ambiguous_width = &.{};
+        allocator.free(self.width_overrides_wide);
+        self.width_overrides_wide = &.{};
+        allocator.free(self.width_overrides_narrow);
+        self.width_overrides_narrow = &.{};
     }
 };
 
@@ -692,4 +760,39 @@ test "config：JSON 解析新字段并应用" {
         .opt_include_usage = @constCast(pj.options.include_usage),
     };
     try std.testing.expect(!behavior(&p).include_usage);
+}
+
+test "config：ambiguous_width 解析、设置与覆盖" {
+    const allocator = std.testing.allocator;
+    const json = "{\"ambiguous_width\": \"narrow\"}";
+    var parsed = try std.json.parseFromSlice(ConfigJson, allocator, json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("narrow", parsed.value.ambiguous_width);
+
+    var cfg = Config{};
+    defer cfg.deinit(allocator);
+    try std.testing.expectEqualStrings("", cfg.ambiguous_width);
+    cfg.setAmbiguousWidth(allocator, parsed.value.ambiguous_width);
+    try std.testing.expectEqualStrings("narrow", cfg.ambiguous_width);
+    // 再次设置：覆盖并释放旧值（泄漏由 testing allocator 兜底）
+    cfg.setAmbiguousWidth(allocator, "wide");
+    try std.testing.expectEqualStrings("wide", cfg.ambiguous_width);
+}
+
+test "config：width_overrides 解析与设置" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"width_overrides": {"wide": "U+2460-U+249B", "narrow": "— →"}}
+    ;
+    var parsed = try std.json.parseFromSlice(ConfigJson, allocator, json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("U+2460-U+249B", parsed.value.width_overrides.wide);
+    try std.testing.expectEqualStrings("— →", parsed.value.width_overrides.narrow);
+
+    var cfg = Config{};
+    defer cfg.deinit(allocator);
+    cfg.setWidthOverridesWide(allocator, parsed.value.width_overrides.wide);
+    cfg.setWidthOverridesNarrow(allocator, parsed.value.width_overrides.narrow);
+    try std.testing.expectEqualStrings("U+2460-U+249B", cfg.width_overrides_wide);
+    try std.testing.expectEqualStrings("— →", cfg.width_overrides_narrow);
 }

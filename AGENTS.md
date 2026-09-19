@@ -88,6 +88,8 @@ ole='summary' 的消息（摘要原文，FTS 可搜）
 - 测试会话标题用 `agent-test` 前缀，方便识别和清理
 - 工具 bug 优先自己修，不要让 TUI 里的 AI 代劳（它的会话随时可能因 schema 变更被清空）
 - 改行为前先跑 `zig build test`；涉及真实 provider 的验证用小会话 + `--max-chars`
+- 模糊宽度 auto 档的内置推荐名单在 `src/main.zig` 的 `auto_recommended_wide`
+  （作者长期维护：发现「单格字形被挤压」的字符族就往里加范围；用户配置 `width_overrides` 永远优先）
 - **新增模块的测试要在 `src/main.zig` 末尾的聚合块里 `_ = @import("xxx.zig");`**，否则 `zig build test` 不会收集它们
 - zigtui 以 git submodule 引入（fork `NeonMedusa/zigtui` 的 `skynet` 分支，路径 `libs/zigtui`）：
   更新上游 = 在 `libs/zigtui` 内 `git fetch upstream && git rebase upstream/master skynet` 后推送，

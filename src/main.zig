@@ -4790,6 +4790,8 @@ pub fn main(init: std.process.Init) !void {
     state.input.allocator = allocator;
     state.environ_map = init.environ_map;
     state.config.load(io, allocator);
+    // 模糊宽度策略（①←≤…按 1 列还是 2 列）：必须在首次绘制前应用
+    applyAmbiguousWidth(&state);
 
     // 打开数据库并恢复/新建会话
     var db_ok = true;
@@ -5253,6 +5255,115 @@ fn modelContextWindow(model: []const u8) u64 {
 fn contextUsagePercent(used: u64, ctx: u64) u64 {
     if (ctx == 0) return 0;
     return @min(used * 100 / ctx, 999);
+}
+
+// ── 模糊宽度（config.json: ambiguous_width）──
+// EAW=Ambiguous 字符（①←≤…等）的排版策略，三档：
+//   auto（默认） = 窄基底 + 内置推荐名单（明显被单格字形挤压的字符族按 2 列）
+//   wide         = 纯 2 列（渲染层自动补续格，CJK 传统）
+//   narrow       = 纯 1 列（opencode/string-width 等生态默认）
+// 用户的 width_overrides 永远最高优先（想抵消 auto 的加宽就写进 narrow 名单）。
+
+const AmbiguousMode = enum { auto, wide, narrow };
+
+/// 档位解析：显式 wide/narrow；""/"auto" 及未知值一律按 auto
+fn parseAmbiguousMode(mode: []const u8) AmbiguousMode {
+    if (std.mem.eql(u8, mode, "wide")) return .wide;
+    if (std.mem.eql(u8, mode, "narrow")) return .narrow;
+    return .auto;
+}
+
+const AutoWideRange = struct { lo: u21, hi: u21 };
+
+/// auto 档内置的「推荐宽字符」名单（由项目作者长期维护：
+/// 以后发现「单格字形被挤压」的字符族，直接往这里加范围即可）。
+/// 仅 auto 档生效；显式 wide/narrow 是纯档位、不叠加本名单；
+/// 用户 width_overrides（含 narrow）永远优先于本名单。
+const auto_recommended_wide = [_]AutoWideRange{
+    // 带圈/带括号数字与字母（①-⑳、⑴-⒇、⒈-⒛ 及 ⒜-ⓩ、⓵-⓿；含 ⓪——官方
+    // EAW=N，但同族字形，一并加宽保持一致）。单格渲染时圈圈明显相叠，默认加宽修正。
+    .{ .lo = 0x2460, .hi = 0x24FF },
+    // 候选（暂未启用）：U+1F100-U+1F10A「数字+句点」补充面组合，出现频率低。
+};
+
+/// 应用模糊宽度档位与覆盖名单到渲染层（TUI 启动时调用一次）
+fn applyAmbiguousWidth(state: *AppState) void {
+    const mode = parseAmbiguousMode(state.config.ambiguous_width);
+    tui.render.width_mod.ambiguous_width = switch (mode) {
+        .wide => .wide,
+        .narrow, .auto => .narrow, // auto 基底为窄，靠推荐名单做定向加宽
+    };
+
+    // 用户覆盖名单（可只配一侧；空名单即清空）
+    var wide_list: std.ArrayListUnmanaged(u21) = .{ .items = &.{}, .capacity = 0 };
+    defer wide_list.deinit(state.allocator);
+    var narrow_list: std.ArrayListUnmanaged(u21) = .{ .items = &.{}, .capacity = 0 };
+    defer narrow_list.deinit(state.allocator);
+    parseWidthOverrides(state.allocator, state.config.width_overrides_wide, &wide_list);
+    parseWidthOverrides(state.allocator, state.config.width_overrides_narrow, &narrow_list);
+
+    // auto：叠加内置推荐名单；用户 narrow 名单优先（冲突的条目不加入）
+    if (mode == .auto) appendAutoRecommended(state.allocator, &wide_list, narrow_list.items);
+
+    tui.render.width_mod.setWidthOverrides(wide_list.items, narrow_list.items);
+}
+
+/// 把内置推荐名单追加进 wide 名单（渲染层上限截断；用户 narrow 名单里的字符跳过）
+fn appendAutoRecommended(allocator: Allocator, wide_list: *std.ArrayListUnmanaged(u21), user_narrow: []const u21) void {
+    const max = tui.render.width_mod.max_width_overrides;
+    for (auto_recommended_wide) |r| {
+        var cp: u32 = r.lo;
+        while (cp <= r.hi) : (cp += 1) {
+            const c: u21 = @intCast(cp);
+            if (user_narrow.len > 0 and std.mem.indexOfScalar(u21, user_narrow, c) != null) continue;
+            if (wide_list.items.len >= max) return;
+            wide_list.append(allocator, c) catch return;
+        }
+    }
+}
+
+/// 解析宽度覆盖名单（config.json 的 width_overrides.wide/narrow）：
+/// 空白/逗号分隔的 token，支持 "U+XXXX"（单点）、"U+XXXX-U+YYYY"（范围，U+ 前缀可省）
+/// 或字面字符（每个 UTF-8 字符分别计入）。非法 token 跳过；总量封顶在渲染层上限。
+fn parseWidthOverrides(allocator: Allocator, spec: []const u8, out: *std.ArrayListUnmanaged(u21)) void {
+    const max = tui.render.width_mod.max_width_overrides;
+    var it = std.mem.tokenizeAny(u8, spec, " ,\t\r\n");
+    while (it.next()) |tok| {
+        if (out.items.len >= max) return;
+        if (tok.len >= 3 and (tok[0] == 'U' or tok[0] == 'u') and tok[1] == '+') {
+            const body = tok[2..];
+            if (std.mem.indexOfScalar(u8, body, '-')) |dash| {
+                const lo = std.fmt.parseInt(u21, body[0..dash], 16) catch continue;
+                var hi_part = body[dash + 1 ..];
+                if (hi_part.len >= 3 and (hi_part[0] == 'U' or hi_part[0] == 'u') and hi_part[1] == '+') {
+                    hi_part = hi_part[2..];
+                }
+                const hi = std.fmt.parseInt(u21, hi_part, 16) catch continue;
+                var cp: u32 = lo;
+                while (cp <= hi) : (cp += 1) {
+                    if (out.items.len >= max) return;
+                    out.append(allocator, @intCast(cp)) catch return;
+                }
+            } else {
+                const cp = std.fmt.parseInt(u21, body, 16) catch continue;
+                out.append(allocator, cp) catch return;
+            }
+        } else {
+            // 字面字符 token：每个 UTF-8 字符加入名单
+            var i: usize = 0;
+            while (i < tok.len) {
+                const len = std.unicode.utf8ByteSequenceLength(tok[i]) catch 1;
+                if (i + len > tok.len) break;
+                const cp = std.unicode.utf8Decode(tok[i .. i + len]) catch {
+                    i += 1;
+                    continue;
+                };
+                if (out.items.len >= max) return;
+                out.append(allocator, cp) catch return;
+                i += len;
+            }
+        }
+    }
 }
 
 /// 缓存命中率百分比（cached/input，越高越好）
@@ -9369,7 +9480,7 @@ test "重启恢复：纯工具调用轮不产生空消息（工具间隔为一�
     // 布局：r0 用户 / r1 空 / r2 Thought头 / r3 空 / r4 Read行 / r5 空 /
     //       r6 Edit头 / r7-r8 diff / r9 空 / r10 bash头 / r11 输出
     try std.testing.expectEqual(@as(u21, 'T'), buf.get(2, 2).?.char); // "> Thought"
-    try std.testing.expectEqual(@as(u21, 'R'), buf.get(2, 4).?.char); // "→ Read"
+    try std.testing.expectEqual(@as(u21, 'R'), buf.get(3, 4).?.char); // "→ Read"（→ 占 2 列）
     try std.testing.expectEqual(@as(u21, '←'), buf.get(0, 6).?.char); // "← Edit"
     try std.testing.expectEqual(@as(u21, '$'), buf.get(0, 10).?.char); // "$ zig build"
     for ([_]u16{ 1, 3, 5, 9 }) |blank_y| {
@@ -9558,6 +9669,101 @@ test "usage 锚点：只认正常结束的回合，取消不设锚点" {
     state.finalizeStream(null);
     try std.testing.expect(state.usage_anchor_len != null);
     try std.testing.expectEqual(@as(u64, 20_500), state.usage_anchor_tokens);
+}
+
+test "模糊宽度档位解析：显式 wide/narrow，其余一律 auto" {
+    try std.testing.expectEqual(AmbiguousMode.wide, parseAmbiguousMode("wide"));
+    try std.testing.expectEqual(AmbiguousMode.narrow, parseAmbiguousMode("narrow"));
+    try std.testing.expectEqual(AmbiguousMode.auto, parseAmbiguousMode(""));
+    try std.testing.expectEqual(AmbiguousMode.auto, parseAmbiguousMode("auto"));
+    try std.testing.expectEqual(AmbiguousMode.auto, parseAmbiguousMode("bogus"));
+}
+
+test "模糊宽度应用：auto = 窄基底 + 推荐名单；wide/narrow 为纯档" {
+    const allocator = std.testing.allocator;
+    var state = AppState{};
+    state.allocator = allocator;
+    defer state.config.deinit(allocator);
+    // 恢复渲染层默认（.wide + 空覆盖名单），避免影响其他测试的坐标断言
+    defer tui.render.width_mod.ambiguous_width = .wide;
+    defer tui.render.width_mod.setWidthOverrides(&[_]u21{}, &[_]u21{});
+
+    // 默认（config 未配置）＝ auto：窄基底 + 推荐名单定向加宽
+    try std.testing.expectEqualStrings("", state.config.ambiguous_width);
+    applyAmbiguousWidth(&state);
+    try std.testing.expectEqual(tui.render.width_mod.AmbiguousWidth.narrow, tui.render.width_mod.ambiguous_width);
+    try std.testing.expectEqual(@as(u2, 2), tui.render.codepointWidth('①')); // 推荐名单
+    try std.testing.expectEqual(@as(u2, 2), tui.render.codepointWidth('⑤'));
+    try std.testing.expectEqual(@as(u2, 2), tui.render.codepointWidth(0x24EA)); // ⓪ 同族一并加宽
+    try std.testing.expectEqual(@as(u2, 2), tui.render.codepointWidth(0x24B6)); // Ⓐ
+    try std.testing.expectEqual(@as(u2, 1), tui.render.codepointWidth('—')); // 其余 A 类保持窄
+    try std.testing.expectEqual(@as(u2, 1), tui.render.codepointWidth('→'));
+    try std.testing.expectEqual(@as(u2, 2), tui.render.codepointWidth('中')); // 真宽不受影响
+
+    // 用户 narrow 覆盖优先于推荐名单（① 放回窄，名单其余字符仍宽）
+    state.config.setWidthOverridesNarrow(allocator, "①");
+    applyAmbiguousWidth(&state);
+    try std.testing.expectEqual(@as(u2, 1), tui.render.codepointWidth('①'));
+    try std.testing.expectEqual(@as(u2, 2), tui.render.codepointWidth('②'));
+    state.config.setWidthOverridesNarrow(allocator, "");
+
+    // narrow = 纯窄（不叠加推荐名单）
+    state.config.setAmbiguousWidth(allocator, "narrow");
+    applyAmbiguousWidth(&state);
+    try std.testing.expectEqual(@as(u2, 1), tui.render.codepointWidth('①'));
+
+    // wide = 纯全宽（A 类全部 2 列，无需名单）
+    state.config.setAmbiguousWidth(allocator, "wide");
+    applyAmbiguousWidth(&state);
+    try std.testing.expectEqual(tui.render.width_mod.AmbiguousWidth.wide, tui.render.width_mod.ambiguous_width);
+    try std.testing.expectEqual(@as(u2, 2), tui.render.codepointWidth('①'));
+    try std.testing.expectEqual(@as(u2, 2), tui.render.codepointWidth('—'));
+}
+
+test "宽度覆盖名单：解析（范围/单点/字面/非法 token）" {
+    const alloc = std.testing.allocator;
+    var list: std.ArrayListUnmanaged(u21) = .{ .items = &.{}, .capacity = 0 };
+    defer list.deinit(alloc);
+
+    parseWidthOverrides(alloc, "U+2460-U+2462", &list);
+    try std.testing.expectEqualSlices(u21, &[_]u21{ 0x2460, 0x2461, 0x2462 }, list.items);
+    list.clearRetainingCapacity();
+
+    // 逗号分隔、小写 u+、U+ 前缀可省的区间上界
+    parseWidthOverrides(alloc, "U+2460, u+24EA U+24EB-24EC", &list);
+    try std.testing.expectEqualSlices(u21, &[_]u21{ 0x2460, 0x24EA, 0x24EB, 0x24EC }, list.items);
+    list.clearRetainingCapacity();
+
+    // 字面字符（每个字符分别计入）
+    parseWidthOverrides(alloc, "— → ①ab", &list);
+    try std.testing.expectEqualSlices(u21, &[_]u21{ 0x2014, 0x2192, 0x2460, 'a', 'b' }, list.items);
+    list.clearRetainingCapacity();
+
+    // 非法 token 跳过，不影响合法部分
+    parseWidthOverrides(alloc, "U+ZZZ U+2460-U+ ①", &list);
+    try std.testing.expectEqualSlices(u21, &[_]u21{0x2460}, list.items);
+}
+
+test "宽度覆盖应用：覆盖优先于策略，真宽字符不被 narrow 收缩" {
+    const alloc = std.testing.allocator;
+    var state = AppState{};
+    state.allocator = alloc;
+    defer state.config.deinit(alloc);
+    defer tui.render.width_mod.ambiguous_width = .wide;
+    defer tui.render.width_mod.setWidthOverrides(&[_]u21{}, &[_]u21{});
+
+    // 用户的偏好档：基础策略 narrow + 带圈数字覆盖为 wide + — 覆盖为 narrow
+    state.config.setAmbiguousWidth(alloc, "narrow");
+    state.config.setWidthOverridesWide(alloc, "U+2460-U+2462");
+    state.config.setWidthOverridesNarrow(alloc, "— 中");
+    applyAmbiguousWidth(&state);
+
+    try std.testing.expectEqual(tui.render.width_mod.AmbiguousWidth.narrow, tui.render.width_mod.ambiguous_width);
+    try std.testing.expectEqual(@as(u2, 2), tui.render.codepointWidth('①')); // 覆盖为宽
+    try std.testing.expectEqual(@as(u2, 2), tui.render.codepointWidth('③'));
+    try std.testing.expectEqual(@as(u2, 1), tui.render.codepointWidth('④')); // 未覆盖 + narrow 策略
+    try std.testing.expectEqual(@as(u2, 1), tui.render.codepointWidth('—'));
+    try std.testing.expectEqual(@as(u2, 2), tui.render.codepointWidth('中')); // 真宽不被收缩
 }
 
 test "压缩确认框：菜单进入两关确认" {
