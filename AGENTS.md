@@ -92,6 +92,20 @@ ole='summary' 的消息（摘要原文，FTS 可搜）
   `$env:SKYNET_LOG='debug'|'warn'|'error'|'off'` 覆盖。含请求/响应/工具/重试/压缩/落库失败
   全链路元数据（不含消息正文与密钥）。**排查线上问题（断连、卡顿、丢消息）时先看最新日志**；
   测试环境不初始化日志（main() 才 init），因此单测零副作用
+- **输入框光标 = 真实终端光标**（IME 深度相关，改动前务必读完）：
+  1. 坐标：每帧 `drawInput` 计算插入点屏幕坐标（`state.term_cursor_*`，基于 `inputCursorScreenPos`）；
+  2. 定位：render 回调写入 `terminal.pending_cursor`，由 zigtui `flush` 作为**帧尾指令**随同步块输出
+     （单一字节流通道）。**不要改回 `terminal.setCursor`**：独立 Win32 调用与帧字节流是两条通道、
+     时序不可控，IME UI 会在"最后写入格子"与目标位置间闪烁（已踩坑）；
+  3. 显隐：主循环按模式切换（`want_cursor`）——正常模式 `showCursor`，菜单模式 `hideCursor`；
+  4. **主输入框禁用应用层方块光标**（`TextArea.draw_fake_cursor=false`）：方块与 IME 组合串重叠，
+     且闪烁时重写该格会让终端连同组合串一起重绘（组合串闪烁的根因）；表单输入框保留方块光标
+     （已知限制：表单里用 IME 时组合串显示在主输入框光标处）；
+  5. 形状：显示时设 `terminal.setCursorShape(.blinking_block)`（DECSCUSR 1 q，终端原生
+     闪烁方块——用户偏好的"粗方块"观感由此实现）；zigtui 的 `Terminal.deinit` 与
+     `restore.leave_sequence` 会复位 `default`（0 q）。**不要再用应用层方块光标实现粗方块**（见第 4 点）
+  - 若去掉 1/2/4 任一项，中文输入法 UI 会漂移/闪烁（生成中 spinner 刷新时尤其明显）；
+  - zigtui 侧行为由 mock backend 测试锁定（terminal/mod.zig 的 "flush emits pending cursor" 用例）。
 - 测试会话标题用 `agent-test` 前缀，方便识别和清理
 - 工具 bug 优先自己修，不要让 TUI 里的 AI 代劳（它的会话随时可能因 schema 变更被清空）
 - 改行为前先跑 `zig build test`；涉及真实 provider 的验证用小会话 + `--max-chars`

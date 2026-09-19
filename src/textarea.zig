@@ -29,6 +29,10 @@ pub const TextArea = struct {
     /// 光标样式：光标落在选中字符上且闪烁可见时使用（灰底，区别于普通光标的白色）
     cursor_sel_style: Style = .{ .fg = .black, .bg = .dark_gray },
     focused: bool = true,
+    /// 是否绘制应用层方块光标。主输入框置 false 改用真实终端光标：
+    /// IME 组合串由终端渲染在真实光标处，方块光标会与其重叠，且每次闪烁
+    /// 重写该格会让终端连同组合串一起重绘 → 字母闪烁（表单仍用方块光标）
+    draw_fake_cursor: bool = true,
     style: Style = .{},
     cursor_style: Style = .{},
     placeholder: []const u8 = "",
@@ -303,7 +307,7 @@ pub const TextArea = struct {
                 buf.setStringTruncated(area.x, area.y, self.placeholder, area.width, self.placeholder_style);
             }
             var x = area.x;
-            if (self.focused and self.blink_on) {
+            if (self.draw_fake_cursor and self.focused and self.blink_on) {
                 buf.setChar(x, area.y, ' ', self.style.merge(self.cursor_style));
                 x +|= 1;
             }
@@ -342,7 +346,7 @@ pub const TextArea = struct {
                 const dec = decodeAt(text, i);
                 const w: usize = codepointWidth(dec.cp);
                 const selected = self.isSelected(i);
-                if (self.focused and self.blink_on and row == rc.row and col == rc.col) {
+                if (self.draw_fake_cursor and self.focused and self.blink_on and row == rc.row and col == rc.col) {
                     const cs = if (self.cursorSelected()) self.cursor_sel_style else self.cursor_style;
                     buf.setChar(x, y, dec.cp, self.style.merge(cs));
                     cursor_drawn = true;
@@ -356,7 +360,7 @@ pub const TextArea = struct {
                 i += dec.len;
             }
             // 行尾光标
-            if (self.focused and self.blink_on and row == rc.row and rc.col >= col) {
+            if (self.draw_fake_cursor and self.focused and self.blink_on and row == rc.row and rc.col >= col) {
                 const cs = if (self.cursorSelected()) self.cursor_sel_style else self.cursor_style;
                 buf.setChar(x, y, ' ', self.style.merge(cs));
                 x +|= 1;
@@ -370,7 +374,7 @@ pub const TextArea = struct {
         }
 
         // 光标位于折行边界（落在虚拟的下一行行首；仅在光标行仍处于视口内时绘制）
-        if (self.focused and self.blink_on and !cursor_drawn and rc.row >= view_start) {
+        if (self.draw_fake_cursor and self.focused and self.blink_on and !cursor_drawn and rc.row >= view_start) {
             const offset = rc.row - view_start;
             if (offset < area.height) {
                 const cy = area.y +| @as(u16, @intCast(@min(offset, 0xFFFF)));
@@ -740,6 +744,30 @@ test "TextArea: 光标闪烁开关影响光标块" {
     buf.clear();
     ta.render(.{ .x = 0, .y = 0, .width = 4, .height = 1 }, &buf);
     try testing.expect(buf.get(2, 0).?.bg.eql(.white));
+}
+
+test "TextArea: draw_fake_cursor 关闭时不绘制方块光标（主输入框用真实终端光标）" {
+    var ta = TextArea{ .allocator = testing.allocator };
+    defer ta.deinit();
+    ta.insertBytes("ab");
+    ta.style = .{ .fg = .white };
+    ta.cursor_style = .{ .fg = .black, .bg = .white };
+    ta.blink_on = true;
+
+    var buf = try Buffer.init(testing.allocator, 4, 1);
+    defer buf.deinit();
+
+    // 开启（默认）：光标格（"ab" 之后）为白底方块
+    ta.render(.{ .x = 0, .y = 0, .width = 4, .height = 1 }, &buf);
+    try testing.expect(buf.get(2, 0).?.bg.eql(.white));
+
+    // 关闭：无方块（该格保持普通底色；文本本身不受影响）
+    ta.draw_fake_cursor = false;
+    buf.clear();
+    ta.render(.{ .x = 0, .y = 0, .width = 4, .height = 1 }, &buf);
+    try testing.expect(buf.get(2, 0).?.bg.eql(.reset));
+    try testing.expectEqual(@as(u21, 'a'), buf.get(0, 0).?.char);
+    try testing.expectEqual(@as(u21, 'b'), buf.get(1, 0).?.char);
 }
 
 test "TextArea: 光标落在选中字符上时使用灰底光标" {

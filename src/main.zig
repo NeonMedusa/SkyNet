@@ -370,6 +370,31 @@ const max_events_per_frame: usize = 1024;
 /// 生成中可排队等待发送的消息上限（防止连打堆积）
 const max_pending_sends: usize = 32;
 
+/// 输入框标题的"进行中"旋转动画（盲文帧），按当前时间推导，无需额外状态
+const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+const spinner_period_ms: i64 = 90;
+
+/// 取当前应当显示的 spinner 帧（纯函数：由时刻推导，便于测试）
+fn spinnerFrame(now_ms: i64) []const u8 {
+    const idx: usize = @intCast(@mod(@divFloor(now_ms, spinner_period_ms), spinner_frames.len));
+    return spinner_frames[idx];
+}
+
+/// 输入框标题：空闲 " 输入 "；生成/压缩中显示旋转动画（+ 已用时秒数）
+fn inputBoxTitle(state: *AppState, buf: []u8) []const u8 {
+    const busy = state.isStreaming() or state.isCompacting();
+    if (!busy) return " 输入 ";
+    const now = std.Io.Timestamp.now(state.io, .awake).toMilliseconds();
+    const frame = spinnerFrame(now);
+    const what: []const u8 = if (state.isCompacting()) "压缩中" else "生成中";
+    // 回合起始缺失（如压缩）时不显示秒数
+    if (state.stream_start_ms >= 0) {
+        const secs = @divFloor(now - state.stream_start_ms, 1000);
+        return std.fmt.bufPrint(buf, " {s} {s} {d}s ", .{ frame, what, secs }) catch " 处理中 ";
+    }
+    return std.fmt.bufPrint(buf, " {s} {s} ", .{ frame, what }) catch " 处理中 ";
+}
+
 // ── 断连自动重试（对齐 pi / opencode 的做法：整请求重发，非续传）──
 /// 最大重试次数（初次尝试之外）；只重试网络错误与流截断，取消/确定性错误不重试
 const stream_retry_max: u32 = 2;
@@ -635,6 +660,16 @@ const AppState = struct {
     toast_len: usize = 0,
     toast_until_ms: i64 = 0,
 
+    /// 当前回合开始时间（askAI 落，收尾清空；<0 = 空闲）。用于输入框标题的
+    /// "生成中 Ns" 计时与旋转动画
+    stream_start_ms: i64 = -1,
+    /// 输入框文本光标的屏幕坐标（每帧由 drawInput 刷新）。
+    /// 真终端光标全程隐藏，但**必须**定位到文本插入点——IME 的组合串与
+    /// 候选窗跟随真实光标，否则会漂到"上一帧最后写入的格子"（如生成中的标题行）
+    term_cursor_x: u16 = 0,
+    term_cursor_y: u16 = 0,
+    term_cursor_valid: bool = false,
+
     // 删除会话确认状态
     confirm_session_id: i64 = 0,
     confirm_title: [128]u8 = undefined,
@@ -653,13 +688,14 @@ const AppState = struct {
         .cursor_style = .{ .fg = .black, .bg = .white },
         .placeholder = "输入消息，Enter 发送，Ctrl+J 换行 (Esc 菜单)",
         .focused = true,
+        // 用真实终端光标（见 runTui 的显隐切换 + pending_cursor 定位）：
+        // 方块光标会与 IME 组合串重叠，且闪烁重写该格会连带组合串一起重绘（闪烁）
+        .draw_fake_cursor = false,
     },
     input_wrap_width: usize = 80,
     input_box_top: u16 = 0,
     input_content_rows: usize = 0,
     last_key_ms: i64 = 0,
-    /// 光标闪烁相位起点（按键/点击后重置，保持短暂实心）
-    blink_anchor_ms: i64 = 0,
 
     messages: std.ArrayListUnmanaged(Message) = .{ .items = &.{}, .capacity = 0 },
 
@@ -2353,6 +2389,8 @@ const AppState = struct {
 
         // 记录 user 消息（落库 + 内存历史）
         self.recordMessage("user", question, "", "", "", 0);
+        // 回合起始计时（输入框标题的 "生成中 Ns"）
+        self.stream_start_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
 
         // 快照请求参数与历史（工作线程独占）
         const job = self.createStreamJob(provider, self.currentModel()) catch {
@@ -2793,6 +2831,8 @@ const AppState = struct {
             const anchor_ok = self.streamStatus() == .done and err == null and job.round_usage.input_tokens > 0;
             job.deinit();
             self.stream_job = null;
+            // 回合结束：停止输入框标题的计时（flushPendingSends 会为新回合重新落时间）
+            self.stream_start_ms = -1;
             // 工具循环中途压缩过：主线程历史按 checkpoint 重建（显示保持不变）
             if (compacted_midturn) {
                 self.rebuildHistoryFromDb();
@@ -4904,6 +4944,8 @@ pub fn main(init: std.process.Init) !void {
     var terminal = try Terminal.init(allocator, backend.interface());
     defer terminal.deinit();
 
+    // 先隐藏：进入主循环后按模式切换（正常模式显示在输入框插入点、形状为
+    // 闪烁方块；菜单模式隐藏；见循环内 want_cursor）
     try terminal.hideCursor();
     // 启用鼠标上报（滚轮滚动聊天）；退出时务必关闭，避免终端停留在鼠标模式
     try terminal.enableMouse();
@@ -4999,6 +5041,9 @@ pub fn main(init: std.process.Init) !void {
         state.input.deinit();
     }
 
+    // 输入框真实光标的显隐（按模式切换，仅在变化时调用终端 API）
+    var cursor_visible = false;
+
     while (state.running) {
         // 流式回复：取出增量、检测结束
         if (state.streamStatus() != .idle) state.pumpStream();
@@ -5041,12 +5086,35 @@ pub fn main(init: std.process.Init) !void {
         // 先绘制再等待事件：sel_rows 里保存的是指向消息内容的指针，
         // 而下一轮开头的 pumpStream 会重分配内容。若在事件之后再绘制，
         // 鼠标命中测试就会用到悬空的行映射（流式输出时点鼠标会崩溃）。
-        const Ctx = struct { s: *AppState };
-        try terminal.draw(Ctx{ .s = &state }, struct {
+        // 输入框光标坐标在 render 回调内才算得出：通过 ctx 写入 terminal.pending_cursor，
+        // 由 flush 作为帧尾指令随同步块一并输出（单一字节流通道，时序确定；
+        // IME 组合串/候选窗跟随物理光标，定位必须与帧同通道，否则会闪烁）。
+        // 光标显隐在 draw 之后按模式切换（见下方 want_cursor）
+        const Ctx = struct { s: *AppState, term: *Terminal };
+        try terminal.draw(Ctx{ .s = &state, .term = &terminal }, struct {
             fn render(ctx: Ctx, buf: *Buffer) !void {
                 drawFrame(ctx.s, buf);
+                ctx.term.pending_cursor = if (ctx.s.term_cursor_valid)
+                    .{ ctx.s.term_cursor_x, ctx.s.term_cursor_y }
+                else
+                    null;
             }
         }.render);
+
+        // 输入框真实光标的显隐与形状：正常模式显示为"闪烁方块"（DECSCUSR 1 q，
+        // 终端原生渲染：粗方块观感 + 原生闪烁，且不与 IME 组合串冲突），
+        // 菜单/弹窗模式隐藏；仅在状态变化时调用终端 API。
+        // 光标本身也是"应用层方块光标已关闭"后的唯一可见光标（见 AppState.input）
+        const want_cursor = state.mode == .normal and state.term_cursor_valid;
+        if (want_cursor != cursor_visible) {
+            if (want_cursor) {
+                terminal.showCursor() catch {};
+                terminal.setCursorShape(.blinking_block) catch {};
+            } else {
+                terminal.hideCursor() catch {};
+            }
+            cursor_visible = want_cursor;
+        }
 
         if (did_autoscroll) {
             state.refreshDragSelection();
@@ -5075,8 +5143,6 @@ pub fn main(init: std.process.Init) !void {
 fn handleTerminalEvent(state: *AppState, terminal: *Terminal, event: tui.Event) !void {
     switch (event) {
         .key => |key| {
-            // 按键重置光标闪烁相位（保持短暂实心）
-            state.blink_anchor_ms = std.Io.Timestamp.now(state.io, .awake).toMilliseconds();
             switch (state.mode) {
                 .model_select => state.handleModelSelectKey(key),
                 .provider_models => state.handleProviderModelsKey(key),
@@ -5136,7 +5202,6 @@ fn handleTerminalEvent(state: *AppState, terminal: *Terminal, event: tui.Event) 
                             } else if (state.pointFromInputStrict(m.x, m.y)) |p| {
                                 // 单击定位输入光标（不改变视口），同时作为选区锚点
                                 state.input.setCursor(p.off);
-                                state.blink_anchor_ms = std.Io.Timestamp.now(state.io, .awake).toMilliseconds();
                                 state.sel_area = .input;
                                 state.sel_anchor = p;
                                 state.sel_current = p;
@@ -6262,10 +6327,6 @@ fn drawFrame(state: *AppState, buf: *Buffer) void {
     const area = buf.getArea();
 
     if (area.width < 30 or area.height < 10) return;
-
-    // 输入光标闪烁：按键后 500ms 内保持实心，之后 1 秒周期闪烁
-    const now_ms = std.Io.Timestamp.now(state.io, .awake).toMilliseconds();
-    state.input.blink_on = @mod(now_ms - state.blink_anchor_ms, 1000) < 500;
 
     // 输入内容宽度：边框 + 左侧 1 列缩进
     const input_inner_w = @max(@as(usize, area.width -| 3), 1);
@@ -7742,11 +7803,31 @@ fn drawFormField(buf: *Buffer, inner: Rect, y: u16, label: []const u8, input: *T
     }, buf);
 }
 
+/// 计算输入框文本光标在屏幕上的坐标（供真实终端光标定位：IME 组合串与候选窗
+/// 跟随真实光标）。光标在视口外或内容区不可用时返回 null。
+/// 与 TextArea.render 的假光标绘制位置保持一致（含"折行边界在虚拟下一行行首"的情形）。
+fn inputCursorScreenPos(input: *const textarea_mod.TextArea, content: Rect) ?[2]u16 {
+    if (content.width == 0 or content.height == 0) return null;
+    const rc = input.cursorRowCol(content.width);
+    const offset = rc.row -| input.view_start;
+    if (offset >= content.height) return null; // 光标不在视口内：不定位
+    const y = content.y +| @as(u16, @intCast(@min(offset, 0xFFFF)));
+    const col = @min(rc.col, content.width);
+    const x = content.x +| @as(u16, @intCast(@min(col, 0xFFFF)));
+    return .{ x, y };
+}
+
 fn drawInput(state: *AppState, area: Rect, buf: *Buffer) void {
+    // 每帧重建（菜单/小窗口等无法计算时保持 invalid，避免残留旧坐标）
+    state.term_cursor_valid = false;
+    // 标题反映进行中状态（旋转动画 + 秒数）；边框在忙碌时换色便于余光可辨
+    var title_buf: [48]u8 = undefined;
+    const title = inputBoxTitle(state, &title_buf);
+    const busy_border = state.isStreaming() or state.isCompacting();
     const blk = Block{
-        .title = " 输入 ",
+        .title = title,
         .borders = Borders.ALL,
-        .border_style = .{ .fg = .magenta },
+        .border_style = .{ .fg = if (busy_border) .cyan else .magenta },
         .title_style = .{ .fg = .white, .modifier = .{ .bold = true } },
         .border_symbols = BorderSymbols.rounded(),
     };
@@ -7767,6 +7848,12 @@ fn drawInput(state: *AppState, area: Rect, buf: *Buffer) void {
             .height = inner.height - 2,
         };
         state.input_content_rows = content.height;
+        // 记录文本光标屏幕坐标：主循环据此定位真实终端光标（IME 组合串/候选窗跟随）
+        if (inputCursorScreenPos(&state.input, content)) |p| {
+            state.term_cursor_x = p[0];
+            state.term_cursor_y = p[1];
+            state.term_cursor_valid = true;
+        }
         // 选区交给 TextArea 渲染（光标叠加在选中字符上时使用灰底光标块）
         state.input.sel_range = if (state.sel_active and state.sel_area == .input)
             state.inputSelectionRange()
@@ -7889,7 +7976,17 @@ fn drawStatusSegment(buf: *Buffer, x: u16, end_x: u16, y: u16, text: []const u8,
 }
 
 fn drawHelp(state: *AppState, area: Rect, buf: *Buffer) void {
-    const help = switch (state.mode) {
+    // 仅普通模式下替换为"进行中"提示（菜单打开时仍显示菜单自身的按键说明）
+    var busy_buf: [96]u8 = undefined;
+    const busy_hint: []const u8 = if (state.mode != .normal)
+        ""
+    else if (state.isCompacting())
+        " [Ctrl+Q] 中断压缩 "
+    else if (state.isStreaming())
+        std.fmt.bufPrint(&busy_buf, " [Enter] 排队发送  [Ctrl+Q] 中断生成  [PgUp/PgDn] 滚动 ", .{}) catch " [Ctrl+Q] 中断生成 "
+    else
+        "";
+    const help = if (busy_hint.len > 0) busy_hint else switch (state.mode) {
         .model_select => " [Ctrl+A] 添加  [Ctrl+E] 编辑  [Del] 删除  [Esc] 取消 ",
         .provider_models => " [↑↓] 选择模型  [Enter] 确认  [Ctrl+E] 编辑提供商  [Esc] 返回 ",
         .preset_select => " [↑↓] 选择预设  [Enter] 下一步  [Esc] 返回 ",
@@ -11253,6 +11350,200 @@ test "状态栏：缓存命中率百分比与着色" {
     const text3 = std.mem.trimEnd(u8, &line, " ");
     try std.testing.expect(std.mem.endsWith(u8, text3, " 20.0k/104.9k 19%"));
     try std.testing.expect(buf3.get(@intCast(std.mem.indexOf(u8, text3, "19%").?), 0).?.fg.eql(tui.style.Color.red));
+}
+
+test "进行中指示：spinner 帧按时间推导" {
+    // 同周期内恒帧、跨周期换帧、整周期回绕
+    try std.testing.expectEqualStrings("⠋", spinnerFrame(0));
+    try std.testing.expectEqualStrings("⠋", spinnerFrame(spinner_period_ms - 1));
+    try std.testing.expectEqualStrings("⠙", spinnerFrame(spinner_period_ms));
+    try std.testing.expectEqualStrings("⠋", spinnerFrame(spinner_period_ms * spinner_frames.len));
+    // 全部 10 帧都能取到且互不相同
+    var seen: u32 = 0;
+    for (0..spinner_frames.len) |i| {
+        const ms = spinner_period_ms * @as(i64, @intCast(i));
+        const f = spinnerFrame(ms);
+        try std.testing.expectEqualStrings(spinner_frames[i], f);
+        const bit = @as(u32, 1) << @intCast(i);
+        try std.testing.expect((seen & bit) == 0);
+        seen |= bit;
+    }
+}
+
+test "进行中指示：输入框标题（空闲/生成/压缩 + 秒数）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    var buf: [48]u8 = undefined;
+
+    // 空闲：固定标题
+    try std.testing.expectEqualStrings(" 输入 ", inputBoxTitle(&state, &buf));
+
+    // 生成中（有起始时间）：spinner + 生成中 + 秒数
+    state.setStreamStatus(.running);
+    const now = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    state.stream_start_ms = now - 5000;
+    const title = inputBoxTitle(&state, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, title, "生成中") != null);
+    try std.testing.expect(std.mem.indexOf(u8, title, "5s") != null);
+    // 首字符是盲文字符（三字节 UTF-8，首字节 0xE2）
+    try std.testing.expect(title.len >= 3 and title[1] == 0xE2);
+
+    // 生成中但无起始时间：不显示秒数（如压缩）
+    state.stream_start_ms = -1;
+    const no_secs = inputBoxTitle(&state, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, no_secs, "生成中") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_secs, "s ") == null);
+
+    // 压缩中：文案为"压缩中"
+    state.setStreamStatus(.idle);
+    state.compact_status.store(1, .release);
+    try std.testing.expect(state.isCompacting());
+    const compact_title = inputBoxTitle(&state, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, compact_title, "压缩中") != null);
+    state.compact_status.store(0, .release);
+}
+
+test "输入框光标屏幕坐标：空/短文本/折行/视口滚动/视口外" {
+    var ta = textarea_mod.TextArea{ .allocator = std.testing.allocator };
+    defer ta.deinit();
+
+    const content = Rect{ .x = 10, .y = 5, .width = 6, .height = 2 };
+
+    // 空文本：内容区左上角
+    try std.testing.expectEqual([2]u16{ 10, 5 }, inputCursorScreenPos(&ta, content).?);
+
+    // 短文本：光标在末尾（文本宽度偏移）
+    ta.insertBytes("abc");
+    try std.testing.expectEqual([2]u16{ 13, 5 }, inputCursorScreenPos(&ta, content).?);
+
+    // 折行：宽度 6，"abcdefg" → 光标在第二行第 1 列
+    ta.insertBytes("defg");
+    ta.applyViewport(6, 2);
+    try std.testing.expectEqual([2]u16{ 11, 6 }, inputCursorScreenPos(&ta, content).?);
+
+    // 视口滚动：view_start=1 时第二行显示为屏幕第一行
+    ta.view_start = 1;
+    try std.testing.expectEqual([2]u16{ 11, 5 }, inputCursorScreenPos(&ta, content).?);
+
+    // 光标在视口外：返回 null（不定位真光标）
+    ta.view_start = 0;
+    const tiny = Rect{ .x = 10, .y = 5, .width = 6, .height = 1 };
+    try std.testing.expect(inputCursorScreenPos(&ta, tiny) == null);
+
+    // 内容区不可用：返回 null
+    try std.testing.expect(inputCursorScreenPos(&ta, .{ .x = 0, .y = 0, .width = 0, .height = 0 }) == null);
+}
+
+test "进行中指示：drawInput 渲染（标题含盲文帧、边框忙碌变色）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    state.input.allocator = std.testing.allocator;
+    defer state.input.deinit();
+
+    const area = Rect{ .x = 0, .y = 0, .width = 60, .height = 6 };
+
+    // 忙碌（生成中）：边框青色 + 标题区出现盲文帧
+    state.setStreamStatus(.running);
+    state.stream_start_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() - 3000;
+    var buf_busy = try tui.render.Buffer.init(std.testing.allocator, 60, 6);
+    defer buf_busy.deinit();
+    drawInput(&state, area, &buf_busy);
+    try std.testing.expect(buf_busy.get(0, 0).?.fg.eql(tui.style.Color.cyan));
+    var saw_braille = false;
+    for (0..60) |x| {
+        const c = buf_busy.get(@intCast(x), 0).?.char;
+        if (c >= 0x2800 and c <= 0x28FF) saw_braille = true;
+    }
+    try std.testing.expect(saw_braille);
+
+    // 空闲：边框恢复品红、标题无盲文
+    state.setStreamStatus(.idle);
+    state.stream_start_ms = -1;
+    var buf_idle = try tui.render.Buffer.init(std.testing.allocator, 60, 6);
+    defer buf_idle.deinit();
+    drawInput(&state, area, &buf_idle);
+    try std.testing.expect(buf_idle.get(0, 0).?.fg.eql(tui.style.Color.magenta));
+    for (0..60) |x| {
+        const c = buf_idle.get(@intCast(x), 0).?.char;
+        try std.testing.expect(c < 0x2800 or c > 0x28FF);
+    }
+}
+
+test "进行中指示：帮助栏切换（含 Ctrl+Q / 排队提示；菜单不覆盖）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    var line: [160]u8 = undefined;
+
+    // 空闲：常规提示
+    {
+        var buf = try tui.render.Buffer.init(std.testing.allocator, 160, 1);
+        defer buf.deinit();
+        drawHelp(&state, .{ .x = 0, .y = 0, .width = 160, .height = 1 }, &buf);
+        renderRowText(&buf, &line);
+        const text = std.mem.trimEnd(u8, &line, " ");
+        // renderRowText 会把中文置换为 '?'，故用 ASCII 判别串
+        try std.testing.expect(std.mem.indexOf(u8, text, "[Enter]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Ctrl+Q") == null);
+    }
+
+    // 生成中：排队 + 中断提示
+    {
+        state.setStreamStatus(.running);
+        var buf = try tui.render.Buffer.init(std.testing.allocator, 160, 1);
+        defer buf.deinit();
+        drawHelp(&state, .{ .x = 0, .y = 0, .width = 160, .height = 1 }, &buf);
+        renderRowText(&buf, &line);
+        const text = std.mem.trimEnd(u8, &line, " ");
+        try std.testing.expect(std.mem.indexOf(u8, text, "Ctrl+Q") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "PgUp") != null);
+        state.setStreamStatus(.idle);
+    }
+
+    // 压缩中：仅中断压缩
+    {
+        var buf = try tui.render.Buffer.init(std.testing.allocator, 160, 1);
+        defer buf.deinit();
+        state.compact_status.store(1, .release);
+        drawHelp(&state, .{ .x = 0, .y = 0, .width = 160, .height = 1 }, &buf);
+        renderRowText(&buf, &line);
+        const text = std.mem.trimEnd(u8, &line, " ");
+        try std.testing.expect(std.mem.indexOf(u8, text, "Ctrl+Q") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "PgUp") == null); // 压缩提示不含滚动键
+        state.compact_status.store(0, .release);
+    }
+
+    // 菜单打开时（即使生成中）：显示菜单自身的按键说明，不覆盖
+    {
+        state.setStreamStatus(.running);
+        state.mode = .model_select;
+        var buf = try tui.render.Buffer.init(std.testing.allocator, 160, 1);
+        defer buf.deinit();
+        drawHelp(&state, .{ .x = 0, .y = 0, .width = 160, .height = 1 }, &buf);
+        renderRowText(&buf, &line);
+        const text = std.mem.trimEnd(u8, &line, " ");
+        try std.testing.expect(std.mem.indexOf(u8, text, "Ctrl+A") != null); // 菜单提示未被覆盖
+        try std.testing.expect(std.mem.indexOf(u8, text, "Ctrl+Q") == null);
+        state.mode = .normal;
+        state.setStreamStatus(.idle);
+    }
 }
 
 /// 测试辅助：把一行单元格转成 ASCII 文本（宽字符以 '?' 占位）
