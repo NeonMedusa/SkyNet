@@ -183,6 +183,26 @@ const Message = struct {
     /// 定格后的思考耗时（毫秒；从数据库恢复时直接使用）
     reasoning_ms: i64 = 0,
     reasoning_expanded: bool = false,
+    /// 行数缓存：drawMessages 每帧需要全部消息的行数，长会话下逐字符重算
+    /// 会把输入/框选响应拖到不可用。缓存键 = 宽度 + 展开态 + 正文/思考字节数：
+    /// 内容增改（各 append* 都是重新分配）、宽度变化、展开切换都会自动失效；
+    /// 字节数不变的内容替换（replaceDisplayMessage）需显式调用 invalidateRowCount。
+    /// row_count_width == 0 表示无效。
+    row_count: usize = 0,
+    row_count_width: usize = 0,
+    row_count_expanded: bool = false,
+    row_count_content_len: usize = 0,
+    row_count_reasoning_len: usize = 0,
+
+    /// 替换正文：接管 `owned` 所有权（须独立分配，不能是旧 content 的切片），
+    /// 释放旧值并**无条件**失效行数缓存（等长替换也不会漏）。
+    /// markdown 解析等关联状态由调用方在同一处维护（见 appendStreamChunk 等）。
+    /// 新增"创建后可变且影响行数"的字段时，须同时并入 messageRowCountCached 的缓存键。
+    fn setContent(msg: *Message, allocator: std.mem.Allocator, owned: []const u8) void {
+        if (msg.content.len > 0) allocator.free(msg.content);
+        msg.content = owned;
+        msg.row_count_width = 0;
+    }
 };
 
 /// 思考块可点击行（用于鼠标展开/折叠）
@@ -1903,8 +1923,7 @@ const AppState = struct {
         const joined = self.allocator.alloc(u8, msg.content.len + chunk.len) catch return;
         @memcpy(joined[0..msg.content.len], msg.content);
         @memcpy(joined[msg.content.len..], chunk);
-        if (msg.content.len > 0) self.allocator.free(msg.content);
-        msg.content = joined;
+        msg.setContent(self.allocator, joined);
         if (msg.md) |old| md_mod.free(self.allocator, old);
         msg.md = md_mod.parse(self.allocator, joined, md_mod.default_styles) catch null;
 
@@ -1920,9 +1939,9 @@ const AppState = struct {
         if (idx >= self.messages.items.len) return;
         const msg = &self.messages.items[idx];
         const owned = self.allocator.dupe(u8, content) catch return;
-        if (msg.content.len > 0) self.allocator.free(msg.content);
         if (msg.md) |old| md_mod.free(self.allocator, old);
-        msg.content = owned;
+        // setContent 接管所有权并失效行数缓存（等长替换也不会漏）
+        msg.setContent(self.allocator, owned);
         msg.md = null;
         msg.style = style;
     }
@@ -2306,8 +2325,7 @@ const AppState = struct {
         const width = self.message_wrap_width;
         const rows_before = if (width > 0) messageRowCount(msg.*, width) else 0;
         const joined = std.fmt.allocPrint(self.allocator, "{s} ({s})", .{ msg.content, suffix }) catch return;
-        if (msg.content.len > 0) self.allocator.free(msg.content);
-        msg.content = joined;
+        msg.setContent(self.allocator, joined);
 
         // 贴底时保持跟随；已上翻时补偿偏移，保持视口不动
         if (width > 0) {
@@ -2359,8 +2377,7 @@ const AppState = struct {
         defer self.allocator.free(capped);
 
         const joined = std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ msg.content, capped }) catch return false;
-        if (msg.content.len > 0) self.allocator.free(msg.content);
-        msg.content = joined;
+        msg.setContent(self.allocator, joined);
 
         // 贴底时保持跟随；已上翻时补偿偏移，保持视口不动
         if (width > 0) {
@@ -2632,8 +2649,7 @@ const AppState = struct {
         const joined = self.allocator.alloc(u8, msg.content.len + chunk.len) catch return;
         @memcpy(joined[0..msg.content.len], msg.content);
         @memcpy(joined[msg.content.len..], chunk);
-        if (msg.content.len > 0) self.allocator.free(msg.content);
-        msg.content = joined;
+        msg.setContent(self.allocator, joined);
 
         // 重新解析 Markdown（整段，KB 级内容足够快）
         if (msg.md) |old| md_mod.free(self.allocator, old);
@@ -6530,6 +6546,33 @@ fn messageRowCount(msg: Message, width: usize) usize {
     return total + countVisualLines(msg.content, wrap_w);
 }
 
+/// 使行数缓存失效。正文替换请优先走 `Message.setContent`（内部调用本函数并接管所有权）；
+/// 直接改写缓存键未覆盖的字段后需手动调用。
+fn invalidateRowCount(msg: *Message) void {
+    msg.row_count_width = 0;
+}
+
+/// 带缓存的行数查询：drawMessages 每帧对全部消息调用，命中时必须 O(1)。
+/// 缓存键与失效规则见 Message.row_count 字段的注释。
+fn messageRowCountCached(msg: *Message, width: usize) usize {
+    if (width == 0) return messageRowCount(msg.*, width);
+    const rlen: usize = if (msg.reasoning) |r| r.len else 0;
+    if (msg.row_count_width == width and
+        msg.row_count_expanded == msg.reasoning_expanded and
+        msg.row_count_content_len == msg.content.len and
+        msg.row_count_reasoning_len == rlen)
+    {
+        return msg.row_count;
+    }
+    const rows = messageRowCount(msg.*, width);
+    msg.row_count = rows;
+    msg.row_count_width = width;
+    msg.row_count_expanded = msg.reasoning_expanded;
+    msg.row_count_content_len = msg.content.len;
+    msg.row_count_reasoning_len = rlen;
+    return rows;
+}
+
 /// 思考块头行："▸/▾ Thought: 2.3s"（可点击展开/折叠）
 fn drawThoughtHeader(state: *AppState, buf: *Buffer, x: u16, y: u16, msg: Message, msg_idx: usize) void {
     const arrow: []const u8 = if (msg.reasoning_expanded) "⌵ " else "> ";
@@ -6608,10 +6651,10 @@ fn drawMessages(state: *AppState, area: Rect, buf: *Buffer) void {
     state.sel_row_count = 0;
     state.thought_row_count = 0;
 
-    // 统计全部可视行数（消息之间各有一个空行）
+    // 统计全部可视行数（消息之间各有一个空行；走缓存，命中为 O(消息数)）
     var total_lines: usize = 0;
-    for (state.messages.items) |msg| {
-        total_lines += messageRowCount(msg, width);
+    for (state.messages.items) |*msg| {
+        total_lines += messageRowCountCached(msg, width);
     }
     if (state.messages.items.len > 1) total_lines += state.messages.items.len - 1;
 
@@ -6629,12 +6672,22 @@ fn drawMessages(state: *AppState, area: Rect, buf: *Buffer) void {
     // 从 start_line 开始绘制（同时构建选择映射）
     var current_line: usize = 0;
     var y = area.y;
-    outer: for (state.messages.items, 0..) |msg, msg_idx| {
+    outer: for (state.messages.items, 0..) |*msg, msg_idx| {
+        // 整条消息完全位于视口之上：用缓存行数直接跳过，不触碰其内容。
+        // 长会话下这是把每帧成本从 O(全会话字符数) 降为 O(消息数) 的关键
+        // （行数与下方逐行走内容的结果一致，是渲染/滚动共用的既有不变量）。
+        const msg_rows = messageRowCountCached(msg, width);
+        const sep_rows: usize = if (msg_idx + 1 < state.messages.items.len) 1 else 0;
+        if (current_line + msg_rows + sep_rows <= start_line) {
+            current_line += msg_rows + sep_rows;
+            continue;
+        }
+
         // 思考块：折叠头（可点击切换）+ 展开时的思考内容
         if (msg.reasoning != null) {
             if (current_line >= start_line) {
                 if (y >= area.y + area.height) break :outer;
-                drawThoughtHeader(state, buf, area.x, y, msg, msg_idx);
+                drawThoughtHeader(state, buf, area.x, y, msg.*, msg_idx);
                 recordThoughtRow(state, y, msg_idx);
                 y += 1;
             }
@@ -6661,7 +6714,7 @@ fn drawMessages(state: *AppState, area: Rect, buf: *Buffer) void {
             }
 
             // 思考块与正文之间空一行（无正文时不留，避免与消息间隔叠成两行）
-            if (thoughtHasBody(msg)) {
+            if (thoughtHasBody(msg.*)) {
                 if (current_line >= start_line) {
                     if (y >= area.y + area.height) break :outer;
                     y += 1;
@@ -10484,6 +10537,86 @@ test "重启恢复：纯工具调用轮不产生空消息（工具间隔为一�
             try std.testing.expect(cell.char == ' ' or cell.char == 0);
         }
     }
+}
+
+test "行数缓存：命中、自动失效（内容/宽度/展开）与显式失效" {
+    const alloc = std.testing.allocator;
+    var msg = Message{ .content = try alloc.dupe(u8, "aaaaaaaaaa\naaaaaaaaaa"), .style = .{} };
+    defer alloc.free(msg.content);
+
+    // 首次计算并填充缓存；再次调用为命中（返回同一值，键已记录）
+    const first = messageRowCountCached(&msg, 10);
+    try std.testing.expectEqual(messageRowCount(msg, 10), first);
+    try std.testing.expectEqual(@as(usize, 10), msg.row_count_width);
+    try std.testing.expectEqual(first, messageRowCountCached(&msg, 10));
+
+    // 宽度变化 → 键不匹配 → 重算
+    _ = messageRowCountCached(&msg, 40);
+    try std.testing.expectEqual(@as(usize, 40), msg.row_count_width);
+
+    // 等长内容替换：setContent 接管所有权并**无条件**失效（等长也不会漏）。
+    // 新旧内容等长（21 字节）但行数不同：2 行（带换行）vs 3 行（无换行，宽 10 折行）
+    const same_len = try alloc.dupe(u8, "aaaaaaaaaaaaaaaaaaaaa");
+    msg.setContent(alloc, same_len);
+    const recomputed = messageRowCountCached(&msg, 10);
+    try std.testing.expectEqual(@as(usize, 3), recomputed);
+    try std.testing.expectEqual(messageRowCount(msg, 10), recomputed);
+
+    // 内容增长（字节数变化）→ 自动失效（setContent 同样无条件失效）
+    const grown = try alloc.dupe(u8, "aaaaaaaaaaaaaaaaaaaaa\nmore");
+    msg.setContent(alloc, grown);
+    const grown_rows = messageRowCountCached(&msg, 10);
+    try std.testing.expectEqual(messageRowCount(msg, 10), grown_rows);
+    try std.testing.expect(grown_rows > recomputed);
+
+    // 思考展开态变化 → 自动失效（键含展开态）
+    msg.reasoning = try alloc.dupe(u8, "think think think think think");
+    defer alloc.free(msg.reasoning.?);
+    const collapsed = messageRowCountCached(&msg, 10);
+    msg.reasoning_expanded = true;
+    const expanded = messageRowCountCached(&msg, 10);
+    try std.testing.expect(expanded > collapsed);
+    try std.testing.expectEqual(messageRowCount(msg, 10), expanded);
+}
+
+test "绘制跳过：视口之上的消息不逐行走，滚动位置正确" {
+    var state = AppState{};
+    state.allocator = std.testing.allocator;
+    defer {
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+    }
+
+    // 5 条消息各 3 行（总行数 = 15 + 4 个间隔 = 19），行文本唯一便于定位
+    for (0..5) |i| {
+        var b: [64]u8 = undefined;
+        const text = try std.fmt.bufPrint(&b, "msg{d}\nmsg{d}b\nmsg{d}c", .{ i, i, i });
+        state.addMessage(text, .{});
+    }
+    state.message_wrap_width = 40;
+
+    var buf = try tui.render.Buffer.init(std.testing.allocator, 40, 8);
+    defer buf.deinit();
+    var line: [160]u8 = undefined;
+
+    // offset=2 → 顶部起始行 = 19 - 8 - 2 = 9 → msg2 的第二行 "msg2b"
+    state.scroll_offset = 2;
+    drawMessages(&state, .{ .x = 0, .y = 0, .width = 40, .height = 8 }, &buf);
+    renderRowText(&buf, &line);
+    const top = std.mem.trimEnd(u8, &line, " ");
+    try std.testing.expect(std.mem.startsWith(u8, top, "msg2b"));
+
+    // offset=0（贴底）→ 起始行 11（msg2/msg3 之间空行）→ 第 1 行是 "msg3"
+    state.scroll_offset = 0;
+    buf.clear();
+    drawMessages(&state, .{ .x = 0, .y = 0, .width = 40, .height = 8 }, &buf);
+    var row1: [160]u8 = undefined;
+    for (0..40) |x| {
+        const cell = buf.get(@intCast(x), 1).?;
+        row1[x] = if (cell.char < 128) @intCast(cell.char) else '?';
+    }
+    const r1 = std.mem.trimEnd(u8, &row1, " ");
+    try std.testing.expect(std.mem.startsWith(u8, r1, "msg3"));
 }
 
 test "思考块间距：无正文时不多留空行（与消息间隔不叠加成两行）" {

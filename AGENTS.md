@@ -106,6 +106,12 @@ ole='summary' 的消息（摘要原文，FTS 可搜）
      `restore.leave_sequence` 会复位 `default`（0 q）。**不要再用应用层方块光标实现粗方块**（见第 4 点）
   - 若去掉 1/2/4 任一项，中文输入法 UI 会漂移/闪烁（生成中 spinner 刷新时尤其明显）；
   - zigtui 侧行为由 mock backend 测试锁定（terminal/mod.zig 的 "flush emits pending cursor" 用例）。
+- **消息行数缓存契约**（长会话渲染性能关键；见 `Message.row_count_*` / `messageRowCountCached`）：
+  ① 改正文必须经 `msg.setContent(allocator, owned)`（接管所有权 + 无条件失效缓存）；
+  ② reasoning 可直接赋值（长度已并入缓存键，自动失效）；
+  ③ 新增"创建后可变且影响行数"的字段时，必须把该字段并入 `messageRowCountCached` 的匹配键；
+  ④ 绘制循环依赖"缓存行数 == 逐行走行数"这一不变量（用于整条跳过视口之上的消息），改动
+  `messageRowCount` 的计行逻辑时注意同步
 - 测试会话标题用 `agent-test` 前缀，方便识别和清理
 - 工具 bug 优先自己修，不要让 TUI 里的 AI 代劳（它的会话随时可能因 schema 变更被清空）
 - 改行为前先跑 `zig build test`；涉及真实 provider 的验证用小会话 + `--max-chars`
