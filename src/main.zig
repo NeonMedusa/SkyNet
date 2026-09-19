@@ -5511,11 +5511,20 @@ fn countBlockRows(content: []const u8, kind: ToolBlockKind, width: usize) usize 
 
 const DiffLineKind = enum { context, removed, added, elide };
 
+/// 展示行格式为 "{行号:>5} {标记} {内容}"（见 tools.zig appendNumberedLine）。
+/// 必须按固定位置解析标记：内容自身可能以 "- " 开头（如 markdown 列表），
+/// 对前几个字节搜子串 " - "/" + " 会把这类行误判成删除/新增。
 fn diffLineKind(text: []const u8) DiffLineKind {
-    const head = text[0..@min(text.len, 10)];
-    if (std.mem.indexOf(u8, head, " - ") != null) return .removed;
-    if (std.mem.indexOf(u8, head, " + ") != null) return .added;
     if (std.mem.startsWith(u8, text, "     …")) return .elide;
+    // 跳过行号：前导空格 + 数字 + 一个空格，随后是标记字符（' '/'-'/'+'）
+    var i: usize = 0;
+    while (i < text.len and text[i] == ' ') : (i += 1) {}
+    while (i < text.len and std.ascii.isDigit(text[i])) : (i += 1) {}
+    if (i < text.len and text[i] == ' ') i += 1;
+    if (i < text.len) {
+        if (text[i] == '-') return .removed;
+        if (text[i] == '+') return .added;
+    }
     return .context;
 }
 
@@ -7815,6 +7824,53 @@ test "工具块：内容构建与底色渲染" {
     const red = tui.style.Color.red;
     drawToolBlockRow(&state, &buf, area, 1, content, "← Edit a.txt", 0, .diff, true, 0);
     try std.testing.expect(buf.get(0, 0).?.fg.eql(red));
+}
+
+test "diff 行分类：内容以 '- ' 开头不误判（markdown 列表场景）" {
+    // 上下文行内容以 "- " 开头 → 仍为 context（旧实现按子串搜 " - " 会误判为删除）
+    try std.testing.expectEqual(DiffLineKind.context, diffLineKind("   73   - 工具没有确认环节"));
+    try std.testing.expectEqual(DiffLineKind.context, diffLineKind("   74   - 提供商预设基本未经实测"));
+    // 删除行内容以 "- " 开头 → removed
+    try std.testing.expectEqual(DiffLineKind.removed, diffLineKind("   75 - - prompt 缓存亲和、工具输出折叠"));
+    // 新增行内容以 "- " 开头 → added（旧实现先命中内容里的 " - "，误判为 removed）
+    try std.testing.expectEqual(DiffLineKind.added, diffLineKind("   75 + - prompt 缓存亲和、工具输出折叠"));
+    // 内容中部出现 " - " 同样不受影响
+    try std.testing.expectEqual(DiffLineKind.context, diffLineKind("   76   说明 - 细节"));
+    try std.testing.expectEqual(DiffLineKind.added, diffLineKind("   76 + 说明 - 细节"));
+    // 常规三态
+    try std.testing.expectEqual(DiffLineKind.context, diffLineKind("    1   ctx"));
+    try std.testing.expectEqual(DiffLineKind.removed, diffLineKind("    2 - old"));
+    try std.testing.expectEqual(DiffLineKind.added, diffLineKind("    2 + new"));
+    // 行号超过 5 位（{d:>5} 不再补空格）
+    try std.testing.expectEqual(DiffLineKind.removed, diffLineKind("100000 - x"));
+    // elide 行
+    try std.testing.expectEqual(DiffLineKind.elide, diffLineKind("     …"));
+}
+
+test "diff 渲染：列表项上下文不染色、带 - 的新增行仍绿" {
+    var state = AppState{};
+    state.allocator = std.testing.allocator;
+    defer {
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+    }
+    try std.testing.expect(state.beginToolBlock("edit", "{\"path\":\"README.md\"}", .diff));
+    try std.testing.expect(state.appendToolBlockBody(.diff, "   73   - 工具没有确认环节\n   75 - - 旧行\n   75 + - 新行", false));
+    const content = state.messages.items[0].content;
+
+    var buf = try tui.render.Buffer.init(std.testing.allocator, 40, 3);
+    defer buf.deinit();
+    const area = Rect{ .x = 0, .y = 0, .width = 40, .height = 3 };
+    drawToolBlockRow(&state, &buf, area, 0, content, "   73   - 工具没有确认环节", 1, .diff, false, 0);
+    drawToolBlockRow(&state, &buf, area, 0, content, "   75 - - 旧行", 2, .diff, false, 1);
+    drawToolBlockRow(&state, &buf, area, 0, content, "   75 + - 新行", 3, .diff, false, 2);
+
+    const block_bg = tui.style.Color{ .rgb = .{ .r = 20, .g = 20, .b = 20 } };
+    const removed_bg = tui.style.Color{ .rgb = .{ .r = 70, .g = 20, .b = 30 } };
+    const added_bg = tui.style.Color{ .rgb = .{ .r = 20, .g = 60, .b = 30 } };
+    try std.testing.expect(buf.get(0, 0).?.bg.eql(block_bg)); // 列表项上下文：默认底色
+    try std.testing.expect(buf.get(0, 1).?.bg.eql(removed_bg));
+    try std.testing.expect(buf.get(0, 2).?.bg.eql(added_bg));
 }
 
 test "工具块：shell 标题自动折行渲染（含上限）" {
