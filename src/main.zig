@@ -11,6 +11,7 @@ const clipboard = @import("clipboard.zig");
 const tools_mod = @import("tools.zig");
 const context_mod = @import("context.zig");
 const cli = @import("cli_args.zig");
+const Log = @import("log.zig");
 
 // 上下文管理纯计算（context.zig）——保留短名，避免大范围改调用点
 const estimateTokens = context_mod.estimateTokens;
@@ -1530,6 +1531,7 @@ const AppState = struct {
             return;
         }
         self.applyLoadedMessagesWithCheckpoint(rows, checkpoint, true);
+        Log.info(.startup, "加载会话 {d}: {d} 行, checkpoint={}", .{ session_id, rows.len, checkpoint != null });
     }
 
     /// 仅重建内存历史（不动显示）：工具循环中途压缩后让主线程与 DB 对齐
@@ -2774,6 +2776,14 @@ const AppState = struct {
                 .output_tokens = job.usage_output,
                 .cached_tokens = job.usage_cached,
             };
+            Log.info(.stream, "回合结束 status={s} in={d} out={d} cached={d} compacted={} err={s}", .{
+                @tagName(self.streamStatus()),
+                job.usage_input,
+                job.usage_output,
+                job.usage_cached,
+                compacted_midturn,
+                if (err) |e| @errorName(e) else "-",
+            });
             // 上下文占用只取最后一轮请求：多轮工具循环累计会虚高（如 35 轮 → 1.1M）
             self.context_usage = job.round_usage;
             self.usage_estimated = false; // 真实用量
@@ -2909,6 +2919,7 @@ const AppState = struct {
                 const cut: u64 = @intCast(estimateTokens(saved));
                 self.usage_anchor_tokens -|= cut;
             }
+            Log.info(.fold, "折叠 {d} 条旧工具输出（约 {d}KB）", .{ folded, saved / 1024 });
             var note_buf: [96]u8 = undefined;
             const note = std.fmt.bufPrint(&note_buf, "已折叠 {d} 条旧工具输出（约 {d}KB）", .{
                 folded,
@@ -4121,6 +4132,7 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db) bool {
     if (job.history.len < 2) return false;
     const est = estimateJobRequestTokens(job);
     if (est * 100 < job.context_window * job.auto_compact_pct) return false;
+    Log.info(.compact, "触发中途压缩 est={d} window={d} pct={d}", .{ est, job.context_window, job.auto_compact_pct });
 
     const hist = job.history;
     const keep_bytes = (if (job.keep_recent_tokens > 0) job.keep_recent_tokens else 20_000) * 4;
@@ -4158,7 +4170,11 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db) bool {
     var collector = SummaryCollector{ .allocator = job.app.allocator };
     defer collector.deinit();
     var cancel = std.atomic.Value(bool).init(false);
-    client.streamMessage(&msgs, &.{}, &cancel, &collector, SummaryCollector.cb, null) catch return false;
+    client.streamMessage(&msgs, &.{}, &cancel, &collector, SummaryCollector.cb, null) catch {
+        // 失败时释放捕获的服务端错误体（该路径不展示详情，仅避免泄漏）
+        if (client.takeErrorBody()) |body| job.app.allocator.free(body);
+        return false;
+    };
     if (collector.list.items.len == 0) return false;
 
     // 保留区首条已落库消息的行 id（实时落库后当前回合消息也有 id）
@@ -4792,6 +4808,9 @@ fn cmdAsk(init: std.process.Init, opt: CliOptions) u8 {
 fn runCli(init: std.process.Init, args: []const []const u8) u8 {
     const allocator = init.gpa;
     const io = init.io;
+    // main() 已初始化日志；CLI 经 std.process.exit 返回，这里保证日志文件关闭
+    defer Log.deinit();
+    Log.info(.startup, "CLI {s}", .{if (args.len > 0) args[0] else ""});
 
     const opt = parseCliArgs(args) orelse {
         cliWriteStderr(io, "参数错误\n\n");
@@ -4861,6 +4880,11 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
+    // 日志（logs/；`SKYNET_LOG=off|error|warn|info|debug` 覆盖级别）
+    Log.init(io, allocator, init.environ_map.get("SKYNET_LOG") orelse "");
+    // CLI 分支经 std.process.exit 退出（本 defer 不执行），runCli 内部自行 deinit
+    defer Log.deinit();
+
     // 无界面子命令（ask/new/sessions/messages/help）：不初始化终端，直接执行后退出
     {
         var arg_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
@@ -4916,6 +4940,12 @@ pub fn main(init: std.process.Init) !void {
     }
     // 启动即显示上下文估算（加载路径里也会刷新）
     state.refreshEstimatedUsage();
+    Log.info(.startup, "TUI 启动 db={s} session={d} provider={s} model={s}", .{
+        if (state.db != null) "ok" else "memory",
+        state.session_id,
+        state.config.current_provider_name,
+        state.config.current_model,
+    });
 
     // 清理过期的 bash 截断临时文件（保留最近 7 天：会话历史里的 stub 可能仍引用）
     _ = tools_mod.cleanupStaleBashTempFiles(
@@ -5927,7 +5957,11 @@ fn persistTranscriptEntry(job: *StreamJob, db: *db_mod.Db, entry_idx: usize, his
         .input_tokens = @intCast(entry.usage.input_tokens),
         .cached_tokens = @intCast(entry.usage.cached_tokens),
         .output_tokens = @intCast(entry.usage.output_tokens),
-    }) catch return;
+    }) catch |e| {
+        // 实时落库失败（此前静默）：记日志，最终由 finalize 的批量写兜底
+        Log.warn(.db, "实时落库失败: {s}", .{@errorName(e)});
+        return;
+    };
     if (id == 0) return;
     entry.msg.db_id = id;
     job.history[hist_idx].db_id = id;
@@ -5938,7 +5972,10 @@ fn ensureWorkerDb(job: *StreamJob, slot: *?db_mod.Db) ?*db_mod.Db {
     if (slot.*) |*d| return d;
     if (job.db_path.len == 0 or job.session_id_num == 0) return null;
     if (std.mem.eql(u8, job.db_path, ":memory:")) return null;
-    slot.* = db_mod.Db.openFile(job.app.allocator, job.io, job.db_path) catch return null;
+    slot.* = db_mod.Db.openFile(job.app.allocator, job.io, job.db_path) catch |e| {
+        Log.debug(.db, "worker 建库失败: {s}（回退 finalize 批量落库）", .{@errorName(e)});
+        return null;
+    };
     return &slot.*.?;
 }
 
@@ -5971,10 +6008,11 @@ fn injectPendingSends(job: *StreamJob, worker_db: *?db_mod.Db) void {
     }
 }
 
-/// 可重试的流错误：网络层失败与响应流被截断（连接中断）。取消与确定性错误不重试。
+/// 可重试的流错误：网络层失败、响应流被截断、服务端瞬时故障（429/5xx）。
+/// 取消与确定性错误（鉴权、参数、上下文过长等）不重试。
 fn streamErrorRetryable(err: ai.AIError) bool {
     return switch (err) {
-        error.NetworkError, error.StreamTruncated => true,
+        error.NetworkError, error.StreamTruncated, error.ServerTransient => true,
         else => false,
     };
 }
@@ -6068,14 +6106,21 @@ fn streamWorker(job: *StreamJob) void {
                     terminal_err = err;
                     break :attempt_loop;
                 }
-                // 重试：丢弃本次尝试的思考/正文（显示侧由 retry_start 事件清除）
+                // 重试：丢弃本次尝试的思考/正文（显示侧由 retry_start 事件清除）；
+                // 该次尝试的服务端错误体仅终态展示需要，重试前主动释放（否则泄漏）
+                if (client.takeErrorBody()) |body| app.allocator.free(body);
                 attempt += 1;
                 var seed: [8]u8 = undefined;
                 std.Io.random(job.io, &seed);
                 const jitter = @as(f32, @floatFromInt(std.mem.readInt(u64, &seed, .little) % 1000)) / 1000.0;
                 const delay_ms = streamRetryDelayMs(attempt, jitter);
                 var note_buf: [128]u8 = undefined;
-                const what: []const u8 = if (err == error.StreamTruncated) "连接中断" else "网络错误";
+                const what: []const u8 = switch (err) {
+                    error.StreamTruncated => "连接中断",
+                    error.ServerTransient => "服务端瞬时故障",
+                    else => "网络错误",
+                };
+                Log.warn(.retry, "重试 {d}/{d}: {s}（{s}），等待 {d}ms", .{ attempt, stream_retry_max, @errorName(err), what, delay_ms });
                 const note = std.fmt.bufPrint(&note_buf, "↻ {s}，{d} 秒后重试（第 {d}/{d} 次）", .{
                     what, (delay_ms + 999) / 1000, attempt, stream_retry_max,
                 }) catch "↻ 连接中断，重试中…";
@@ -6083,6 +6128,7 @@ fn streamWorker(job: *StreamJob) void {
                 // 确保主线程先把失败尝试的显示清掉，再开始退避
                 waitDrained(app);
                 if (!streamRetrySleep(app, delay_ms)) {
+                    Log.info(.retry, "退避期间被用户取消", .{});
                     app.setStreamStatus(.canceled);
                     return;
                 }
@@ -6139,11 +6185,22 @@ fn streamWorker(job: *StreamJob) void {
             }
             const args_summary = summarizeToolArgs(arena, tc.arguments) catch "";
             pushStreamEvent(app, .tool_start, tc.name, args_summary, tc.arguments, "", false);
+            const tool_t0 = std.Io.Timestamp.now(job.io, .awake).toMilliseconds();
+            if (Log.enabled()) {
+                const args_head = tc.arguments[0..@min(tc.arguments.len, 160)];
+                Log.debug(.tools, "执行 {s} args={s}", .{ tc.name, args_head });
+            }
 
             const exec_result = tools_mod.executeWithEnv(arena, job.io, job.cwd, tc.name, tc.arguments, job.environ_map) catch |e| blk: {
                 const msg = std.fmt.allocPrint(arena, "Tool execution failed: {s}", .{@errorName(e)}) catch "Tool execution failed";
                 break :blk tools_mod.Result{ .content = @constCast(msg), .is_error = true };
             };
+            Log.info(.tools, "完成 {s}: {d}ms {d}B err={}", .{
+                tc.name,
+                std.Io.Timestamp.now(job.io, .awake).toMilliseconds() - tool_t0,
+                exec_result.content.len,
+                exec_result.is_error,
+            });
 
             const result_summary = summarizeToolResult(arena, exec_result) catch "";
             // 块内容：edit → diff 展示文本；bash → 原始输出
@@ -7861,6 +7918,7 @@ test {
     _ = @import("tools.zig");
     _ = @import("context.zig");
     _ = @import("cli_args.zig");
+    _ = @import("log.zig");
 }
 
 test "历史消息会清洗非法 UTF-8（避免 JSON 退化为字节数组）" {
@@ -8700,8 +8758,9 @@ test "排队消息：无活动生成时 flush 作为新回合发出（需本地 
 test "断连重试：错误分类与退避计算" {
     try std.testing.expect(streamErrorRetryable(error.NetworkError));
     try std.testing.expect(streamErrorRetryable(error.StreamTruncated));
+    try std.testing.expect(streamErrorRetryable(error.ServerTransient)); // 429/5xx：瞬时故障可重试
     try std.testing.expect(!streamErrorRetryable(error.Canceled));
-    try std.testing.expect(!streamErrorRetryable(error.ServerError));
+    try std.testing.expect(!streamErrorRetryable(error.ServerError)); // 400/403/404：确定性错误
     try std.testing.expect(!streamErrorRetryable(error.InvalidApiKey));
     try std.testing.expect(!streamErrorRetryable(error.JsonParseError));
     try std.testing.expect(!streamErrorRetryable(error.InvalidResponse));
@@ -8815,6 +8874,77 @@ test "断连重试：截断后自动重试成功，丢弃失败尝试的部分�
         }
         try std.testing.expect(final_ok);
     }
+}
+
+test "断连重试：HTTP 503 属瞬时故障，自动重试（需 mock 18127）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    std.Io.Dir.cwd().access(io, "test/mock_18127.running", .{}) catch return error.SkipZigTest;
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    defer {
+        state.config.deinit(std.testing.allocator);
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+        state.stream_buf.deinit(std.testing.allocator);
+        state.stream_reasoning_buf.deinit(std.testing.allocator);
+        state.clearStreamEventsLocked();
+        state.stream_events.deinit(std.testing.allocator);
+        state.clearPendingSends();
+        state.pending_sends.deinit(std.testing.allocator);
+    }
+
+    _ = state.config.appendProvider(std.testing.allocator, .{
+        .name = "mock127",
+        .endpoint = "http://127.0.0.1:18127/v1",
+    });
+    state.config.setCurrentProvider(std.testing.allocator, "mock127");
+    state.config.setCurrentModel(std.testing.allocator, "mock-model");
+
+    // 加速退避（真实值 2s/4s）
+    const saved_delay = stream_retry_base_delay_ms;
+    stream_retry_base_delay_ms = 20;
+    defer stream_retry_base_delay_ms = saved_delay;
+
+    // 标记以 503 开头：mock 对每个标记的第一次请求返回 HTTP 503（瞬时故障）
+    // （旧实现把它归类为 InvalidResponse → 不可重试 → 一次重试后即失败；本测试锁定修复）
+    var qbuf: [72]u8 = undefined;
+    const question = std.fmt.bufPrint(&qbuf, "触发一次 503 重试 #503{d}", .{
+        std.Io.Timestamp.now(io, .awake).toMilliseconds(),
+    }) catch "触发一次 503 重试";
+    state.askAI(question);
+
+    var guard: usize = 0;
+    while (state.streamStatus() != .idle and guard < 3000) : (guard += 1) {
+        state.pumpStream();
+        Io.sleep(io, Io.Duration.fromMilliseconds(5), .awake) catch {};
+    }
+    var connection_failure = false;
+    for (state.messages.items) |m| {
+        if (std.mem.indexOf(u8, m.content, "NetworkError") != null or
+            std.mem.indexOf(u8, m.content, "Unexpected") != null) connection_failure = true;
+    }
+    if (connection_failure) return error.SkipZigTest;
+    try std.testing.expectEqual(StreamStatus.idle, state.streamStatus());
+
+    var display = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    defer display.deinit(std.testing.allocator);
+    for (state.messages.items) |m| {
+        try display.appendSlice(std.testing.allocator, m.content);
+        try display.append(std.testing.allocator, '\n');
+    }
+    // 503 被识别为"服务端瞬时故障" → 重试提示出现 → 重试成功 → 无终态错误
+    try std.testing.expect(std.mem.indexOf(u8, display.items, "服务端瞬时故障") != null);
+    try std.testing.expect(std.mem.indexOf(u8, display.items, "重试（第 1/2 次）") != null);
+    try std.testing.expect(std.mem.indexOf(u8, display.items, "重试成功：这是完整回答。") != null);
+    try std.testing.expect(std.mem.indexOf(u8, display.items, "AI 请求失败") == null);
 }
 
 test "断连重试：退避期间 Ctrl+Q 可取消（需 mock 18126）" {

@@ -20,7 +20,7 @@ zig build -Doptimize=ReleaseSafe
 | `test/mock_openai_400_gzip.ps1` | 18124 | gzip 压缩的服务端 400 错误体（循环服务） |
 | `test/mock_summary.ps1` | 18125 | compaction 摘要请求（返回 `MOCK_SUMMARY`） |
 | `test/mock_openai_truncated.ps1` | 18126 | 响应流中途断开（无 [DONE]/finish_reason）→ 验证 StreamTruncated 检测与重试预算耗尽 |
-| `test/mock_openai_retry.ps1` | 18127 | 每个唯一标记（提问中的 `#<毫秒>`）的第一次请求截断、后续成功 → 验证自动重试可重复运行 |
+| `test/mock_openai_retry.ps1` | 18127 | 每个唯一标记（提问中的 `#<毫秒>` 或 `#503<毫秒>`）的第一次请求失败、后续成功：无 `503` 前缀 → 截断（验证断连重试）；有 → HTTP 503（验证瞬时故障重试）。可重复运行 |
 
 启动（在工作目录执行，脚本会写 `test/mock_*.running` 标记）：
 
@@ -84,9 +84,14 @@ ole='summary' 的消息（摘要原文，FTS 可搜）
 - `src/cli_args.zig`：CLI 参数解析与输出辅助（无 AppState 依赖）
 - `src/ai.zig`：SSE 流式请求、工具调用分片、usage 解析、各厂会话亲和/缓存参数
 - `src/db.zig`：SQLite（fridge）schema 与读写；`src/tools.zig`：7 个工具实现；`src/regex.zig`：grep 用迷你正则
+- `src/log.zig`：迷你日志（仅文件、线程安全；模块标签 + 级别过滤；见"其他约定"）
 
 ## 其他约定
 
+- **日志**：每次启动写 `logs/<epoch>.<ms>.txt`（保留最近 20 份）。默认 info 级；
+  `$env:SKYNET_LOG='debug'|'warn'|'error'|'off'` 覆盖。含请求/响应/工具/重试/压缩/落库失败
+  全链路元数据（不含消息正文与密钥）。**排查线上问题（断连、卡顿、丢消息）时先看最新日志**；
+  测试环境不初始化日志（main() 才 init），因此单测零副作用
 - 测试会话标题用 `agent-test` 前缀，方便识别和清理
 - 工具 bug 优先自己修，不要让 TUI 里的 AI 代劳（它的会话随时可能因 schema 变更被清空）
 - 改行为前先跑 `zig build test`；涉及真实 provider 的验证用小会话 + `--max-chars`

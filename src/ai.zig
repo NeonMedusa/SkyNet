@@ -4,6 +4,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Uri = std.Uri;
 const config_mod = @import("config.zig");
+const Log = @import("log.zig");
 
 pub const Affinity = config_mod.Affinity;
 pub const CacheRetention = config_mod.CacheRetention;
@@ -406,6 +407,8 @@ pub const AIError = error{
     Canceled,
     /// 连接中途被关闭（EOF）且响应流未经 [DONE]/finish_reason 正常终止
     StreamTruncated,
+    /// 服务端瞬时故障（429 限流 / 5xx）——属"可重试"类，由调用方决定退避重发
+    ServerTransient,
 };
 
 pub const ModelInfo = struct {
@@ -571,6 +574,8 @@ pub const AI = struct {
         tool_calls: ?*ToolCallAccumulator,
     ) AIError!void {
         self.usage = .{};
+        const t0 = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        Log.info(.api, "请求 model={s} 消息={d} 工具={d}", .{ self.config.model, history.len, tools.len });
         const body_json = try buildRequestBody(
             self.allocator,
             self.config.model,
@@ -630,10 +635,17 @@ pub const AI = struct {
         var response = request.receiveHead(&redirect_buf) catch return error.NetworkError;
 
         const status = response.head.status;
+        if (status.class() != .success) {
+            // 非成功响应记录状态码：此前该信息在错误分类中被静默丢弃，事后无从诊断
+            Log.warn(.api, "HTTP {s}（非成功响应）", .{@tagName(status)});
+        }
         if (status == .unauthorized) return error.InvalidApiKey;
-        if (status == .not_found or status == .internal_server_error or
-            status == .bad_request or status == .forbidden)
-        {
+        // 429 限流与 5xx：服务端瞬时故障 → 可重试（对齐 pi/opencode 的重试面）
+        if (status == .too_many_requests or status.class() == .server_error) {
+            self.captureErrorBody(&response);
+            return error.ServerTransient;
+        }
+        if (status == .not_found or status == .bad_request or status == .forbidden) {
             self.captureErrorBody(&response);
             return error.ServerError;
         }
@@ -671,8 +683,15 @@ pub const AI = struct {
         // 否则"纯思考/部分内容被截断"会被当成正常结束：用户只看到输出停住、无任何提示。
         if (!parser.finished and !parser.saw_finish_reason) {
             if (cancel.load(.acquire)) return error.Canceled;
+            Log.warn(.api, "流被截断（无 [DONE]/finish_reason）({d}ms)", .{std.Io.Timestamp.now(self.io, .awake).toMilliseconds() - t0});
             return error.StreamTruncated;
         }
+        Log.info(.api, "响应 {d}ms in={d} cached={d} out={d}", .{
+            std.Io.Timestamp.now(self.io, .awake).toMilliseconds() - t0,
+            self.usage.input_tokens,
+            self.usage.cached_tokens,
+            self.usage.output_tokens,
+        });
     }
 
     pub fn listModels(self: *AI) AIError![]ModelInfo {

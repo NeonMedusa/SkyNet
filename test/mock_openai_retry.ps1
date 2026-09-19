@@ -1,7 +1,8 @@
-# 模拟"首次断连、重试成功"：请求体中出现新标记（#<毫秒时间戳>）的第一次请求返回被截断的 SSE
-# （无 finish_reason / [DONE]），同一标记的后续请求返回完整回答。
-# 每个测试运行在提问里嵌入新标记，因此可重复运行；客户端应丢弃失败尝试的部分思考并
-# 自动重发请求，最终得到完整回答且不显示终态错误。
+# 模拟"首次失败、重试成功"（两种失败模式，按提问里的标记区分）：
+#   #<毫秒时间戳>      → 第一次请求返回被截断的 SSE（无 finish_reason / [DONE]）
+#   #503<毫秒时间戳>   → 第一次请求返回 HTTP 503（服务端瞬时故障）
+# 同一标记的后续请求返回完整回答。每个测试运行在提问里嵌入新标记，因此可重复运行；
+# 客户端应丢弃失败尝试的部分产出并自动重发请求，最终得到完整回答且不显示终态错误。
 $ErrorActionPreference = "Stop"
 $marker_file = Join-Path $PSScriptRoot "mock_18127.running"
 "running" | Set-Content $marker_file
@@ -9,7 +10,7 @@ $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopba
 $listener.Start()
 $log = Join-Path $env:TEMP "skynet_mock_retry.log"
 "START $(Get-Date -Format o)" | Set-Content $log
-$truncated = @{}   # 已被截断过的标记（同一标记的下一次请求回成功）
+$truncated = @{}   # 已被处理过的标记（同一标记的下一次请求回成功）
 
 function Send-Chunked($stream, [string]$payload) {
     $payloadBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
@@ -44,19 +45,29 @@ try {
             }
             $text = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
 
-            # 标记：提问中的 "#<毫秒时间戳>"，每个测试运行唯一
-            $truncate = $false
-            $mark = [regex]::Match($text, '#(\d{6,})')
+            # 标记：提问中的 "#<毫秒>"（截断模式）或 "#503<毫秒>"（HTTP 503 模式），每次运行唯一
+            $mode = 'ok'
+            $mark = [regex]::Match($text, '#([A-Za-z0-9]+)')
             if ($mark.Success) {
                 $key = $mark.Groups[1].Value
                 if (-not $truncated.ContainsKey($key)) {
                     $truncated[$key] = $true
-                    $truncate = $true
+                    $mode = if ($key.StartsWith('503')) { '503' } else { 'cut' }
                 }
             }
-            Add-Content $log "REQ marker=$($mark.Value) truncate=$truncate bytes=$($text.Length)"
+            Add-Content $log "REQ marker=$($mark.Value) mode=$mode bytes=$($text.Length)"
 
-            if ($truncate) {
+            if ($mode -eq '503') {
+                # 服务端瞬时故障：503 + JSON 错误体
+                $payload = '{"error":{"message":"mock 503 temporary overload"}}'
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+                $head = "HTTP/1.1 503 Service Unavailable`r`nContent-Type: application/json`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`n`r`n"
+                $headBytes = [System.Text.Encoding]::ASCII.GetBytes($head)
+                $stream.Write($headBytes, 0, $headBytes.Length)
+                $stream.Write($bytes, 0, $bytes.Length)
+                $stream.Flush()
+            }
+            elseif ($mode -eq 'cut') {
                 # 截断：发一段 reasoning 后直接结束（无 [DONE] / finish_reason）
                 $payload = 'data: {"choices":[{"delta":{"reasoning_content":"第一段思考（会被丢弃）……"}}]}' + "`n`n"
                 Send-Chunked $stream $payload

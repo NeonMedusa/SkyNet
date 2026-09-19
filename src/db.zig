@@ -2,6 +2,7 @@ const std = @import("std");
 const fr = @import("fridge");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const Log = @import("log.zig");
 
 pub const MessageRow = struct {
     id: i64 = 0,
@@ -174,6 +175,10 @@ pub const Db = struct {
             if (rows.len > 0) current = rows[0].user_version;
         } else |_| {}
         if (current != schema_version) {
+            // current == 0 = 全新库（无 schema），无需迁移、也谈不上"数据丢失"
+            if (current != 0) {
+                Log.warn(.db, "schema 版本不符（{d} → {d}）: {s}", .{ current, schema_version, filename });
+            }
             // v5 → v6：新增 usage 列 + compaction 表；v6 → v7：compaction 增加摘要消息引用
             var migrated = false;
             if (current == 5 or current == 6) {
@@ -202,6 +207,7 @@ pub const Db = struct {
                     compaction_ok;
             }
             if (!migrated) {
+                if (current != 0) Log.warn(.db, "无法无损迁移：删表重建（旧会话数据将丢失）", .{});
                 try sess.conn.execAll(
                     \\DROP TRIGGER IF EXISTS "message_ai";
                     \\DROP TRIGGER IF EXISTS "message_ad";
@@ -216,6 +222,8 @@ pub const Db = struct {
 
         try sess.conn.execAll(schema);
         try sess.conn.execAll(std.fmt.comptimePrint("PRAGMA user_version = {d};", .{schema_version}));
+
+        Log.info(.db, "数据库就绪 {s} schema={d}（原 {d}）", .{ filename, schema_version, current });
 
         return .{ .sess = sess, .io = io, .allocator = allocator, .path = path_copy };
     }
