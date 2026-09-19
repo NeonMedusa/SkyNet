@@ -5,7 +5,7 @@ $listener = [System.Net.HttpListener]::new()
 $listener.Prefixes.Add("http://127.0.0.1:18124/")
 $listener.Start()
 try {
-    for ($i = 0; $i -lt 1; $i++) {
+    while ($true) {
         $ctx = $listener.GetContext()
         $reader = New-Object System.IO.StreamReader($ctx.Request.InputStream, [System.Text.Encoding]::UTF8)
         $null = $reader.ReadToEnd()

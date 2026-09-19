@@ -369,6 +369,12 @@ const max_events_per_frame: usize = 1024;
 /// 生成中可排队等待发送的消息上限（防止连打堆积）
 const max_pending_sends: usize = 32;
 
+// ── 断连自动重试（对齐 pi / opencode 的做法：整请求重发，非续传）──
+/// 最大重试次数（初次尝试之外）；只重试网络错误与流截断，取消/确定性错误不重试
+const stream_retry_max: u32 = 2;
+/// 基础退避毫秒数（指数增长 + 抖动；测试可调小以加速）
+var stream_retry_base_delay_ms: u64 = 2000;
+
 // ── 旧工具输出折叠（控制上下文占用）──
 // 折叠/压缩的纯计算在 context.zig（保护窗口、批量阈值、区间选择等）
 const StreamStatus = enum(u8) { idle, running, done, failed, canceled };
@@ -382,7 +388,7 @@ const tool_schemas = blk: {
     break :blk arr;
 };
 
-const StreamEventKind = enum { turn_end, tool_start, tool_end, user_sent };
+const StreamEventKind = enum { turn_end, tool_start, tool_end, user_sent, retry_start };
 
 const StreamEvent = struct {
     kind: StreamEventKind,
@@ -2199,6 +2205,10 @@ const AppState = struct {
         job.auto_compact_pct = self.auto_compact_pct;
         job.context_window = self.contextWindowCurrent();
         job.keep_recent_tokens = self.keep_recent_tokens;
+        // create() 不应用结构体默认值：以下字段必须显式清零（否则是未初始化内存）
+        job.round_usage = .{};
+        job.anchor_len = 0;
+        job.anchor_tokens = 0;
         // usage 锚点随历史拷进 job（增量估算用；越界时不使用）
         if (self.usage_anchor_len) |al| {
             if (al <= self.history.items.len) {
@@ -2518,6 +2528,11 @@ const AppState = struct {
                 switch (ev.kind) {
                     .turn_end => self.closeCurrentTurn(),
                     .user_sent => self.setToast("排队消息已送达"),
+                    .retry_start => {
+                        // 丢弃失败尝试的部分显示（思考/正文），改为一行重试提示
+                        self.removeStreamingMessage();
+                        self.addStreamMessage(ev.text, .{ .fg = .dark_gray });
+                    },
                     .tool_start => {
                         // bash/edit：先放一个只含标题的块（结果到达后追加正文）
                         const started = if (block_kind != null) self.beginToolBlock(ev.name, ev.args, block_kind.?) else false;
@@ -5956,6 +5971,33 @@ fn injectPendingSends(job: *StreamJob, worker_db: *?db_mod.Db) void {
     }
 }
 
+/// 可重试的流错误：网络层失败与响应流被截断（连接中断）。取消与确定性错误不重试。
+fn streamErrorRetryable(err: ai.AIError) bool {
+    return switch (err) {
+        error.NetworkError, error.StreamTruncated => true,
+        else => false,
+    };
+}
+
+/// 第 attempt 次重试的退避时长：base × 2^(attempt-1)，叠加 ±25% 抖动
+fn streamRetryDelayMs(attempt: u32, jitter: f32) u64 {
+    const base = stream_retry_base_delay_ms * (@as(u64, 1) << @intCast(attempt - 1));
+    const factor: f64 = 0.75 + 0.5 * @as(f64, jitter);
+    return @intFromFloat(@as(f64, @floatFromInt(base)) * factor);
+}
+
+/// 可取消的退避睡眠（50ms 步进检查 Ctrl+Q）；返回 false 表示期间被取消
+fn streamRetrySleep(app: *AppState, total_ms: u64) bool {
+    var remaining = total_ms;
+    while (remaining > 0) {
+        if (app.stream_cancel.load(.acquire)) return false;
+        const step: u64 = @min(remaining, 50);
+        Io.sleep(app.io, Io.Duration.fromMilliseconds(@intCast(step)), .awake) catch {};
+        remaining -= step;
+    }
+    return !app.stream_cancel.load(.acquire);
+}
+
 fn streamWorker(job: *StreamJob) void {
     const app = job.app;
     const arena = job.arena.allocator();
@@ -5974,12 +6016,6 @@ fn streamWorker(job: *StreamJob) void {
 
     // 持续循环，直到模型不再返回工具调用（自然结束）、出错或被用户取消
     while (true) {
-        var tool_calls = ai.ToolCallAccumulator{ .allocator = arena };
-        job.content.clearRetainingCapacity();
-        job.reasoning.clearRetainingCapacity();
-        job.reasoning_start_ms = 0;
-        job.reasoning_end_ms = 0;
-
         // 工具轮次边界：把用户排队消息注入历史（下一轮请求即可见）
         injectPendingSends(job, &worker_db);
 
@@ -5991,20 +6027,71 @@ fn streamWorker(job: *StreamJob) void {
             }
         }
 
-        const result = client.streamMessage(
-            job.history,
-            &tool_schemas,
-            &app.stream_cancel,
-            job,
-            onStreamDelta,
-            &tool_calls,
-        );
-        job.usage_input += client.usage.input_tokens;
-        job.usage_output += client.usage.output_tokens;
-        job.usage_cached += client.usage.cached_tokens;
-        job.round_usage = client.usage;
+        // 单轮请求：断连（网络错误/流截断）自动重试，重试会丢弃失败尝试的部分产出
+        // （对齐 pi/opencode：整请求重发而非续传；输入侧靠前缀缓存几乎免费，输出侧重算）
+        var tool_calls = ai.ToolCallAccumulator{ .allocator = arena };
+        var attempt: u32 = 0;
+        var terminal_err: ?ai.AIError = null;
+        attempt_loop: while (true) {
+            // 每次尝试从干净状态开始
+            tool_calls = .{ .allocator = arena };
+            job.content.clearRetainingCapacity();
+            job.reasoning.clearRetainingCapacity();
+            job.reasoning_start_ms = 0;
+            job.reasoning_end_ms = 0;
 
-        if (result) |_| {} else |err| {
+            const result = client.streamMessage(
+                job.history,
+                &tool_schemas,
+                &app.stream_cancel,
+                job,
+                onStreamDelta,
+                &tool_calls,
+            );
+
+            if (result) |_| {
+                // 成功：累计本轮 usage（仅成功尝试计入上下文显示）
+                job.usage_input += client.usage.input_tokens;
+                job.usage_output += client.usage.output_tokens;
+                job.usage_cached += client.usage.cached_tokens;
+                job.round_usage = client.usage;
+                break :attempt_loop;
+            } else |err| {
+                if (!streamErrorRetryable(err) or attempt >= stream_retry_max or
+                    app.stream_cancel.load(.acquire))
+                {
+                    // 终态失败：累计本次尝试 usage（真实消耗）后走原有错误路径
+                    job.usage_input += client.usage.input_tokens;
+                    job.usage_output += client.usage.output_tokens;
+                    job.usage_cached += client.usage.cached_tokens;
+                    job.round_usage = client.usage;
+                    terminal_err = err;
+                    break :attempt_loop;
+                }
+                // 重试：丢弃本次尝试的思考/正文（显示侧由 retry_start 事件清除）
+                attempt += 1;
+                var seed: [8]u8 = undefined;
+                std.Io.random(job.io, &seed);
+                const jitter = @as(f32, @floatFromInt(std.mem.readInt(u64, &seed, .little) % 1000)) / 1000.0;
+                const delay_ms = streamRetryDelayMs(attempt, jitter);
+                var note_buf: [128]u8 = undefined;
+                const what: []const u8 = if (err == error.StreamTruncated) "连接中断" else "网络错误";
+                const note = std.fmt.bufPrint(&note_buf, "↻ {s}，{d} 秒后重试（第 {d}/{d} 次）", .{
+                    what, (delay_ms + 999) / 1000, attempt, stream_retry_max,
+                }) catch "↻ 连接中断，重试中…";
+                pushStreamEvent(app, .retry_start, "", note, "", "", false);
+                // 确保主线程先把失败尝试的显示清掉，再开始退避
+                waitDrained(app);
+                if (!streamRetrySleep(app, delay_ms)) {
+                    app.setStreamStatus(.canceled);
+                    return;
+                }
+                job.content.clearRetainingCapacity();
+                job.reasoning.clearRetainingCapacity();
+            }
+        }
+
+        if (terminal_err) |err| {
             // 失败/取消：保留已累积的内容与工具调用后退出（同样实时落库）
             if (job.content.items.len > 0 or tool_calls.items.items.len > 0) {
                 if (appendAssistantTurn(job, arena, tool_calls.items.items)) |_| {
@@ -7881,10 +7968,15 @@ test "集成：响应流被截断（需 mock 18126，中途断开无 [DONE]/fini
     state.config.setCurrentProvider(std.testing.allocator, "mock126");
     state.config.setCurrentModel(std.testing.allocator, "mock-model");
 
+    // 加速退避（真实值 2s/4s）：本测试验证"重试预算耗尽后报错"的路径
+    const saved_delay = stream_retry_base_delay_ms;
+    stream_retry_base_delay_ms = 20;
+    defer stream_retry_base_delay_ms = saved_delay;
+
     state.askAI("触发截断");
 
     var guard: usize = 0;
-    while (state.streamStatus() != .idle and guard < 1000) : (guard += 1) {
+    while (state.streamStatus() != .idle and guard < 2000) : (guard += 1) {
         state.pumpStream();
         Io.sleep(io, Io.Duration.fromMilliseconds(10), .awake) catch {};
     }
@@ -7894,14 +7986,21 @@ test "集成：响应流被截断（需 mock 18126，中途断开无 [DONE]/fini
     var saw_truncated = false;
     var saw_checklist = false;
     var saw_failed = false;
+    var retry_notes: usize = 0;
+    var saw_retry_2 = false;
     for (state.messages.items) |m| {
         if (std.mem.indexOf(u8, m.content, "响应流未正常结束") != null) saw_truncated = true;
         if (std.mem.indexOf(u8, m.content, "请检查: 1)") != null) saw_checklist = true;
         if (std.mem.indexOf(u8, m.content, "AI 请求失败") != null) saw_failed = true;
+        if (std.mem.indexOf(u8, m.content, "↻ 连接中断") != null) retry_notes += 1;
+        if (std.mem.indexOf(u8, m.content, "重试（第 2/2 次）") != null) saw_retry_2 = true;
     }
     try std.testing.expect(saw_truncated);
     try std.testing.expect(!saw_failed); // 截断使用友好文案，不走通用失败格式
     try std.testing.expect(!saw_checklist); // 截断属瞬时问题，不显示配置检查清单
+    // 重试预算：共重试 2 次（提示两条），第二次为最后一次
+    try std.testing.expectEqual(@as(usize, 2), retry_notes);
+    try std.testing.expect(saw_retry_2);
 }
 
 test "工具块：内容构建与底色渲染" {
@@ -8596,6 +8695,192 @@ test "排队消息：无活动生成时 flush 作为新回合发出（需本地 
         if (std.mem.eql(u8, m.content, queued_text)) display_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), display_count);
+}
+
+test "断连重试：错误分类与退避计算" {
+    try std.testing.expect(streamErrorRetryable(error.NetworkError));
+    try std.testing.expect(streamErrorRetryable(error.StreamTruncated));
+    try std.testing.expect(!streamErrorRetryable(error.Canceled));
+    try std.testing.expect(!streamErrorRetryable(error.ServerError));
+    try std.testing.expect(!streamErrorRetryable(error.InvalidApiKey));
+    try std.testing.expect(!streamErrorRetryable(error.JsonParseError));
+    try std.testing.expect(!streamErrorRetryable(error.InvalidResponse));
+
+    const saved = stream_retry_base_delay_ms;
+    defer stream_retry_base_delay_ms = saved;
+    stream_retry_base_delay_ms = 2000;
+    // 中位抖动 = 基准值；0.0/1.0 = -25%/+25%；attempt 2 指数翻倍
+    try std.testing.expectEqual(@as(u64, 2000), streamRetryDelayMs(1, 0.5));
+    try std.testing.expectEqual(@as(u64, 4000), streamRetryDelayMs(2, 0.5));
+    try std.testing.expectEqual(@as(u64, 1500), streamRetryDelayMs(1, 0.0));
+    try std.testing.expectEqual(@as(u64, 2500), streamRetryDelayMs(1, 1.0));
+    try std.testing.expectEqual(@as(u64, 3000), streamRetryDelayMs(2, 0.0));
+}
+
+test "断连重试：截断后自动重试成功，丢弃失败尝试的部分产出（需 mock 18127）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    std.Io.Dir.cwd().access(io, "test/mock_18127.running", .{}) catch return error.SkipZigTest;
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+
+    const db_path = "skynet_test_retry.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_retry.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_retry.db-shm") catch {};
+    state.db = db_mod.Db.openFile(std.testing.allocator, io, db_path) catch null;
+    state.session_id = if (state.db != null) (state.db.?.createSession("") catch 0) else 0;
+
+    defer {
+        if (state.db) |*d| d.deinit();
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_retry.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_retry.db-shm") catch {};
+        state.config.deinit(std.testing.allocator);
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+        state.stream_buf.deinit(std.testing.allocator);
+        state.stream_reasoning_buf.deinit(std.testing.allocator);
+        state.clearStreamEventsLocked();
+        state.stream_events.deinit(std.testing.allocator);
+        state.clearPendingSends();
+        state.pending_sends.deinit(std.testing.allocator);
+    }
+
+    _ = state.config.appendProvider(std.testing.allocator, .{
+        .name = "mock127",
+        .endpoint = "http://127.0.0.1:18127/v1",
+    });
+    state.config.setCurrentProvider(std.testing.allocator, "mock127");
+    state.config.setCurrentModel(std.testing.allocator, "mock-model");
+
+    // 加速退避（真实值 2s/4s）
+    const saved_delay = stream_retry_base_delay_ms;
+    stream_retry_base_delay_ms = 20;
+    defer stream_retry_base_delay_ms = saved_delay;
+
+    // 提问嵌入唯一标记（#毫秒时间戳）：mock 只截断每个标记的第一次请求，
+    // 因此测试可重复运行（不依赖 mock 进程的请求计数）
+    var qbuf: [64]u8 = undefined;
+    const question = std.fmt.bufPrint(&qbuf, "触发一次断连重试 #{d}", .{
+        std.Io.Timestamp.now(io, .awake).toMilliseconds(),
+    }) catch "触发一次断连重试";
+    state.askAI(question);
+
+    var guard: usize = 0;
+    while (state.streamStatus() != .idle and guard < 3000) : (guard += 1) {
+        state.pumpStream();
+        Io.sleep(io, Io.Duration.fromMilliseconds(5), .awake) catch {};
+    }
+    // 连接失败 ≠ 测试失败（mock 未就绪时跳过）
+    var connection_failure = false;
+    for (state.messages.items) |m| {
+        if (std.mem.indexOf(u8, m.content, "NetworkError") != null or
+            std.mem.indexOf(u8, m.content, "Unexpected") != null) connection_failure = true;
+    }
+    if (connection_failure) return error.SkipZigTest;
+    try std.testing.expectEqual(StreamStatus.idle, state.streamStatus());
+
+    var display = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    defer display.deinit(std.testing.allocator);
+    for (state.messages.items) |m| {
+        try display.appendSlice(std.testing.allocator, m.content);
+        try display.append(std.testing.allocator, '\n');
+    }
+    // 重试提示出现；失败尝试的部分思考被丢弃；最终得到完整回答；无终态错误
+    try std.testing.expect(std.mem.indexOf(u8, display.items, "重试（第 1/2 次）") != null);
+    try std.testing.expect(std.mem.indexOf(u8, display.items, "会被丢弃") == null);
+    try std.testing.expect(std.mem.indexOf(u8, display.items, "重试成功：这是完整回答。") != null);
+    try std.testing.expect(std.mem.indexOf(u8, display.items, "响应流未正常结束") == null);
+    try std.testing.expect(std.mem.indexOf(u8, display.items, "AI 请求失败") == null);
+
+    // 落库：完整回答入库；被丢弃的部分思考不入库
+    if (state.db) |*db| {
+        const rows = db.loadMessages(state.session_id) catch &.{};
+        var final_ok = false;
+        for (rows) |m| {
+            if (std.mem.eql(u8, m.role, "assistant") and std.mem.indexOf(u8, m.content, "重试成功") != null) {
+                final_ok = true;
+                try std.testing.expectEqual(@as(i64, 100), m.input_tokens);
+                try std.testing.expectEqual(@as(i64, 80), m.cached_tokens);
+            }
+            try std.testing.expect(std.mem.indexOf(u8, m.content, "会被丢弃") == null);
+        }
+        try std.testing.expect(final_ok);
+    }
+}
+
+test "断连重试：退避期间 Ctrl+Q 可取消（需 mock 18126）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    std.Io.Dir.cwd().access(io, "test/mock_18126.running", .{}) catch return error.SkipZigTest;
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    defer {
+        state.config.deinit(std.testing.allocator);
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+        state.stream_buf.deinit(std.testing.allocator);
+        state.stream_reasoning_buf.deinit(std.testing.allocator);
+        state.clearStreamEventsLocked();
+        state.stream_events.deinit(std.testing.allocator);
+        state.clearPendingSends();
+        state.pending_sends.deinit(std.testing.allocator);
+    }
+
+    _ = state.config.appendProvider(std.testing.allocator, .{
+        .name = "mock126",
+        .endpoint = "http://127.0.0.1:18126/v1",
+    });
+    state.config.setCurrentProvider(std.testing.allocator, "mock126");
+    state.config.setCurrentModel(std.testing.allocator, "mock-model");
+
+    // 拉长退避，保证取消发生在睡眠期间
+    const saved_delay = stream_retry_base_delay_ms;
+    stream_retry_base_delay_ms = 5000;
+    defer stream_retry_base_delay_ms = saved_delay;
+
+    state.askAI("触发截断并在退避中取消");
+
+    // 泵到重试提示出现（第一次尝试已截断、进入退避）
+    var saw_note = false;
+    var guard: usize = 0;
+    while (guard < 2000 and !saw_note) : (guard += 1) {
+        state.pumpStream();
+        for (state.messages.items) |m| {
+            if (std.mem.indexOf(u8, m.content, "重试（第 1/2 次）") != null) saw_note = true;
+        }
+        Io.sleep(io, Io.Duration.fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expect(saw_note);
+
+    // 退避睡眠中取消：worker 应在 50ms 步进内响应并退出
+    state.cancelStream();
+    guard = 0;
+    while (state.streamStatus() != .idle and guard < 400) : (guard += 1) {
+        state.pumpStream();
+        Io.sleep(io, Io.Duration.fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expectEqual(StreamStatus.idle, state.streamStatus());
+    // 取消路径不显示终态错误
+    for (state.messages.items) |m| {
+        try std.testing.expect(std.mem.indexOf(u8, m.content, "响应流未正常结束") == null);
+        try std.testing.expect(std.mem.indexOf(u8, m.content, "AI 请求失败") == null);
+    }
 }
 
 test "粘贴换行判定：突发间隔视为粘贴" {
