@@ -2,10 +2,9 @@
 
 # SkyNet
 
-用 Zig 0.16 写的 TUI AI 编码助手
-仿照 pi 提供 7 个工具（read / write / edit / bash / grep / find / ls）、
-流式对话、思考块、SQLite 持久化、
-工具输出折叠、上下文压缩（compaction）、prompt 缓存亲和、CLI 与 TUI 共用同一套 agent 逻辑。
+用 Zig 0.16 写的 TUI AI 编码助手，仿照 pi 提供 7 个工具（read / write / edit / bash / grep / find / ls）：
+流式对话、思考块、SQLite 持久化、工具输出折叠、上下文压缩（compaction）、prompt 缓存亲和；
+CLI 与 TUI 共用同一套 agent 逻辑。
 
 ## 免责声明（请务必阅读）
 
@@ -14,14 +13,13 @@
   全程没有任何确认或拦截。"换个安全目录再跑"**不能**限制它——工作目录只是提示词层面的约定，
   不构成隔离。要真正限制，只能靠系统级手段（虚拟机、独立用户/容器、备份与权限控制），
   而不是指望本程序。**用它造成的一切后果由使用者自行承担。**
-- **提供商兼容性仅做了极有限实测。** 目前只实测过 **opencode-go** 网关，模型只实测过
-  **deepseek-v4.1-flash**。内置的其他提供商预设（OpenAI、OpenRouter、DeepSeek 官方等
-  18 家）只是模板，**不保证可用**；其他模型对工具调用、缓存字段、思考强度参数的支持
-  也不一致，可能出现报错、重复计费或行为异常。
 - **会产生真实费用。** 请自行确认计费与配额，建议先用小会话和 `--max-chars` 观察。
-- **缓存命中优化、上下文压缩、会话持久化都只是"尽量做了"，不保证可靠。**
-  摘要可能丢信息，缓存亲和可能失效，数据库 schema 版本不一致时会**删表重建**（会话丢失）。
-  不要把 SkyNet 用作唯一的信息存储。
+- **更新 SkyNet 后，旧会话可能全部丢失。** 数据库结构可能在更新中发生破坏性变动
+  （直接删表重建），历史对话不保证保留；重要会话请自行备份 `skynet.db`。
+- **提供商兼容性仅做了极有限实测。** 目前只实测过 **opencode-go** 网关，模型只实测过
+  **deepseek-v4.1-flash**。内置的其他提供商预设（OpenAI、OpenRouter、DeepSeek 官方等）
+  只是模板，**不保证可用**；其他模型对工具调用、缓存字段、思考强度参数的支持
+  也不一致，可能出现报错、重复计费或行为异常。
 - 本项目仅供学习与自用，不提供任何形式的担保（见文末）。
 
 ## 构建
@@ -39,40 +37,34 @@ zig build -Doptimize=ReleaseSafe
 ## 运行
 
 ```bash
-./zig-out/bin/SkyNet.exe                 # 启动 TUI
-./zig-out/bin/SkyNet.exe help            # CLI 帮助
-./zig-out/bin/SkyNet.exe ask -new -title "随便聊聊" "你好"
-./zig-out/bin/SkyNet.exe ask -session latest "继续"
+./zig-out/bin/SkyNet.exe                                     # 启动 TUI（无参数）
+./zig-out/bin/SkyNet.exe ask -new -title "随便聊聊" "你好"    # 无界面发送一轮对话
+./zig-out/bin/SkyNet.exe help                                # 全部子命令与参数
 ```
 
-- 提供商与密钥：编辑 `config.json`（默认不随仓库提交），密钥也可以走环境变量
-- 数据默认落 `skynet.db`（SQLite，WAL）
-- `config.json` 顶层 `ambiguous_width`：模糊宽度字符（`①②③`、`→≤…` 等）的排版档位
-  —— 省略或 `"auto"`（默认）：以单列为基底，仅明显被挤压的字符族（带圈/带括号字母数字）
-  按两列；`"wide"`：全部按两列；`"narrow"`：全部按一列。
-  `auto` 的内置名单由项目长期维护（发现新的"挤压字符"会加进去），想调整可提 issue
-- `config.json` 顶层 `width_overrides`：在档位之外按字符覆盖，永远最高优先。
-  名单格式：空白/逗号分隔；支持码点范围 `U+2460-U+249B`（`U+` 前缀可省）或字面字符 `— →`。
-  示例：`{"width_overrides": {"wide": "U+2460-U+249B", "narrow": "— → ←"}}`；
-  想抵消 auto 名单里某个字符的加宽，把该字符写进 narrow 名单即可。
-  注意：真宽字符（如 `中`）终端固定渲染 2 列，narrow 名单对它们无效；
-  wide 名单对任何字符有效（渲染层会补续格对齐）。上限各 1024 个码点。
-- CLI 的 stdout 是最终回答，stderr 是工具活动；`--json` 输出结构化结果；
-  退出码 0 成功 / 2 参数错误 / 3 无可用提供商或模型 / 4 请求或数据库失败
+首次启动自动生成 `config.json`（空配置）与 `skynet.db`（SQLite，WAL）。
+第一次使用：TUI 里按 `Esc` → `models` → 底部「+ 添加提供商…」，填入 API 地址与密钥
+（密钥也可留空、改填环境变量名）。
 
-常用 CLI 子命令：`ask` / `new` / `sessions` / `messages` / `stats` / `compact`。
-常用参数：`-session <id|latest>`、`-db`、`-config`、`-model`、`-provider`、
-`--no-tools`、`--max-chars N`、`--max-context N`、`--thinking off|low|high|max`。
+**完整参考见 [`docs/user-guide.md`](docs/user-guide.md)：**
 
-TUI 里可用的指令与快捷键：`/help`、`/models`、`/sessions`、`/compact`、`/thinking`、
-`Esc` 打开菜单、`Ctrl+Q` 取消流式/压缩、`Ctrl+C` 复制选中内容。
+- `config.json` 全部字段与 18 家内置预设、密钥解析顺序；
+- TUI 指令与快捷键（`/help` `/models` `/sessions` `/compact` `/thinking`、鼠标操作）；
+- CLI 子命令与参数（`ask` / `new` / `sessions` / `messages` / `stats` / `compact`）；
+- 状态栏读数、`ambiguous_width` / `width_overrides`（调整 `①②③`、`—→` 等字符显示宽度）。
+
+约定：CLI 的 stdout = 最终回答，stderr = 工具活动；退出码 0 成功 / 2 参数错误 /
+3 无可用提供商或模型 / 4 请求或数据库失败。
 
 ## 已知限制
 
-- 工具没有确认环节、没有目录白名单，也**无法阻止通过绝对路径访问任意位置**（见免责声明第一条）
-- 提供商预设基本未经实测，只有 opencode-go + deepseek-v4.1-flash 是验证过的组合
-- prompt 缓存亲和、工具输出折叠、自动/手动压缩属于启发式实现，边界情况下可能失效或误判
-- SQLite schema 升级策略：相邻版本尽量 `ALTER TABLE` 无损迁移，版本跨度大时删表重建
+- prompt 缓存亲和、工具输出折叠、自动/手动压缩：**只是"尽量做了"，是否真正有效未经验证**。
+  不要依赖它们带来的收益；边界情况下它们可能失效，甚至帮倒忙（压缩可能丢信息、折叠会使缓存暂时失效、缓存亲和可能完全不生效）
+- 提供商预设基本未经实测（仅 opencode-go + deepseek-v4.1-flash 验证过）；
+  其他模型对工具调用、缓存字段、思考强度参数的支持不一致，可能报错或行为异常
+- 流式响应中途断开会被检测并提示"连接中断"，但**不会自动重试**（手动重发即可）
+- 工具没有确认环节、没有目录白名单，无法阻止通过绝对路径访问任意位置（见免责声明）
+- **项目仍在实验阶段：数据库结构随时可能变动**——升级时可能直接删表重建，历史对话会丢失；重要会话请自行备份 `skynet.db`
 - 仅在 Windows + PowerShell 7 上做过日常验证
 
 ## 第三方组件
@@ -85,7 +77,7 @@ TUI 里可用的指令与快捷键：`/help`、`/models`、`/sessions`、`/compa
 ## 参考与致谢
 
 本项目的工具集设计仿照 [pi coding agent](https://github.com/earendil-works/pi)；
-TUI样式、工具输出折叠等上下文管理的部分规则参考了 [opencode](https://github.com/anomalyco/opencode)。
+TUI 样式、工具输出折叠等上下文管理的部分规则参考了 [opencode](https://github.com/anomalyco/opencode)。
 
 ## 许可证
 
