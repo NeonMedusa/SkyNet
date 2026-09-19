@@ -3,6 +3,8 @@
 SkyNet 是一个 Zig 0.16 编写的 TUI AI 编码助手：流式对话、工具调用（read/write/edit/bash/grep/find/ls）、
 思考块、SQLite 持久化、上下文折叠与压缩（compaction）。数据默认在 `skynet.db`（SQLite WAL）。
 
+> 面向人类开发者的架构速览、路线图与踩坑记录见 [`docs/development.md`](docs/development.md)。
+
 ## 构建与测试
 
 ```bash

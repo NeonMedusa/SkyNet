@@ -20,7 +20,7 @@
 - PR 合并后：`skynet` rebase 到新 `upstream/master`（冲突一般接受上游版本），
   再回主仓库更新 submodule 指针并按需适配。
 
-## 改动分类（对照 fork 的三个提交）
+## 改动分类（对照 fork 的五个提交）
 
 ### 6c0105e 非法 UTF-8 容错（69 行）—— 全部适合 PR
 
@@ -49,18 +49,33 @@
 | `setWidthOverrides` + 全局名单数组 | **保留 fork** | 应用层字符 curation，属 SkyNet 需求，不属通用库能力 |
 | `auto_recommended_wide` 推荐名单 | **保留 SkyNet**（已在 `src/main.zig`） | 同上 |
 
+### 0b3b877 帧尾光标定位 / e762dda 光标形状（本仓库新增）—— 全部适合 PR（需英文化）
+
+- **动机**：中文输入法（IME）的组合串与候选窗跟随**真实终端光标**。此前光标
+  定位走独立 Win32 `SetConsoleCursorPosition`，与帧字节流是两条通道、时序不可控，
+  IME UI 会在"最后写入格子"与目标位置间闪烁；把定位并入帧尾（同步块内）后消除。
+- **组成**：`Terminal.pending_cursor` + `flush` 帧尾输出 + mock backend 测试（`0b3b877`）；
+  `CursorShape`/`setCursorShape`（DECSCUSR）+ 退出/panic 复位（`e762dda`）。
+- **判定**：均通用能力（POSIX 同样受益，DECSCUSR 系 xterm 标准序列），
+  改动小而独立、已有 mock 测试；移植时注释/测试名英文化、基于 `upstream/master` 重建。
+
 ## PR 路线图（按可合并性排序）
 
 | # | 标题草案 | 分支 | 组成 | 状态 |
 |---|---|---|---|---|
 | 1 | `render: tolerate malformed UTF-8 instead of panicking` | `utf8-tolerance` | 6c0105e 的英文移植 | **已推送**（`653b2f2` @ origin/utf8-tolerance） |
 | 2 | `fix(windows): arm terminal restore hook and save console state` | `windows-restore` | b173771 的 restore 部分 | **已推送**（`fa4aadc` @ origin/windows-restore） |
-| 3 | `feat: bracketed paste events (POSIX backend)` | `bracketed-paste`（待建） | Parser + POSIX 接线 + LF 语义 | 未开始 |
-| 4 | `feat(windows): VT input mode with bracketed paste and SGR mouse` | 待定 | windows.zig 主体（先 issue 探路） | 未开始 |
-| 5 | `feat: East Asian ambiguous width support (opt-in)` | `ambiguous-width`（待建） | 宽度表 + options 化 + 补格（先 issue 探路） | 未开始 |
+| 3 | `terminal: emit pending cursor as the last instruction of a frame` | `cursor-frame-tail`（待建） | 0b3b877 的英文移植（`pending_cursor` + mock backend 测试） | 本地已有（skynet 分支 `0b3b877`），待移植/推送 |
+| 4 | `terminal: DECSCUSR cursor shape support` | `decscusr`（待建） | e762dda 的英文移植（`CursorShape` + `setCursorShape` + 退出复位） | 本地已有（skynet 分支 `e762dda`），待移植/推送 |
+| 5 | `feat: bracketed paste events (POSIX backend)` | `bracketed-paste`（待建） | Parser + POSIX 接线 + LF 语义 | 未开始 |
+| 6 | `feat(windows): VT input mode with bracketed paste and SGR mouse` | 待定 | windows.zig 主体（先 issue 探路） | 未开始 |
+| 7 | `feat: East Asian ambiguous width support (opt-in)` | `ambiguous-width`（待建） | 宽度表 + options 化 + 补格（先 issue 探路） | 未开始 |
 
-顺序考量：#1、#2 为低风险"热身"（纯修复、小改动），建立 PR 记录后再提 #3（新功能）、
-#4/#5（含设计讨论，建议先开 issue 探路）。
+顺序考量：#1–#4 均为低风险（修复或小而独立的能力；#3/#4 由 SkyNet 实装并实测——
+IME 漂移/闪烁问题已在真实环境解决，说服力强；mock backend 属测试基建增量），
+建立 PR 记录后再提 #5（新功能）、#6/#7（含设计讨论，建议先开 issue 探路）。
+注意：#3/#4 的 `restore.zig` 改动（复位序列）与 PR-2 同文件，若 PR-2 先合并，
+移植时基于合并后的 master 重建。
 
 ## PR-1 语义备忘（utf8-tolerance）
 
