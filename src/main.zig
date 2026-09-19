@@ -366,6 +366,9 @@ const external_poll_interval_ms = 500;
 /// 每帧最多处理的事件数（防止输入洪峰饿死重绘；超出部分留到下一帧）
 const max_events_per_frame: usize = 1024;
 
+/// 生成中可排队等待发送的消息上限（防止连打堆积）
+const max_pending_sends: usize = 32;
+
 // ── 旧工具输出折叠（控制上下文占用）──
 // 折叠/压缩的纯计算在 context.zig（保护窗口、批量阈值、区间选择等）
 const StreamStatus = enum(u8) { idle, running, done, failed, canceled };
@@ -379,7 +382,7 @@ const tool_schemas = blk: {
     break :blk arr;
 };
 
-const StreamEventKind = enum { turn_end, tool_start, tool_end };
+const StreamEventKind = enum { turn_end, tool_start, tool_end, user_sent };
 
 const StreamEvent = struct {
     kind: StreamEventKind,
@@ -497,6 +500,10 @@ const AppState = struct {
     /// 工具调用/回合事件（worker → 主线程，按序消费）
     stream_events: std.ArrayListUnmanaged(StreamEvent) = .{ .items = &.{}, .capacity = 0 },
     stream_error: ?ai.AIError = null,
+
+    /// 生成/压缩期间用户提交、等待发送的消息（主线程入队；worker 在工具轮次边界取走注入）
+    pending_sends_mutex: Io.Mutex = .init,
+    pending_sends: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 },
     /// 最近一次请求的 token 用量；无真实数据时为历史估算值（见 usage_estimated）
     last_usage: ai.Usage = .{},
     /// 本轮最后一个请求的用量（上下文占用显示：工具循环的多轮请求不累计）
@@ -1505,6 +1512,7 @@ const AppState = struct {
         self.clearHistory();
         self.clearDisplay();
         self.clearSelection();
+        self.clearPendingSends();
         self.session_id = session_id;
         // 记录"上次访问"：下次启动时自动恢复该会话
         db.touchSession(session_id) catch {};
@@ -1572,6 +1580,7 @@ const AppState = struct {
         const db = if (self.db) |*d| d else return;
         self.clearHistory();
         self.clearDisplay();
+        self.clearPendingSends();
         self.last_seen_msg_id = 0;
         const sid = db.createSession("") catch {
             self.addMessage("新建会话失败", .{ .fg = .red });
@@ -1827,7 +1836,11 @@ const AppState = struct {
             self.appendCompactChunk(d);
             self.allocator.free(d);
         }
-        if (self.compact_status.load(.acquire) == 2) self.finalizeCompaction();
+        if (self.compact_status.load(.acquire) == 2) {
+            self.finalizeCompaction();
+            // 压缩期间排队的消息：压缩收尾后作为新回合发出
+            self.flushPendingSends();
+        }
     }
 
     /// 摘要增量追加（首块时先放黄色标题，再建正文消息）
@@ -2358,6 +2371,61 @@ const AppState = struct {
         };
     }
 
+    /// 生成/压缩期间用户提交消息：入队（稍后由 worker 注入或轮尾发出）+ 立即显示。
+    /// 调用方负责清空输入框。
+    fn queuePendingSend(self: *AppState, text: []const u8) void {
+        if (text.len == 0) return;
+        const owned = self.allocator.dupe(u8, text) catch {
+            self.setToast("排队失败：内存不足");
+            return;
+        };
+        self.pending_sends_mutex.lockUncancelable(self.io);
+        if (self.pending_sends.items.len >= max_pending_sends) {
+            self.pending_sends_mutex.unlock(self.io);
+            self.allocator.free(owned);
+            self.setToast("排队消息过多（上限 32 条），请稍候");
+            return;
+        }
+        self.pending_sends.append(self.allocator, owned) catch {
+            self.pending_sends_mutex.unlock(self.io);
+            self.allocator.free(owned);
+            self.setToast("排队失败：内存不足");
+            return;
+        };
+        self.pending_sends_mutex.unlock(self.io);
+
+        // 立即上屏；真正落库与送达发生在注入（工具轮次边界）或轮尾 flush
+        self.addUserMessage(text);
+        self.setToast("已排队：将在下一个工具轮次或本轮结束后发送");
+    }
+
+    /// 取走最早一条排队消息（无则 null；调用方负责释放）
+    fn takeFirstPendingSend(self: *AppState) ?[]u8 {
+        self.pending_sends_mutex.lockUncancelable(self.io);
+        defer self.pending_sends_mutex.unlock(self.io);
+        if (self.pending_sends.items.len == 0) return null;
+        return self.pending_sends.orderedRemove(0);
+    }
+
+    /// 清空排队消息并释放文本（会话切换 / 退出清理）
+    fn clearPendingSends(self: *AppState) void {
+        self.pending_sends_mutex.lockUncancelable(self.io);
+        defer self.pending_sends_mutex.unlock(self.io);
+        for (self.pending_sends.items) |text| self.allocator.free(text);
+        self.pending_sends.clearRetainingCapacity();
+    }
+
+    /// 一轮结束（正常/取消/失败）或压缩收尾后：若仍有排队消息，取最早一条作为新回合发出。
+    /// 其余留在队列中，由下一回合的 worker 在工具轮次边界注入。
+    fn flushPendingSends(self: *AppState) void {
+        if (!self.running) return;
+        if (self.isStreaming() or self.isCompacting()) return;
+        if (self.currentProvider() == null) return; // 无可用提供商：保留队列，待配置就绪
+        const text = self.takeFirstPendingSend() orelse return;
+        defer self.allocator.free(text);
+        self.askAI(text);
+    }
+
     /// auto（硬编码）：思考结束后自动折叠正在流式的思考块。
     /// "思考结束"包括：正文开始、回合结束（工具轮）、整个请求收尾
     fn collapseStreamingThought(self: *AppState) void {
@@ -2449,6 +2517,7 @@ const AppState = struct {
                 const block_kind = toolBlockKind(ev.name);
                 switch (ev.kind) {
                     .turn_end => self.closeCurrentTurn(),
+                    .user_sent => self.setToast("排队消息已送达"),
                     .tool_start => {
                         // bash/edit：先放一个只含标题的块（结果到达后追加正文）
                         const started = if (block_kind != null) self.beginToolBlock(ev.name, ev.args, block_kind.?) else false;
@@ -2483,10 +2552,16 @@ const AppState = struct {
             events.deinit(self.allocator);
         }
 
-        // 3) 状态检查
+        // 3) 状态检查：收尾后把仍未送达的排队消息作为新回合发出
         switch (self.streamStatus()) {
-            .done, .canceled => self.finalizeStream(null),
-            .failed => self.finalizeStream(self.stream_error),
+            .done, .canceled => {
+                self.finalizeStream(null);
+                self.flushPendingSends();
+            },
+            .failed => {
+                self.finalizeStream(self.stream_error);
+                self.flushPendingSends();
+            },
             else => {},
         }
     }
@@ -3455,8 +3530,6 @@ const AppState = struct {
                 }
             },
             .enter => {
-                // 生成中忽略发送
-                if (self.isStreaming()) return;
                 if (self.sel_active) self.clearSelection();
                 // Ctrl+Enter（或 Shift+Enter）插入换行
                 if (key.modifiers.ctrl or key.modifiers.shift) {
@@ -3470,10 +3543,22 @@ const AppState = struct {
                 }
                 const command = self.input.value();
                 if (command.len > 0) {
-                    // 指令不回显到聊天区，只有发给 AI 的消息才回显（竖条代替旧前缀）
-                    if (!isCommandInput(command)) {
-                        self.addUserMessage(command);
+                    // 指令：生成中保持忽略（压缩中照常执行，由各指令校验自身状态）
+                    if (isCommandInput(command)) {
+                        if (!self.isStreaming()) {
+                            self.handleInput(command);
+                            self.input.clear();
+                        }
+                        return;
                     }
+                    // 生成/压缩中：排队，稍后在工具轮次边界注入或本轮结束后发出
+                    if (self.isStreaming() or self.isCompacting()) {
+                        self.queuePendingSend(command);
+                        self.input.clear();
+                        return;
+                    }
+                    // 常规发送：消息回显到聊天区（竖条代替旧前缀）
+                    self.addUserMessage(command);
                     self.handleInput(command);
                     self.input.clear();
                 }
@@ -4402,6 +4487,8 @@ fn cliCleanupState(state: *AppState, allocator: Allocator) void {
     state.stream_reasoning_buf.deinit(allocator);
     state.clearStreamEventsLocked();
     state.stream_events.deinit(allocator);
+    state.clearPendingSends();
+    state.pending_sends.deinit(allocator);
     if (state.compact_status.load(.acquire) != 0) {
         state.compact_cancel.store(true, .release);
         state.finalizeCompaction();
@@ -4855,6 +4942,8 @@ pub fn main(init: std.process.Init) !void {
         state.stream_reasoning_buf.deinit(state.allocator);
         state.clearStreamEventsLocked();
         state.stream_events.deinit(state.allocator);
+        state.clearPendingSends();
+        state.pending_sends.deinit(state.allocator);
         // 压缩线程：取消并收尾后释放缓冲
         if (state.compact_status.load(.acquire) != 0) {
             state.compact_cancel.store(true, .release);
@@ -5838,6 +5927,35 @@ fn ensureWorkerDb(job: *StreamJob, slot: *?db_mod.Db) ?*db_mod.Db {
     return &slot.*.?;
 }
 
+/// 工具轮次边界：把用户排队消息作为 user 消息注入历史（含实时落库与转录记录），
+/// 下一轮请求即可见。先整批取走（减少持锁时间），再逐条注入；失败仅丢弃该条。
+fn injectPendingSends(job: *StreamJob, worker_db: *?db_mod.Db) void {
+    const app = job.app;
+    var taken: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 };
+    defer taken.deinit(app.allocator);
+    {
+        app.pending_sends_mutex.lockUncancelable(app.io);
+        defer app.pending_sends_mutex.unlock(app.io);
+        if (app.pending_sends.items.len == 0) return;
+        taken.appendSlice(app.allocator, app.pending_sends.items) catch return;
+        app.pending_sends.clearRetainingCapacity();
+    }
+
+    const arena = job.arena.allocator();
+    for (taken.items) |text| {
+        defer app.allocator.free(text);
+        const owned = arena.dupe(u8, text) catch continue;
+        const user_msg = ai.Message{ .role = "user", .content = owned };
+        job.transcript.append(arena, .{ .msg = user_msg }) catch continue;
+        job.history = extendHistory(arena, job.history, &[_]ai.Message{user_msg}) catch continue;
+        // 立即落库（与顺序一致）；失败留给 finalize 的批量兜底
+        if (ensureWorkerDb(job, worker_db)) |wdb| {
+            persistTranscriptEntry(job, wdb, job.transcript.items.len - 1, job.history.len - 1);
+        }
+        pushStreamEvent(app, .user_sent, "", "", "", "", false);
+    }
+}
+
 fn streamWorker(job: *StreamJob) void {
     const app = job.app;
     const arena = job.arena.allocator();
@@ -5861,6 +5979,9 @@ fn streamWorker(job: *StreamJob) void {
         job.reasoning.clearRetainingCapacity();
         job.reasoning_start_ms = 0;
         job.reasoning_end_ms = 0;
+
+        // 工具轮次边界：把用户排队消息注入历史（下一轮请求即可见）
+        injectPendingSends(job, &worker_db);
 
         // 工具循环会迅速堆积上下文：发下一轮前检查并按需压缩
         // （消息已实时落库，整段历史含当前回合都可参与）
@@ -8169,6 +8290,312 @@ test "集成：工具调用循环（需本地 mock 服务器 127.0.0.1:18123）"
         try std.testing.expect(db_r2);
         try std.testing.expect(db_final);
     }
+}
+
+test "生成中回车排队：入队+显示+清空输入；指令与空输入保持忽略" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    state.input.allocator = std.testing.allocator;
+    defer {
+        state.clearPendingSends();
+        state.pending_sends.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+        state.input.deinit();
+    }
+
+    // 模拟流式进行中
+    state.setStreamStatus(.running);
+
+    // 回车：消息入队 + 立即上屏 + 输入框清空
+    // （last_key_ms 置 0：模拟人类按键间隔，避免被"粘贴换行"启发式误判）
+    state.input.insertBytes("生成中插一句");
+    state.last_key_ms = 0;
+    state.handleNormalKey(.{ .code = .enter });
+    try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len);
+    try std.testing.expectEqualStrings("生成中插一句", state.pending_sends.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), state.input.value().len);
+    try std.testing.expectEqual(@as(usize, 1), state.messages.items.len);
+    try std.testing.expect(state.messages.items[0].user);
+    try std.testing.expectEqualStrings("生成中插一句", state.messages.items[0].content);
+
+    // 指令：生成中保持忽略（不排队、不清空输入）
+    state.input.insertBytes("/help");
+    state.last_key_ms = 0;
+    state.handleNormalKey(.{ .code = .enter });
+    try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len);
+    try std.testing.expectEqualStrings("/help", state.input.value());
+
+    // 空输入：无动作
+    state.input.clear();
+    state.last_key_ms = 0;
+    state.handleNormalKey(.{ .code = .enter });
+    try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len);
+
+    // 连续提交：FIFO 排队
+    state.input.insertBytes("第二条");
+    state.last_key_ms = 0;
+    state.handleNormalKey(.{ .code = .enter });
+    try std.testing.expectEqual(@as(usize, 2), state.pending_sends.items.len);
+    try std.testing.expectEqualStrings("生成中插一句", state.pending_sends.items[0]);
+    try std.testing.expectEqualStrings("第二条", state.pending_sends.items[1]);
+}
+
+test "排队消息：FIFO 取用/清空；flush 在无提供商或生成中时不取走" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    defer {
+        state.clearPendingSends();
+        state.pending_sends.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+    }
+
+    state.queuePendingSend("第一条");
+    state.queuePendingSend("第二条");
+    try std.testing.expectEqual(@as(usize, 2), state.pending_sends.items.len);
+
+    // flush：未配置提供商 → 保留队列、不取走
+    state.flushPendingSends();
+    try std.testing.expectEqual(@as(usize, 2), state.pending_sends.items.len);
+
+    // flush：生成中 → 保留队列
+    state.setStreamStatus(.running);
+    state.flushPendingSends();
+    try std.testing.expectEqual(@as(usize, 2), state.pending_sends.items.len);
+    state.setStreamStatus(.idle);
+
+    // FIFO 取用
+    const first = state.takeFirstPendingSend().?;
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqualStrings("第一条", first);
+    const second = state.takeFirstPendingSend().?;
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings("第二条", second);
+    try std.testing.expect(state.takeFirstPendingSend() == null);
+
+    // clear 释放全部
+    state.queuePendingSend("第三条");
+    state.clearPendingSends();
+    try std.testing.expectEqual(@as(usize, 0), state.pending_sends.items.len);
+}
+
+test "排队消息：生成中提交，在工具轮次间注入（需本地 mock 18123）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    std.Io.Dir.cwd().access(io, "test/mock_18123.running", .{}) catch return error.SkipZigTest;
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+
+    const db_path = "skynet_test_pending_send.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_pending_send.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_pending_send.db-shm") catch {};
+    state.db = db_mod.Db.openFile(std.testing.allocator, io, db_path) catch null;
+    state.session_id = if (state.db != null) (state.db.?.createSession("") catch 0) else 0;
+
+    defer {
+        if (state.db) |*d| d.deinit();
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_pending_send.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_pending_send.db-shm") catch {};
+        state.config.deinit(std.testing.allocator);
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+        state.stream_buf.deinit(std.testing.allocator);
+        state.stream_reasoning_buf.deinit(std.testing.allocator);
+        state.clearStreamEventsLocked();
+        state.stream_events.deinit(std.testing.allocator);
+        state.clearPendingSends();
+        state.pending_sends.deinit(std.testing.allocator);
+    }
+
+    _ = state.config.appendProvider(std.testing.allocator, .{
+        .name = "mock",
+        .endpoint = "http://127.0.0.1:18123/v1",
+        .preset = "openai",
+    });
+    state.config.setCurrentProvider(std.testing.allocator, "mock");
+    state.config.setCurrentModel(std.testing.allocator, "mock-model");
+
+    const queued_text = "顺便说一句：多留意缓存";
+    state.askAI("列一下目录");
+
+    // 泵到首个工具块出现（第一轮工具已执行），此时提交排队消息
+    var saw_block = false;
+    var conn_fail = false;
+    var guard: usize = 0;
+    while (guard < 2000 and !saw_block and !conn_fail) : (guard += 1) {
+        state.pumpStream();
+        for (state.messages.items) |m| {
+            if (m.tool_block != null) saw_block = true;
+            if (std.mem.indexOf(u8, m.content, "NetworkError") != null or
+                std.mem.indexOf(u8, m.content, "Unexpected") != null) conn_fail = true;
+        }
+        Io.sleep(io, Io.Duration.fromMilliseconds(5), .awake) catch {};
+    }
+    if (conn_fail) return error.SkipZigTest;
+    try std.testing.expect(saw_block);
+
+    state.queuePendingSend(queued_text);
+    try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len);
+
+    // 泵到底
+    guard = 0;
+    while (state.streamStatus() != .idle and guard < 2000) : (guard += 1) {
+        state.pumpStream();
+        Io.sleep(io, Io.Duration.fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expectEqual(StreamStatus.idle, state.streamStatus());
+    // 队列已被 worker 在轮次边界取走
+    try std.testing.expectEqual(@as(usize, 0), state.pending_sends.items.len);
+
+    // 历史：恰好一次，且位于首个 assistant 与最后 assistant 之间（轮次间注入，而非轮尾追加）
+    var q_idx: ?usize = null;
+    var first_a: ?usize = null;
+    var last_a: ?usize = null;
+    var q_count: usize = 0;
+    for (state.history.items, 0..) |m, i| {
+        if (std.mem.eql(u8, m.role, "assistant")) {
+            if (first_a == null) first_a = i;
+            last_a = i;
+        }
+        if (std.mem.eql(u8, m.content, queued_text)) {
+            q_count += 1;
+            q_idx = i;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), q_count);
+    try std.testing.expect(first_a != null and last_a != null);
+    try std.testing.expect(first_a.? < q_idx.?);
+    try std.testing.expect(q_idx.? < last_a.?);
+
+    // 显示：恰好一次（提交时上屏，注入时不重复）
+    var display_count: usize = 0;
+    for (state.messages.items) |m| {
+        if (std.mem.eql(u8, m.content, queued_text)) display_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), display_count);
+
+    // 落库：恰好一次（worker 实时落库）
+    if (state.db) |*db| {
+        const rows = db.loadMessages(state.session_id) catch &.{};
+        var db_count: usize = 0;
+        for (rows) |r| {
+            if (std.mem.eql(u8, r.role, "user") and std.mem.eql(u8, r.content, queued_text)) db_count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), db_count);
+    }
+}
+
+test "排队消息：无活动生成时 flush 作为新回合发出（需本地 mock 18123）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    std.Io.Dir.cwd().access(io, "test/mock_18123.running", .{}) catch return error.SkipZigTest;
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+
+    const db_path = "skynet_test_pending_flush.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_pending_flush.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_pending_flush.db-shm") catch {};
+    state.db = db_mod.Db.openFile(std.testing.allocator, io, db_path) catch null;
+    state.session_id = if (state.db != null) (state.db.?.createSession("") catch 0) else 0;
+
+    defer {
+        if (state.db) |*d| d.deinit();
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_pending_flush.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_pending_flush.db-shm") catch {};
+        state.config.deinit(std.testing.allocator);
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+        state.stream_buf.deinit(std.testing.allocator);
+        state.stream_reasoning_buf.deinit(std.testing.allocator);
+        state.clearStreamEventsLocked();
+        state.stream_events.deinit(std.testing.allocator);
+        state.clearPendingSends();
+        state.pending_sends.deinit(std.testing.allocator);
+    }
+
+    _ = state.config.appendProvider(std.testing.allocator, .{
+        .name = "mock",
+        .endpoint = "http://127.0.0.1:18123/v1",
+        .preset = "openai",
+    });
+    state.config.setCurrentProvider(std.testing.allocator, "mock");
+    state.config.setCurrentModel(std.testing.allocator, "mock-model");
+
+    const queued_text = "排队后自动发送";
+    state.queuePendingSend(queued_text);
+    try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len);
+
+    // 轮尾 flush：取走最早一条并立即发起新回合
+    state.flushPendingSends();
+    try std.testing.expectEqual(StreamStatus.running, state.streamStatus());
+    try std.testing.expectEqual(@as(usize, 0), state.pending_sends.items.len);
+
+    // 泵到底
+    var guard: usize = 0;
+    while (state.streamStatus() != .idle and guard < 2000) : (guard += 1) {
+        state.pumpStream();
+        Io.sleep(io, Io.Duration.fromMilliseconds(5), .awake) catch {};
+    }
+    var conn_fail = false;
+    for (state.messages.items) |m| {
+        if (std.mem.indexOf(u8, m.content, "NetworkError") != null or
+            std.mem.indexOf(u8, m.content, "Unexpected") != null) conn_fail = true;
+    }
+    if (conn_fail) return error.SkipZigTest;
+    try std.testing.expectEqual(StreamStatus.idle, state.streamStatus());
+
+    // 历史：作为本回合的 user 消息恰好一次，位于首个 assistant 之前
+    var q_count: usize = 0;
+    var q_idx: ?usize = null;
+    var first_a: ?usize = null;
+    for (state.history.items, 0..) |m, i| {
+        if (std.mem.eql(u8, m.role, "assistant") and first_a == null) first_a = i;
+        if (std.mem.eql(u8, m.content, queued_text)) {
+            q_count += 1;
+            q_idx = i;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), q_count);
+    try std.testing.expect(first_a != null);
+    try std.testing.expect(q_idx.? < first_a.?);
+
+    // 显示恰好一次（排队时上屏，flush 不再重复上屏）
+    var display_count: usize = 0;
+    for (state.messages.items) |m| {
+        if (std.mem.eql(u8, m.content, queued_text)) display_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), display_count);
 }
 
 test "粘贴换行判定：突发间隔视为粘贴" {

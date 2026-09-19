@@ -32,7 +32,10 @@ function Tool-CallChunks([string]$id, [string]$name, [string]$argJson) {
 }
 
 try {
-    for ($i = 0; $i -lt 3; $i++) {
+    # 按“请求内容”判定轮次（而非请求序号），同一脚本可持续服务多组对话：
+    #   无工具结果 → 第 1 轮（ls）；无 call_bash → 第 2 轮（bash）；否则最终回答
+    $req_no = 0
+    while ($true) {
         $ctx = $listener.GetContext()
         $reader = New-Object System.IO.StreamReader($ctx.Request.InputStream, [System.Text.Encoding]::UTF8)
         $body = $reader.ReadToEnd()
@@ -40,17 +43,24 @@ try {
         $hasCacheKey = $body -match 'prompt_cache_key'
         $hasSessionHdr = $null -ne $ctx.Request.Headers["session_id"]
         $hasAffinityHdr = $null -ne $ctx.Request.Headers["x-session-affinity"]
-        Add-Content $log "ROUND $($i + 1) len=$($body.Length) has_tools=$($body -match '"tools"') has_tool_role=$($body -match '"role": ?"tool"') cache_key=$hasCacheKey session_hdr=$hasSessionHdr affinity_hdr=$hasAffinityHdr"
+        $round = if ($body -notmatch '"role": ?"tool"') { 1 } elseif ($body -notmatch 'call_bash') { 2 } else { 3 }
+        $req_no++
+        # 调试：SKYNET_MOCK_DUMP=1 时把请求体转储到 %TEMP%\skynet_mock_reqN.json
+        if ($env:SKYNET_MOCK_DUMP -eq "1") {
+            $dump = Join-Path $env:TEMP "skynet_mock_req$req_no.json"
+            Set-Content -LiteralPath $dump -Value $body -Encoding UTF8
+        }
+        Add-Content $log "REQ $req_no round=$round len=$($body.Length) has_tools=$($body -match '"tools"') has_tool_role=$($body -match '"role": ?"tool"') cache_key=$hasCacheKey session_hdr=$hasSessionHdr affinity_hdr=$hasAffinityHdr"
 
         $chunks = @()
-        if ($i -eq 0) {
+        if ($round -eq 1) {
             $chunks += 'data: {"choices":[{"delta":{"reasoning_content":"让我先想想：需要列目录。"}}]}' + "`n`n"
             Start-Sleep -Milliseconds 30
             $chunks += 'data: {"choices":[{"delta":{"content":"我先看一下目录。"}}]}' + "`n`n"
             Start-Sleep -Milliseconds 40
             $chunks += Tool-CallChunks "call_ls" "ls" '{"path":"."}'
         }
-        elseif ($i -eq 1) {
+        elseif ($round -eq 2) {
             $chunks += 'data: {"choices":[{"delta":{"reasoning_content":"再看命令输出验证一下。"}}]}' + "`n`n"
             Start-Sleep -Milliseconds 30
             $chunks += 'data: {"choices":[{"delta":{"content":"再看下命令输出。"}}]}' + "`n`n"
@@ -60,10 +70,7 @@ try {
         else {
             $chunks += 'data: {"choices":[{"delta":{"reasoning_content":"信息齐了，可以总结。"}}]}' + "`n`n"
             Start-Sleep -Milliseconds 30
-            if (($body -notmatch '"role": ?"tool"') -or ($body -notmatch 'call_bash')) {
-                $chunks += 'data: {"choices":[{"delta":{"content":"MOCK_ERROR round3 missing tool context"}}]}' + "`n`n"
-            }
-            elseif (-not $hasCacheKey) {
+            if (-not $hasCacheKey) {
                 $chunks += 'data: {"choices":[{"delta":{"content":"MOCK_ERROR missing prompt_cache_key"}}]}' + "`n`n"
             }
             elseif ((-not $hasSessionHdr) -or (-not $hasAffinityHdr)) {

@@ -16,7 +16,7 @@ zig build -Doptimize=ReleaseSafe
 
 | 脚本 | 端口 | 用途 |
 |---|---|---|
-| `test/mock_openai_sse.ps1` | 18123 | 工具循环 3 轮（ls → bash → 最终回答） |
+| `test/mock_openai_sse.ps1` | 18123 | 工具循环 3 轮（ls → bash → 最终回答）；按请求内容判定轮次，可持续服务多组对话；`SKYNET_MOCK_DUMP=1` 启动时把请求体转储到 `%TEMP%\skynet_mock_reqN.json` |
 | `test/mock_openai_400_gzip.ps1` | 18124 | gzip 压缩的服务端 400 错误体 |
 | `test/mock_summary.ps1` | 18125 | compaction 摘要请求（返回 `MOCK_SUMMARY`） |
 | `test/mock_openai_truncated.ps1` | 18126 | 响应流中途断开（无 [DONE]/finish_reason）→ 验证 StreamTruncated 检测 |
@@ -91,6 +91,11 @@ ole='summary' 的消息（摘要原文，FTS 可搜）
 - 模糊宽度 auto 档的内置推荐名单在 `src/main.zig` 的 `auto_recommended_wide`
   （作者长期维护：发现「单格字形被挤压」的字符族就往里加范围；用户配置 `width_overrides` 永远优先）
 - **新增模块的测试要在 `src/main.zig` 末尾的聚合块里 `_ = @import("xxx.zig");`**，否则 `zig build test` 不会收集它们
+- 连接被拒（mock 未启动但标记残留、provider 未启动等）时，std 的 io worker 会向 stderr 打印
+  `error.Unexpected NTSTATUS=0xc0000236 (CONNECTION_REFUSED)` 及整段堆栈——这是 Zig 0.16 std 的
+  **诊断噪音**（Windows 连接被拒未映射到 `ConnectionRefused`，而是 `error.Unexpected`；错误会被正常
+  返回、测试正常 skip、构建 summary 正常），**不是崩溃，勿追查**。真正要防的是 mock 被强杀后标记
+  残留：跑测试前删掉 `test/mock_*.running` 即可避免此噪音
 - zigtui 以 git submodule 引入（fork `NeonMedusa/zigtui` 的 `skynet` 分支，路径 `libs/zigtui`）：
   更新上游 = 在 `libs/zigtui` 内 `git fetch upstream && git rebase upstream/master skynet` 后推送，
   再回主库 `git add libs/zigtui` 提交指针更新；克隆主库要用 `--recurse-submodules`
