@@ -79,9 +79,9 @@ pub const CompactionRow = struct {
     id: i64 = 0,
     session_id: i64 = 0,
     created_at: i64 = 0,
-    /// 摘要正文（summary_message_id 为 0 的旧记录使用；新记录以消息行为准）
+    /// 摘要正文（降级副本：仅摘要消息行落库失败时写入；正常为空、以消息行为准）
     summary: []const u8 = "",
-    /// 摘要消息行 id（role='summary'；0 = 旧记录，回退到 summary 字段）
+    /// 摘要消息行 id（role='summary'；0 = 消息行落库失败，回退到 summary 字段）
     summary_message_id: i64 = 0,
     /// 保留区起始消息 id（含）：id >= tail_start_id 的消息仍完整发送
     tail_start_id: i64 = 0,
@@ -89,6 +89,102 @@ pub const CompactionRow = struct {
     tokens_before: i64 = 0,
     model: []const u8 = "",
 };
+
+/// 打开数据库时发现的版本不匹配信息（供上层决定：拒绝打开后如何处理）
+pub const VersionMismatch = struct {
+    /// 库文件中的 schema 用户版本号（> 0）
+    db_version: i64 = 0,
+    /// 本程序编译时的 schema 版本号
+    program_version: i64 = 0,
+
+    /// true = 库比程序旧（升级场景，可提供"重命名旧库并新建"选项）
+    pub fn dbIsOlder(self: VersionMismatch) bool {
+        return self.db_version < self.program_version;
+    }
+};
+
+/// 只读探测数据库的 schema 版本（不打开 SQLite、不产生任何副作用：直接读文件头的
+/// user_version 字段——SQLite 格式第 60 字节起 4 字节大端）。文件缺失/非 SQLite/版本 0 返回 null。
+/// 用于在 openFile 因版本不符失败后，取出版本号供启动闸门展示。
+pub fn probeVersionMismatch(allocator: Allocator, io: Io, filename: [:0]const u8) ?VersionMismatch {
+    _ = allocator;
+    const dir = Io.Dir.cwd();
+    // 打开失败（含不存在）：非版本问题
+    const file = dir.openFile(io, filename, .{}) catch return null;
+    defer file.close(io);
+    var header: [100]u8 = undefined;
+    const n = file.readPositionalAll(io, &header, 0) catch return null;
+    if (n < 64) return null;
+    if (!std.mem.eql(u8, header[0..16], "SQLite format 3\x00")) return null;
+    const ver = std.mem.readInt(u32, header[60..64], .big);
+    if (ver == 0) return null; // 全新库：非"版本不符"
+    return .{ .db_version = @intCast(ver), .program_version = Db.schema_version };
+}
+
+/// 选择旧库备份名：`<base>.old.db` → `<base>.old.2.db` → …（取第一个未被占用的名字；
+/// 只做存在性检查，不创建任何文件）。用于弹窗展示"将重命名为 X"与实际重命名。
+pub fn pickLegacyBackupName(allocator: Allocator, io: Io, filename: [:0]const u8) ![]u8 {
+    const dir = Io.Dir.cwd();
+    const base = std.fs.path.basename(filename);
+    var n: usize = 0;
+    while (n < 100) : (n += 1) {
+        const candidate = if (n == 0)
+            try std.fmt.allocPrint(allocator, "{s}.old.db", .{base})
+        else
+            try std.fmt.allocPrint(allocator, "{s}.old.{d}.db", .{ base, n + 1 });
+        const taken = blk: {
+            dir.access(io, candidate, .{}) catch break :blk false;
+            break :blk true;
+        };
+        if (!taken) return candidate;
+        allocator.free(candidate);
+    }
+    return error.TooManyBackups;
+}
+
+/// 把旧版本数据库（含 -wal / -shm / -journal 侧车文件）重命名为备份名，
+/// 供用户确认后在"新建空库继续"前调用。成功返回实际使用的备份路径（调用者负责释放）。
+///
+/// 顺序与回滚：
+///  1. 先重命名主文件（失败 = 什么都没动，直接报错返回）；
+///  2. 侧车文件逐个重命名（存在才动）；任一失败则尽力把已搬走的改回原名后报错。
+/// 全程只做"重命名"，不写入、不删除任何文件内容——失败时文件保持原位。
+pub fn renameLegacyDbFiles(allocator: Allocator, io: Io, filename: [:0]const u8) ![]u8 {
+    const dir = Io.Dir.cwd();
+    const target = try pickLegacyBackupName(allocator, io, filename);
+    errdefer allocator.free(target);
+
+    dir.rename(filename, dir, target, io) catch return error.RenameFailed;
+
+    // 侧车文件跟随主文件搬迁（未 checkpoint 的 WAL 数据必须一起走，迁移才完整）
+    const suffixes = [_][]const u8{ "-wal", "-shm", "-journal" };
+    var moved: usize = 0;
+    for (suffixes) |suf| {
+        var src_buf: [4096]u8 = undefined;
+        const src = std.fmt.bufPrint(&src_buf, "{s}{s}", .{ filename, suf }) catch continue;
+        dir.access(io, src, .{}) catch continue; // 不存在：跳过
+        var dst_buf: [4096]u8 = undefined;
+        const dst = std.fmt.bufPrint(&dst_buf, "{s}{s}", .{ target, suf }) catch continue;
+        dir.rename(src, dir, dst, io) catch {
+            // 回滚：把已搬迁的侧车与主文件改回原名（尽力而为）
+            var k: usize = moved;
+            while (k > 0) {
+                k -= 1;
+                var rb_src_buf: [4096]u8 = undefined;
+                const rb_src = std.fmt.bufPrint(&rb_src_buf, "{s}{s}", .{ target, suffixes[k] }) catch break;
+                var rb_dst_buf: [4096]u8 = undefined;
+                const rb_dst = std.fmt.bufPrint(&rb_dst_buf, "{s}{s}", .{ filename, suffixes[k] }) catch break;
+                dir.rename(rb_src, dir, rb_dst, io) catch {};
+            }
+            dir.rename(target, dir, filename, io) catch {};
+            return error.RenameFailed;
+        };
+        moved += 1;
+    }
+
+    Log.info(.db, "旧库已重命名为备份：{s}（数据原样保留）", .{target});
+    return target;
+}
 
 pub const Db = struct {
     sess: fr.Session,
@@ -149,14 +245,28 @@ pub const Db = struct {
         \\END;
     ;
 
-    /// 库结构版本：不一致时删表重建（破坏性升级；相邻版本可无损迁移）
-    const schema_version: i64 = 7;
+    /// 库结构版本：打开时校验，不一致**拒绝打开**（不迁移、不重建、不写入）。
+    /// 全部历史迁移代码已于 2026-09 清空（尚无外部用户，一次性迁移无保留价值）；
+    /// 数据库升级迁移模块将来专门设计，届时从 openFile 的版本校验处接入。
+    /// TUI 启动闸门据此提示用户：旧库可经确认重命名为备份后新建空库（见 main.zig）。
+    pub const schema_version: i64 = 7;
 
     pub fn open(allocator: Allocator, io: Io) !Db {
         return openFile(allocator, io, "skynet.db");
     }
 
     pub fn openFile(allocator: Allocator, io: Io, filename: [:0]const u8) !Db {
+        // 版本校验安排在打开 SQLite 之前（纯读文件头）：被拒绝的库连 WAL 恢复都不触发，
+        // 真正做到"一个字节都不被改动"。current == 0 = 全新库（无 schema）。
+        // 说明：本项目暂无迁移逻辑（2026-09 清空全部历史迁移代码）；数据库升级迁移
+        // 模块将来专门设计，届时从这里接入。
+        var current: i64 = 0;
+        if (probeVersionMismatch(allocator, io, filename)) |mm| current = mm.db_version;
+        if (current != 0 and current != schema_version) {
+            Log.err(.db, "schema 版本不符（库 {d} ≠ 程序 {d}）: 拒绝打开 {s}（不迁移、不删除）", .{ current, schema_version, filename });
+            return error.SchemaVersionMismatch;
+        }
+
         var sess = try fr.Session.open(fr.SQLite3, allocator, io, .{
             .filename = filename,
             .busy_timeout = 5000,
@@ -167,58 +277,6 @@ pub const Db = struct {
         errdefer allocator.free(path_copy);
 
         try sess.conn.execAll("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
-
-        // 版本不符：丢弃旧表（含 FTS 索引与触发器）后重建
-        const Version = struct { user_version: i64 = 0 };
-        var current: i64 = 0;
-        if (sess.raw("SELECT user_version FROM pragma_user_version", .{}).fetchAll(Version)) |rows| {
-            if (rows.len > 0) current = rows[0].user_version;
-        } else |_| {}
-        if (current != schema_version) {
-            // current == 0 = 全新库（无 schema），无需迁移、也谈不上"数据丢失"
-            if (current != 0) {
-                Log.warn(.db, "schema 版本不符（{d} → {d}）: {s}", .{ current, schema_version, filename });
-            }
-            // v5 → v6：新增 usage 列 + compaction 表；v6 → v7：compaction 增加摘要消息引用
-            var migrated = false;
-            if (current == 5 or current == 6) {
-                if (current == 5) {
-                    if (!tableHasColumn(allocator, &sess, "message", "input_tokens")) {
-                        sess.conn.execAll("ALTER TABLE \"message\" ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0;") catch {};
-                    }
-                    if (!tableHasColumn(allocator, &sess, "message", "cached_tokens")) {
-                        sess.conn.execAll("ALTER TABLE \"message\" ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0;") catch {};
-                    }
-                    if (!tableHasColumn(allocator, &sess, "message", "output_tokens")) {
-                        sess.conn.execAll("ALTER TABLE \"message\" ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;") catch {};
-                    }
-                }
-                // v5 还没有 compaction 表（由 schema 直接建新表，天然带列）；v6 需要 ALTER
-                var compaction_ok = true;
-                if (current == 6) {
-                    if (!tableHasColumn(allocator, &sess, "compaction", "summary_message_id")) {
-                        sess.conn.execAll("ALTER TABLE \"compaction\" ADD COLUMN summary_message_id INTEGER NOT NULL DEFAULT 0;") catch {};
-                    }
-                    compaction_ok = tableHasColumn(allocator, &sess, "compaction", "summary_message_id");
-                }
-                migrated = tableHasColumn(allocator, &sess, "message", "input_tokens") and
-                    tableHasColumn(allocator, &sess, "message", "cached_tokens") and
-                    tableHasColumn(allocator, &sess, "message", "output_tokens") and
-                    compaction_ok;
-            }
-            if (!migrated) {
-                if (current != 0) Log.warn(.db, "无法无损迁移：删表重建（旧会话数据将丢失）", .{});
-                try sess.conn.execAll(
-                    \\DROP TRIGGER IF EXISTS "message_ai";
-                    \\DROP TRIGGER IF EXISTS "message_ad";
-                    \\DROP TRIGGER IF EXISTS "message_au";
-                    \\DROP TABLE IF EXISTS "message_fts";
-                    \\DROP TABLE IF EXISTS "compaction";
-                    \\DROP TABLE IF EXISTS "message";
-                    \\DROP TABLE IF EXISTS "session";
-                );
-            }
-        }
 
         try sess.conn.execAll(schema);
         try sess.conn.execAll(std.fmt.comptimePrint("PRAGMA user_version = {d};", .{schema_version}));
@@ -379,11 +437,6 @@ pub const Db = struct {
         return id;
     }
 
-    /// 更新消息内容（用于旧会话 system prompt 升级）
-    pub fn updateMessageContent(self: *Db, id: i64, content: []const u8) !void {
-        try self.sess.exec("UPDATE \"message\" SET content = ? WHERE id = ?", .{ content, id });
-    }
-
     /// 折叠一条工具结果：content 替换为 stub，全文存入 tool_full。
     /// 已折叠过（tool_full 非空）时不覆盖。
     pub fn foldToolMessage(self: *Db, id: i64, folded_content: []const u8, full_content: []const u8) !void {
@@ -411,17 +464,6 @@ pub const Db = struct {
         );
     }
 };
-
-/// 表是否存在指定列（用于判断能否无损迁移）
-fn tableHasColumn(allocator: Allocator, sess: *fr.Session, table: []const u8, column: []const u8) bool {
-    const sql = std.fmt.allocPrint(allocator, "SELECT name FROM pragma_table_info('{s}')", .{table}) catch return false;
-    defer allocator.free(sql);
-    const rows = sess.raw(sql, .{}).fetchAll(struct { name: []const u8 = "" }) catch return false;
-    for (rows) |r| {
-        if (std.mem.eql(u8, r.name, column)) return true;
-    }
-    return false;
-}
 
 /// 从消息内容截取会话标题（最多 30 个字符，遇换行截止）
 pub fn titleFromContent(content: []const u8) []const u8 {
@@ -473,7 +515,7 @@ test "db: 会话与消息生命周期" {
 
     // 建会话 + 消息
     const sid = try db.createSession("");
-    _ = try db.insertMessage(.{ .session_id = sid, .role = "system", .content = "You are helpful" });
+    _ = try db.insertMessage(.{ .session_id = sid, .role = "user", .content = "You are helpful" });
     _ = try db.insertMessage(.{ .session_id = sid, .role = "user", .content = "帮我写个 Zig 函数" });
     _ = try db.insertMessage(.{
         .session_id = sid,
@@ -645,94 +687,7 @@ test "db: latestSession 按最近活跃（而非最大 id），touchSession 可�
     try testing.expectEqual(sid_b, (try db.listSessions())[0].id);
 }
 
-test "db: v5 → v7 无损迁移（保留历史，补 usage 列与 compaction 表）" {
-    var threaded: std.Io.Threaded = undefined;
-    const io = testIo(&threaded);
-    defer threaded.deinit();
-
-    const dir = Io.Dir.cwd();
-    const path = "skynet_test_migrate6.db";
-    dir.deleteFile(io, path) catch {};
-    dir.deleteFile(io, "skynet_test_migrate6.db-wal") catch {};
-    dir.deleteFile(io, "skynet_test_migrate6.db-shm") catch {};
-    defer {
-        dir.deleteFile(io, path) catch {};
-        dir.deleteFile(io, "skynet_test_migrate6.db-wal") catch {};
-        dir.deleteFile(io, "skynet_test_migrate6.db-shm") catch {};
-    }
-
-    var sid: i64 = 0;
-    {
-        // 先造 v6 库写入数据，再降级为 v5 形态（去掉 usage 列与 compaction 表）
-        var db = try Db.openFile(testing.allocator, io, path);
-        defer db.deinit();
-        sid = try db.createSession("");
-        _ = try db.insertMessage(.{ .session_id = sid, .role = "user", .content = "迁移前的消息" });
-        try db.sess.conn.execAll(
-            \\DROP TABLE IF EXISTS "compaction";
-            \\ALTER TABLE "message" DROP COLUMN input_tokens;
-            \\ALTER TABLE "message" DROP COLUMN cached_tokens;
-            \\ALTER TABLE "message" DROP COLUMN output_tokens;
-            \\PRAGMA user_version = 5;
-        );
-    }
-    {
-        var db = try Db.openFile(testing.allocator, io, path);
-        defer db.deinit();
-        const rows = try db.loadMessages(sid);
-        try testing.expectEqual(@as(usize, 1), rows.len);
-        try testing.expectEqualStrings("迁移前的消息", rows[0].content);
-        try testing.expectEqual(@as(i64, 0), rows[0].input_tokens);
-
-        // 新列与 compaction 表可用
-        try db.foldToolMessage(rows[0].id, "stub", "全文");
-        _ = try db.insertCompaction(sid, "摘要", 0, rows[0].id, 123, "m");
-        const cp = (try db.latestCompaction(sid)).?;
-        try testing.expectEqualStrings("摘要", cp.summary);
-        try testing.expectEqual(rows[0].id, cp.tail_start_id);
-    }
-}
-
-test "db: v6 → v7 无损迁移（compaction 补 summary_message_id）" {
-    var threaded: std.Io.Threaded = undefined;
-    const io = testIo(&threaded);
-    defer threaded.deinit();
-
-    const dir = Io.Dir.cwd();
-    const path = "skynet_test_migrate7.db";
-    dir.deleteFile(io, path) catch {};
-    dir.deleteFile(io, "skynet_test_migrate7.db-wal") catch {};
-    dir.deleteFile(io, "skynet_test_migrate7.db-shm") catch {};
-    defer {
-        dir.deleteFile(io, path) catch {};
-        dir.deleteFile(io, "skynet_test_migrate7.db-wal") catch {};
-        dir.deleteFile(io, "skynet_test_migrate7.db-shm") catch {};
-    }
-
-    var cp_id: i64 = 0;
-    {
-        // 先造 v7 库写入 checkpoint，再降级为 v6 形态（去掉 summary_message_id 列）
-        var db = try Db.openFile(testing.allocator, io, path);
-        defer db.deinit();
-        const sid = try db.createSession("");
-        const mid = try db.insertMessage(.{ .session_id = sid, .role = "user", .content = "旧消息" });
-        cp_id = try db.insertCompaction(sid, "旧摘要", 0, mid, 100, "m");
-        try db.sess.conn.execAll(
-            \\ALTER TABLE "compaction" DROP COLUMN summary_message_id;
-            \\PRAGMA user_version = 6;
-        );
-    }
-    {
-        var db = try Db.openFile(testing.allocator, io, path);
-        defer db.deinit();
-        const cp = (try db.latestCompaction(1)).?;
-        try testing.expectEqual(cp_id, cp.id);
-        try testing.expectEqualStrings("旧摘要", cp.summary);
-        try testing.expectEqual(@as(i64, 0), cp.summary_message_id);
-    }
-}
-
-test "db: 版本不一致时重建（破坏性升级）" {
+test "db: 版本不一致时拒绝打开（不迁移、不重建；数据原样保留）" {
     var threaded: std.Io.Threaded = undefined;
     const io = testIo(&threaded);
     defer threaded.deinit();
@@ -776,21 +731,103 @@ test "db: 版本不一致时重建（破坏性升级）" {
         try sess.exec("INSERT INTO \"message\" (session_id, role, content, created_at) VALUES (1, 'user', '旧消息', 1)", .{});
     }
 
-    // 打开后：旧数据被清空、新 schema 可用
-    var db = try Db.openFile(testing.allocator, io, path);
-    defer db.deinit();
+    // 打开被拒绝：明确报错（不是静默重建）
+    try testing.expectError(error.SchemaVersionMismatch, Db.openFile(testing.allocator, io, path));
 
-    try testing.expect((try db.latestSession()) == null);
-    try testing.expectEqual(@as(usize, 0), (try db.loadMessages(1)).len);
+    // 文件原样保留：版本号与数据一个字节都没动
+    {
+        var sess = try fr.Session.open(fr.SQLite3, testing.allocator, io, .{
+            .filename = path,
+            .busy_timeout = 5000,
+            .foreign_keys = .on,
+        });
+        defer sess.deinit();
+        const Msg = struct { content: []const u8 = "" };
+        const msgs = try sess.raw("SELECT content FROM \"message\" WHERE id = 1", .{}).fetchAll(Msg);
+        try testing.expectEqual(@as(usize, 1), msgs.len);
+        try testing.expectEqualStrings("旧消息", msgs[0].content);
+        const Ver = struct { user_version: i64 = 0 };
+        const ver = try sess.raw("SELECT user_version FROM pragma_user_version", .{}).fetchAll(Ver);
+        try testing.expectEqual(@as(i64, 1), ver[0].user_version);
+    }
+}
 
-    const sid = try db.createSession("新会话");
-    _ = try db.insertMessage(.{
-        .session_id = sid,
-        .role = "tool",
-        .content = "src/",
-        .tool_call_id = "call_9",
-    });
-    const msgs = try db.loadMessages(sid);
-    try testing.expectEqual(@as(usize, 1), msgs.len);
-    try testing.expectEqualStrings("call_9", msgs[0].tool_call_id);
+test "db: 旧库重命名（侧车搬迁、冲突编号、失败不变更）与只读版本探测" {
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    defer threaded.deinit();
+
+    const dir = Io.Dir.cwd();
+    const path: [:0]const u8 = "skynet_test_rename.db";
+    const cleanup = [_][]const u8{
+        "skynet_test_rename.db",
+        "skynet_test_rename.db-wal",
+        "skynet_test_rename.db-shm",
+        "skynet_test_rename.db.old.db",
+        "skynet_test_rename.db.old.db-wal",
+        "skynet_test_rename.db.old.2.db",
+    };
+    for (cleanup) |f| dir.deleteFile(io, f) catch {};
+    defer for (cleanup) |f| dir.deleteFile(io, f) catch {};
+
+    // 构造旧库（user_version = 1）
+    {
+        var sess = try fr.Session.open(fr.SQLite3, testing.allocator, io, .{
+            .filename = path,
+            .busy_timeout = 5000,
+            .foreign_keys = .on,
+        });
+        defer sess.deinit();
+        try sess.conn.execAll("PRAGMA user_version = 1;");
+    }
+
+    // 只读探测：拿到版本号且与程序版本对比正确
+    const mm = probeVersionMismatch(testing.allocator, io, path) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 1), mm.db_version);
+    try testing.expectEqual(Db.schema_version, mm.program_version);
+    try testing.expect(mm.dbIsOlder());
+    // 探测不修改文件：仍是 v1 且数据完好
+    try testing.expectEqual(@as(i64, 1), probeVersionMismatch(testing.allocator, io, path).?.db_version);
+
+    // 手写一个假 -wal 侧车（必须在所有 SQLite 打开之后写：合法 SQLite 会清掉非法 WAL）
+    {
+        const f = try dir.createFile(io, "skynet_test_rename.db-wal", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "OLD-DB-WAL-DATA");
+    }
+
+    // 重命名：主文件与侧车一起搬走，原名不再存在
+    const backup = try renameLegacyDbFiles(testing.allocator, io, path);
+    defer testing.allocator.free(backup);
+    try testing.expectEqualStrings("skynet_test_rename.db.old.db", backup);
+    try testing.expectError(error.FileNotFound, dir.access(io, path, .{}));
+    {
+        const data = try dir.readFileAlloc(io, backup, testing.allocator, .limited(1 << 20));
+        defer testing.allocator.free(data);
+        try testing.expect(data.len >= 16);
+        try testing.expectEqualStrings("SQLite format 3", data[0..15]);
+    }
+    {
+        const wal = try dir.readFileAlloc(io, "skynet_test_rename.db.old.db-wal", testing.allocator, .limited(1 << 20));
+        defer testing.allocator.free(wal);
+        try testing.expectEqualStrings("OLD-DB-WAL-DATA", wal);
+    }
+
+    // 冲突编号：备份名已存在时改用 .old.2.db
+    {
+        var sess = try fr.Session.open(fr.SQLite3, testing.allocator, io, .{
+            .filename = path,
+            .busy_timeout = 5000,
+            .foreign_keys = .on,
+        });
+        defer sess.deinit();
+        try sess.conn.execAll("PRAGMA user_version = 1;");
+    }
+    const backup2 = try renameLegacyDbFiles(testing.allocator, io, path);
+    defer testing.allocator.free(backup2);
+    try testing.expectEqualStrings("skynet_test_rename.db.old.2.db", backup2);
+
+    // 失败路径：源文件不存在 → RenameFailed（不产生新备份文件）
+    try testing.expectError(error.RenameFailed, renameLegacyDbFiles(testing.allocator, io, path));
+    try testing.expectError(error.FileNotFound, dir.access(io, "skynet_test_rename.db.old.3.db", .{}));
 }

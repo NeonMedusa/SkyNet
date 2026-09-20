@@ -71,11 +71,18 @@ zig-out/bin/SkyNet.exe compact -session 3 -db skynet.db --json # 手动压缩（
 
 ## 数据库 / schema 约定
 
-- `schema_version` 在 `src/db.zig`（当前 **v7**）；版本不一致会**删表重建**，破坏性升级前先提醒用户
-- 相邻版本优先写 `ALTER TABLE` 无损迁移（例如 v5→v6 补 usage 列与 compaction 表）
+- `schema_version` 在 `src/db.zig`（当前 **v7**）；**版本不符即拒绝打开**（不迁移、不重建、
+  不写入——校验用纯读文件头完成（`probeVersionMismatch`），先于任何 SQLite 打开，被拒绝的库
+  连 WAL 都不触发）——**迁移代码已全部清空**（2026-09 决定：尚无外部用户，一次性迁移无保留
+  价值）；数据库升级迁移模块将来专门设计，届时从 openFile 版本校验处接入
+- 拒绝打开后 TUI 有**启动闸门**（`main.zig` runVersionGate）：旧库（库 < 程序）弹窗询问
+  "重命名为 `skynet.old.db`（数据原样保留）并新建空库" / "退出"；库比程序新则提示升级（含
+  项目地址）后退出。重命名只搬文件（含 -wal/-shm/-journal 侧车 + 冲突编号 + 失败回滚），
+  **绝不写入/删除旧库内容**；非交互终端降级为文本提示后退出。CLI `-db` 不走闸门（fail-fast）
+- **禁止**在 `openFile` 里新增任何隐式迁移/删除逻辑：数据永不自动销毁，迁移必须走专门模块
 - `message` 存全部原文；发给模型的 `content` 在大工具输出折叠后是 stub，全文在 `tool_full`
 - 压缩 checkpoint 在 compaction 表：summary_message_id + tail_start_id（id >= tail_start_id 的消息才发给模型）；summary_message_id 指向一条 
-ole='summary' 的消息（摘要原文，FTS 可搜）
+role='summary' 的消息（摘要原文，FTS 可搜）
 - TUI 的 /compact 是**异步**的：摘要流式渲染，Ctrl+Q 可取消；CLI compact 仍同步（脚本友好）
 - `skynet.db*`、`config.json` 已在 `.gitignore`，不要提交
 
@@ -90,6 +97,10 @@ ole='summary' 的消息（摘要原文，FTS 可搜）
 
 ## 其他约定
 
+- **系统提示词政策（政策A，2026-09 定）**：提示词属于程序（`src/main.zig` 顶部 `system_prompt`，
+  随版本升级，全局一套）。**DB 不含 system 行**（写入侧从不产生，读取侧无兼容分支——
+  旧库数据 2026-09 已全部清除）；加载/重建时统一前置当前值一次（`prepend_system=true`），
+  增量路径传 false（勿重复前置）。政策与背景见 `docs/development.md` 2.5 节
 - **日志**：每次启动写 `logs/<epoch>.<ms>.txt`（保留最近 20 份）。默认 info 级；
   `$env:SKYNET_LOG='debug'|'warn'|'error'|'off'` 覆盖。含请求/响应/工具/重试/压缩/落库失败
   全链路元数据（不含消息正文与密钥）。**排查线上问题（断连、卡顿、丢消息）时先看最新日志**；

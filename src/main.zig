@@ -29,6 +29,8 @@ const fold_min_bytes = context_mod.fold_min_bytes;
 const fold_marker = context_mod.fold_marker;
 const FoldScanner = context_mod.FoldScanner;
 
+/// 系统提示词（政策A：属于程序的一部分）：每轮请求由加载/新建路径前置发送；
+/// DB 不含 system 行——历史前缀只此一处定义
 const system_prompt =
     "You are SkyNet, a helpful AI coding assistant with access to tools for file operations and shell commands.\n" ++
     "Guidelines:\n" ++
@@ -906,7 +908,7 @@ const AppState = struct {
 
         const offset_before = self.scroll_offset;
         const msgs_before = self.messages.items.len;
-        self.applyLoadedMessages(rows);
+        self.applyLoadedMessages(rows, false);
         // 上翻阅读时按新增行数补偿偏移；贴底时跟随最新
         if (offset_before > 0 and self.message_wrap_width > 0) {
             var added: usize = 0;
@@ -937,16 +939,8 @@ const AppState = struct {
                 return @intCast(self.usage_anchor_tokens + estimateTokens(inc));
             }
         }
-        var has_system = false;
-        for (self.history.items) |m| {
-            if (std.mem.eql(u8, m.role, "system")) {
-                has_system = true;
-                break;
-            }
-        }
-        var bytes = historyRequestBytesSlice(self.history.items) + toolsSchemaBytes();
-        if (!has_system) bytes += system_prompt.len;
-        return estimateTokens(bytes);
+        // 政策A：system 由加载/新建路径前置进 history，无需单独补计
+        return estimateTokens(historyRequestBytesSlice(self.history.items) + toolsSchemaBytes());
     }
 
     /// 无真实 usage 时用历史估算填充上下文占用（启动/加载/压缩后即可显示）
@@ -1361,13 +1355,15 @@ const AppState = struct {
         self.usage_anchor_tokens = 0;
     }
 
-    /// 把数据库中的消息灌入内存历史与界面显示（无 checkpoint 版本）
-    fn applyLoadedMessages(self: *AppState, rows: []const db_mod.MessageRow) void {
-        self.applyLoadedMessagesWithCheckpoint(rows, null, true);
+    /// 把数据库中的消息灌入内存历史与界面显示（无 checkpoint 版本）。
+    /// `prepend_system`：增量追加传 false（历史里已有 system，勿重复前置）
+    fn applyLoadedMessages(self: *AppState, rows: []const db_mod.MessageRow, prepend_system: bool) void {
+        self.applyLoadedMessagesWithCheckpoint(rows, null, true, prepend_system);
     }
 
     /// 把数据库中的消息灌入内存历史与界面显示
-    /// - system：升级为当前 system_prompt（并更新库内旧值）
+    /// - system：政策A——提示词属于程序（随源码版本升级）；DB 不含 system 行，
+    ///   重建时统一前置当前值一次（`prepend_system=true`）
     /// - 有 checkpoint：历史重建为 system + 摘要伪消息 + 保留区
     /// - assistant/tool：恢复工具调用字段与提示行
     fn applyLoadedMessagesWithCheckpoint(
@@ -1375,6 +1371,7 @@ const AppState = struct {
         rows: []const db_mod.MessageRow,
         checkpoint: ?db_mod.CompactionRow,
         with_display: bool,
+        prepend_system: bool,
     ) void {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
@@ -1390,15 +1387,9 @@ const AppState = struct {
         var call_lines = std.ArrayListUnmanaged(CallLineIdx){ .items = &.{}, .capacity = 0 };
         defer call_lines.deinit(arena);
 
-        // system prompt 升级（历史里只保留一份）
-        for (rows) |row| {
-            if (!std.mem.eql(u8, row.role, "system")) continue;
-            if (!std.mem.eql(u8, row.content, system_prompt)) {
-                if (self.db) |*db| db.updateMessageContent(row.id, system_prompt) catch {};
-            }
-            break;
-        }
-        // 摘要文本：优先取 role='summary' 的消息行；旧记录回退到 compaction.summary
+        // 政策A：请求前缀 = 程序当前的 system_prompt（打开/重建时只前置这一次）
+        if (prepend_system) self.appendHistory("system", system_prompt);
+        // 摘要文本：优先取 role='summary' 的消息行；消息行落库失败时回退到 compaction.summary
         var summary_text: []const u8 = "";
         var summary_msg_id: i64 = 0;
         var compacted_count: usize = 0;
@@ -1414,13 +1405,12 @@ const AppState = struct {
             }
             if (summary_text.len == 0) summary_text = cp.summary;
             for (rows) |row| {
-                if (!std.mem.eql(u8, row.role, "system") and row.id < cp.tail_start_id) compacted_count += 1;
+                if (row.id < cp.tail_start_id) compacted_count += 1;
             }
         }
 
         if (checkpoint != null) {
-            // 被压缩区不再发送：历史 = system + 摘要 + 保留区
-            self.appendHistory("system", system_prompt);
+            // 被压缩区不再发送：历史 = 摘要 + 保留区（system 已由前置步骤写入）
             self.appendCheckpointHistory(summary_text);
         }
 
@@ -1436,13 +1426,6 @@ const AppState = struct {
             if (!marker_shown and in_tail) {
                 if (with_display) self.appendCheckpointDisplay(summary_text, compacted_count, checkpoint.?);
                 marker_shown = true;
-            }
-
-            if (std.mem.eql(u8, row.role, "system")) {
-                if (checkpoint == null) {
-                    self.appendHistoryMessage(.{ .role = "system", .content = system_prompt });
-                }
-                continue;
             }
 
             if (std.mem.eql(u8, row.role, "tool")) {
@@ -1583,10 +1566,12 @@ const AppState = struct {
         const checkpoint = db.latestCompaction(session_id) catch null;
         self.last_compaction_id = if (checkpoint) |c| c.id else 0;
         if (rows.len == 0 and checkpoint == null) {
+            // 空会话：历史 = 当前提示词（与新建一致），并刷新估算显示
             self.appendHistory("system", system_prompt);
+            self.refreshEstimatedUsage();
             return;
         }
-        self.applyLoadedMessagesWithCheckpoint(rows, checkpoint, true);
+        self.applyLoadedMessagesWithCheckpoint(rows, checkpoint, true, true);
         Log.info(.startup, "加载会话 {d}: {d} 行, checkpoint={}", .{ session_id, rows.len, checkpoint != null });
     }
 
@@ -1598,7 +1583,7 @@ const AppState = struct {
         self.clearHistory();
         self.last_seen_msg_id = 0;
         self.last_compaction_id = if (checkpoint) |c| c.id else 0;
-        self.applyLoadedMessagesWithCheckpoint(rows, checkpoint, false);
+        self.applyLoadedMessagesWithCheckpoint(rows, checkpoint, false, true);
     }
 
     /// 把压缩摘要作为历史中的 checkpoint 伪消息（user 角色，内容固定利于缓存稳定）
@@ -1651,8 +1636,7 @@ const AppState = struct {
             return;
         };
         self.session_id = sid;
-        const sys_id = db.insertMessage(.{ .session_id = sid, .role = "system", .content = system_prompt }) catch 0;
-        if (sys_id > self.last_seen_msg_id) self.last_seen_msg_id = sys_id;
+        // 政策A：DB 不记录 system 行（提示词属于程序；加载/重建时统一前置当前值）
         self.appendHistory("system", system_prompt);
         self.refreshEstimatedUsage();
     }
@@ -3706,7 +3690,18 @@ const cliJsonWrite = cli.cliJsonWrite;
 fn cliOpenDb(allocator: Allocator, io: Io, opt: CliOptions) ?db_mod.Db {
     const path = allocator.dupeZ(u8, opt.db_path) catch return null;
     defer allocator.free(path);
-    return db_mod.Db.openFile(allocator, io, path) catch null;
+    return db_mod.Db.openFile(allocator, io, path) catch |e| {
+        if (e == error.SchemaVersionMismatch) {
+            if (db_mod.probeVersionMismatch(allocator, io, path)) |mm| {
+                var buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "数据库 schema 版本不符（库 v{d} ≠ 程序 v{d}）：已拒绝打开（不迁移、不删除；详见日志）\n", .{ mm.db_version, mm.program_version }) catch "数据库 schema 版本与程序不符：已拒绝打开（不迁移、不删除；详见日志）\n";
+                cliWriteStderr(io, msg);
+            } else {
+                cliWriteStderr(io, "数据库 schema 版本与程序不符：已拒绝打开（不迁移、不删除；详见日志）\n");
+            }
+        }
+        return null;
+    };
 }
 
 /// 会话解析结果：新建 / 已存在 / 不存在 / 参数非法
@@ -3733,11 +3728,6 @@ fn cliResolveSessionEx(db: *db_mod.Db, opt: CliOptions, create_if_missing: bool)
     const exists = db.sessionExists(id) catch return .invalid;
     if (!exists) return .not_found;
     return .{ .existing = id };
-}
-
-/// 新建会话时写入 system 消息（与 TUI 行为一致）
-fn cliInitSessionRow(db: *db_mod.Db, session_id: i64) void {
-    _ = db.insertMessage(.{ .session_id = session_id, .role = "system", .content = system_prompt }) catch {};
 }
 
 fn cliPrintHelp(io: Io, to_stderr: bool) void {
@@ -3877,7 +3867,6 @@ fn cmdNew(allocator: Allocator, io: Io, opt: CliOptions) u8 {
         cliWriteStderr(io, "新建会话失败\n");
         return 4;
     };
-    cliInitSessionRow(&db, sid);
 
     if (opt.json) {
         const J = struct { session_id: i64, title: []const u8 };
@@ -4169,16 +4158,8 @@ fn estimateJobRequestTokens(job: *const StreamJob) usize {
         const inc = historyRequestBytesSlice(job.history[job.anchor_len..]);
         return @intCast(job.anchor_tokens + estimateTokens(inc));
     }
-    var has_system = false;
-    for (job.history) |m| {
-        if (std.mem.eql(u8, m.role, "system")) {
-            has_system = true;
-            break;
-        }
-    }
-    var bytes = historyRequestBytesSlice(job.history) + toolsSchemaBytes();
-    if (!has_system) bytes += system_prompt.len;
-    return estimateTokens(bytes);
+    // 政策A：system 由加载/新建路径前置进 job.history，无需单独补计
+    return estimateTokens(historyRequestBytesSlice(job.history) + toolsSchemaBytes());
 }
 
 /// 回合中途压缩：worker 已实时落库，整段 job.history（含当前回合）都可参与压缩。
@@ -4315,12 +4296,10 @@ fn cmdStats(allocator: Allocator, io: Io, opt: CliOptions) u8 {
     if (checkpoint) |cp| {
         summary_msg_id = cp.summary_message_id;
         var start: usize = 0;
-        var n: usize = 0;
-        while (start < rows.len and rows[start].id < cp.tail_start_id) : (start += 1) {
-            if (!std.mem.eql(u8, rows[start].role, "system")) n += 1;
-        }
-        compacted_count = n;
+        while (start < rows.len and rows[start].id < cp.tail_start_id) : (start += 1) {}
+        compacted_count = start;
         active = rows[start..];
+        // 摘要字节：优先取消息行；消息行落库失败降级时用 compaction.summary 副本
         var slen = cp.summary.len;
         if (summary_msg_id != 0) {
             for (rows) |r| {
@@ -4336,35 +4315,32 @@ fn cmdStats(allocator: Allocator, io: Io, opt: CliOptions) u8 {
     // 按角色统计（同时估算真正进入请求的字节：assistant 还带 tool_calls 文本）
     const RoleAgg = struct { role: []const u8, count: usize = 0, bytes: usize = 0 };
     var aggs = [_]RoleAgg{
-        .{ .role = "system" },
         .{ .role = "user" },
         .{ .role = "assistant" },
         .{ .role = "tool" },
         .{ .role = "other" },
     };
-    var has_system = false;
     var total_bytes: usize = 0;
-    var request_bytes: usize = summary_bytes;
+    // 发送口径（政策A）：前缀固定发送当前 system_prompt（不计入总量，计入请求估算）
+    var request_bytes: usize = summary_bytes + system_prompt.len;
+    var sent_count: usize = 0; // 实际进入请求的消息数（摘要行由包裹文本代表）
     for (active) |r| {
         if (summary_msg_id != 0 and r.id == summary_msg_id) continue; // 摘要行由包裹文本代表
-        const idx: usize = if (std.mem.eql(u8, r.role, "system")) blk: {
-            has_system = true;
-            break :blk 0;
-        } else if (std.mem.eql(u8, r.role, "user"))
-            1
+        sent_count += 1;
+        const idx: usize = if (std.mem.eql(u8, r.role, "user"))
+            0
         else if (std.mem.eql(u8, r.role, "assistant"))
-            2
+            1
         else if (std.mem.eql(u8, r.role, "tool"))
-            3
+            2
         else
-            4;
+            3;
         aggs[idx].count += 1;
         aggs[idx].bytes += r.content.len;
         total_bytes += r.content.len;
         request_bytes += r.content.len;
-        if (idx == 2) request_bytes += r.tool_calls.len;
+        if (idx == 1) request_bytes += r.tool_calls.len;
     }
-    if (!has_system) request_bytes += system_prompt.len;
 
     // 工具输出明细 + 折叠模拟（只看仍在发送的）
     const Largest = struct { id: i64, tool: []const u8, bytes: usize };
@@ -4514,7 +4490,7 @@ fn cmdStats(allocator: Allocator, io: Io, opt: CliOptions) u8 {
     }
     {
         const line = std.fmt.bufPrint(&buf, "合计         {d: >5} {d: >11} {d: >13}\n", .{
-            active.len, total_bytes, estimateTokens(total_bytes),
+            sent_count, total_bytes, estimateTokens(total_bytes),
         }) catch "";
         cliWriteStdout(io, line);
     }
@@ -4766,7 +4742,6 @@ fn cmdAsk(init: std.process.Init, opt: CliOptions) u8 {
     };
     state.session_id = sid;
     if (created) {
-        cliInitSessionRow(db, sid);
         state.appendHistory("system", system_prompt);
     } else {
         state.loadSessionContent(sid);
@@ -4932,7 +4907,319 @@ test "指令识别：/compact 不会被当成聊天发出去" {
     try std.testing.expect(isCommandInput("/compact"));
 }
 
-pub fn main(init: std.process.Init) !void {
+// ───────────────────────── 启动闸门（数据库版本不符） ─────────────────────────
+//
+// 版本不符时不进入 TUI（避免"静默内存模式"），先弹窗让用户明确选择：
+//  - 库比程序旧（升级场景）：询问"重命名旧库为备份并新建空库" / "退出"；
+//    选"是"则重命名（旧库数据原样保留为 skynet.old.db），然后正常启动
+//    （新库持久化正常）。选"否"或重命名失败 → 退出，零改动。
+//  - 库比程序新（降级场景）：告知需升级程序（含项目地址），确认后退出。
+// 闸门只做"按用户明确选择的重命名"，绝不写入/删除旧库内容。
+
+const GateChoice = enum { proceed, quit };
+
+/// 闸门弹窗的文案与按钮（文案集中于此，便于调整）
+const GateKind = enum { legacy_upgrade, newer_db };
+
+const GateButton = struct {
+    label: []const u8,
+    choice: GateChoice,
+};
+
+// ── 弹窗正文折行（规则同 markdown 表格单元格：优先空格断行、行尾空格丢弃、
+//    下一行跳过行首空格；单"词"长于宽度时按字符硬断）──
+
+const WrapCursor = struct { end: usize = 0, next: usize = 0 };
+
+/// 从 `text[start..]` 折出下一行：返回该行内容区间 [start, end) 与下一行起点 next。
+/// `start` 处的前导空格会被跳过；返回 null 表示已到末尾。
+fn wrapNextLine(text: []const u8, start: usize, width: usize) ?WrapCursor {
+    var i = start;
+    while (i < text.len and text[i] == ' ') i += 1;
+    if (i >= text.len) return null;
+
+    var j = i;
+    var col: usize = 0;
+    var content_end = i;
+    var break_content_end: ?usize = null; // 空格断行：内容截止（空格处）
+    var break_next: ?usize = null; // 空格断行：下一行起点（空格之后）
+    var overflowed = false;
+
+    while (j < text.len) {
+        const len: usize = std.unicode.utf8ByteSequenceLength(text[j]) catch 1;
+        const clen = @min(len, text.len - j);
+        const cp: u21 = if (clen == 1)
+            text[j]
+        else
+            std.unicode.utf8Decode(text[j .. j + clen]) catch 0xFFFD;
+        if (cp == '\n') break;
+        const cw: usize = tui.render.codepointWidth(cp);
+        if (cp == ' ') {
+            break_content_end = j;
+            break_next = j + clen;
+        }
+        if (cw > 0 and col + cw > width and col > 0) {
+            overflowed = true;
+            break;
+        }
+        content_end = j + clen;
+        col += cw;
+        j += clen;
+    }
+
+    if (overflowed and break_next != null) {
+        return .{ .end = break_content_end.?, .next = break_next.? };
+    }
+    return .{ .end = content_end, .next = j };
+}
+
+/// 文本按宽度折行后的行数（空串计 1 行，用于高度估算）
+fn wrappedRowCount(text: []const u8, width: usize) usize {
+    if (width == 0) return @as(usize, 1);
+    if (text.len == 0) return 1;
+    var rows: usize = 0;
+    var i: usize = 0;
+    while (wrapNextLine(text, i, width)) |line| {
+        rows += 1;
+        if (line.next <= i) break; // 防御：不前进则停止
+        i = line.next;
+    }
+    return @max(rows, 1);
+}
+
+/// 把一行文本按宽度折行绘制到内区（从 `y.*` 起；超出内区则停止）。绘制后 `y.*` 指向下一空行。
+fn drawWrappedLine(buf: *Buffer, area: Rect, y: *u16, text: []const u8, style: Style) void {
+    if (area.width == 0) return;
+    var i: usize = 0;
+    if (text.len == 0) {
+        if (y.* < area.y + area.height) y.* += 1;
+        return;
+    }
+    while (wrapNextLine(text, i, area.width)) |line| {
+        if (y.* >= area.y + area.height) return;
+        buf.setStringTruncated(area.x, y.*, text[i..line.end], area.width, style);
+        y.* += 1;
+        if (line.next <= i) return; // 防御：不前进则停止
+        i = line.next;
+    }
+}
+
+fn drawGateFrame(
+    buf: *Buffer,
+    warning: bool,
+    title: []const u8,
+    lines: []const []const u8,
+    buttons: []const GateButton,
+    selected: usize,
+) void {
+    buf.fillArea(.{ .x = 0, .y = 0, .width = buf.width, .height = buf.height }, ' ', .{ .fg = .reset, .bg = .reset });
+    if (buf.width < 12 or buf.height < 6) return;
+
+    const blk = Block{
+        .title = title,
+        .borders = Borders.ALL,
+        .border_style = if (warning) .{ .fg = .red } else .{ .fg = .yellow },
+        .title_style = .{ .fg = .white, .modifier = .{ .bold = true } },
+        .border_symbols = BorderSymbols.rounded(),
+    };
+
+    const area = Rect{ .x = 0, .y = 0, .width = buf.width, .height = buf.height };
+    var w: u16 = @intCast(@as(u32, area.width) * 80 / 100);
+    if (w > 88) w = 88;
+    w = @max(w, @min(area.width, 52));
+
+    // 高度自适应：按内区宽度预估正文折行后的行数（内区 = 弹窗宽 - 2 边框）
+    const inner_w: usize = if (w >= 2) w - 2 else 1;
+    var body_rows: usize = 0;
+    for (lines) |line| body_rows += wrappedRowCount(line, inner_w);
+    var h: u16 = @intCast(@min(body_rows + 6, @as(usize, 0xFFFF)));
+    if (h > area.height) h = area.height;
+
+    const popup = tui.centeredRectFixed(area, w, h);
+    blk.render(popup, buf);
+    const inner = blk.inner(popup);
+    if (inner.height == 0 or inner.width == 0) return;
+
+    var y = inner.y;
+    for (lines) |line| {
+        if (y >= inner.y + inner.height) break;
+        drawWrappedLine(buf, .{ .x = inner.x, .y = inner.y, .width = inner.width, .height = inner.height }, &y, line, .{ .fg = .white });
+    }
+
+    // 按钮行：贴内区最后一行居中
+    if (buttons.len == 0) return;
+    const btn_y = inner.y + inner.height - 1;
+    var total: u16 = 0;
+    for (buttons, 0..) |b, bi| {
+        total +|= @intCast(tui.render.stringWidth(b.label));
+        if (bi + 1 < buttons.len) total +|= 4;
+    }
+    var x = inner.x + (inner.width -| total) / 2;
+    for (buttons, 0..) |b, bi| {
+        const style: Style = if (bi == selected)
+            .{ .fg = .black, .bg = .white, .modifier = .{ .bold = true } }
+        else
+            .{ .fg = .white };
+        buf.setString(x, btn_y, b.label, style);
+        x +|= @intCast(tui.render.stringWidth(b.label));
+        if (bi + 1 < buttons.len) x +|= 4;
+    }
+}
+
+const GateCtx = struct {
+    warning: bool,
+    title: []const u8,
+    lines: []const []const u8,
+    buttons: []const GateButton,
+    selected: usize,
+};
+
+/// 启动闸门：只处理该弹窗的最小事件循环；返回用户选择。
+/// 闸门未能运行弹窗时的处理（非交互终端/初始化失败）：输出文本提示后退出
+const GateFallback = error{TerminalUnavailable};
+
+fn runStartupGate(
+    allocator: Allocator,
+    backend: *tui.backend.NativeBackend,
+    warning: bool,
+    title: []const u8,
+    lines: []const []const u8,
+    buttons: []const GateButton,
+) GateFallback!GateChoice {
+    var terminal = Terminal.init(allocator, backend.interface()) catch return error.TerminalUnavailable;
+    defer terminal.deinit();
+    terminal.hideCursor() catch {};
+
+    // 默认高亮第一个选项（升级场景 = "否：退出程序"——不可逆操作保守优先）
+    var selected: usize = 0;
+
+    while (true) {
+        const ctx = GateCtx{
+            .warning = warning,
+            .title = title,
+            .lines = lines,
+            .buttons = buttons,
+            .selected = selected,
+        };
+        terminal.draw(ctx, struct {
+            fn render(c: GateCtx, buf: *Buffer) !void {
+                drawGateFrame(buf, c.warning, c.title, c.lines, c.buttons, c.selected);
+            }
+        }.render) catch return error.TerminalUnavailable;
+
+        const ev = backend.interface().pollEvent(150) catch return error.TerminalUnavailable;
+        switch (ev) {
+            .key => |key| switch (key.code) {
+                .left, .right, .tab, .back_tab => {
+                    if (buttons.len > 1) selected = (selected + 1) % buttons.len;
+                },
+                .enter => return buttons[selected].choice,
+                .esc => return .quit,
+                .char => |c| {
+                    if (c == 'y' or c == 'Y') return buttons[buttons.len - 1].choice;
+                    if (c == 'n' or c == 'N') return if (buttons.len > 1) buttons[0].choice else .quit;
+                    if (buttons.len == 1) return buttons[0].choice;
+                },
+                else => {},
+            },
+            .resize => |size| {
+                terminal.resize(.{ .width = size.width, .height = size.height }) catch {};
+            },
+            else => {},
+        }
+    }
+}
+
+/// 启动闸门的结果（供 main 决定退出码/提示/后续启动）
+const GateOutcome = enum {
+    /// 无版本问题：照常启动
+    normal,
+    /// 旧库已经用户确认重命名；照常启动（将创建新库）
+    new_db,
+    /// 用户选择退出（未做任何改动）
+    quit_cancelled,
+    /// 库比程序新：已告知需升级
+    quit_newer_db,
+    /// 重命名失败（文件未改动）
+    quit_rename_failed,
+    /// 无法运行弹窗（非交互终端）：已用文本提示，未做任何改动
+    quit_terminal_unavailable,
+};
+
+/// 判定并处理版本不符：弹窗让用户明确选择（不静默落入内存模式）。
+/// 文案中的版本号与备份名均取实际值。
+fn runVersionGate(allocator: Allocator, io: Io, backend: *tui.backend.NativeBackend) GateOutcome {
+    // TUI 只使用默认库；CLI 的 -db 走 fail-fast（见 cliOpenDb）
+    const path: [:0]const u8 = "skynet.db";
+    const mm = db_mod.probeVersionMismatch(allocator, io, path) orelse return .normal;
+    if (mm.db_version == mm.program_version) return .normal; // 版本一致：打开失败另有原因，维持原流程
+
+    if (mm.dbIsOlder()) {
+        // 升级场景：询问"重命名并继续" / "退出"
+        const backup_name = db_mod.pickLegacyBackupName(allocator, io, path) catch null;
+        defer if (backup_name) |b| allocator.free(b);
+        const backup: []const u8 = if (backup_name) |b| b else "skynet.old.db";
+
+        var lines: [9][]const u8 = undefined;
+        lines[0] = std.fmt.allocPrint(allocator, "当前数据库为旧版结构（schema v{d} ≠ 当前 v{d}）。是否将其重命名为 {s}", .{ mm.db_version, mm.program_version, backup }) catch "";
+        lines[1] = "(数据原样保留、不做任何修改)，并创建全新的 skynet.db 继续使用？";
+        lines[2] = "";
+        lines[3] = std.fmt.allocPrint(allocator, "旧会话记录仍在 {s} 中，之后可请 AI 帮你迁移：把该文件与 SkyNet 源码一起", .{backup}) catch "";
+        lines[4] = "交给它，写一个一次性转换脚本即可（Python 标准库的 sqlite3 最适合这类工作），";
+        lines[5] = "也可以直接在这里让 SkyNet 代写。";
+        lines[6] = "";
+        lines[7] = "说明：项目尚在起步阶段，作者有意不内置自动迁移（避免历史包袱，稳定后再专门设计），详见 README。";
+        lines[8] = "";
+        defer {
+            allocator.free(lines[0]);
+            allocator.free(lines[3]);
+        }
+        const buttons = [_]GateButton{
+            .{ .label = "[ 否：退出程序 ]", .choice = .quit },
+            .{ .label = "[ 是：重命名并继续 ]", .choice = .proceed },
+        };
+        const choice = runStartupGate(allocator, backend, false, " 检测到旧版本数据库 ", &lines, &buttons) catch {
+            // 非交互终端（管道/无法初始化）：退化为文本说明后退出，不静默进行
+            cliWriteStdout(io, "检测到旧版本数据库（schema 版本不符）：请在交互终端中启动以便选择处理方式。\n");
+            cliWriteStdout(io, "如需迁移旧数据：把 skynet.db 与 SkyNet 源码交给 AI 写一次性转换脚本（详见 README）。\n");
+            return .quit_terminal_unavailable;
+        };
+        if (choice != .proceed) return .quit_cancelled;
+
+        const used = db_mod.renameLegacyDbFiles(allocator, io, path) catch {
+            Log.err(.db, "旧库重命名失败（文件未改动）: {s}", .{path});
+            return .quit_rename_failed;
+        };
+        defer allocator.free(used);
+        Log.info(.startup, "已重命名旧库为 {s}，将创建新库", .{used});
+        const n = @min(used.len, g_gate_backup_name.buf.len);
+        @memcpy(g_gate_backup_name.buf[0..n], used[0..n]);
+        g_gate_backup_name.len = n;
+        g_gate_mismatch = mm;
+        return .new_db;
+    }
+
+    // 降级场景：库比程序新——告知升级（含项目地址），确认后退出
+    g_gate_mismatch = mm;
+    var lines2: [7][]const u8 = undefined;
+    lines2[0] = std.fmt.allocPrint(allocator, "当前数据库的 schema 版本为 v{d}，本程序支持的版本为 v{d}。该库由更新版本的", .{ mm.db_version, mm.program_version }) catch "";
+    lines2[1] = "SkyNet 创建或使用过——为避免损坏数据，本程序不会打开它，也不会做任何修改。";
+    lines2[2] = "";
+    lines2[3] = "请升级 SkyNet 后重试。项目地址：";
+    lines2[4] = "https://github.com/NeonMedusa/SkyNet";
+    lines2[5] = "";
+    lines2[6] = "";
+    defer allocator.free(lines2[0]);
+    const buttons2 = [_]GateButton{.{ .label = "[ 知道了 ]", .choice = .quit }};
+    _ = runStartupGate(allocator, backend, true, " 数据库版本过新 · 无法启动 ", &lines2, &buttons2) catch .quit;
+    return .quit_newer_db;
+}
+
+/// 闸门结果（跨 runVersionGate 与启动流程传递的少量状态）
+var g_gate_backup_name: struct { buf: [512]u8 = undefined, len: usize = 0 } = .{};
+var g_gate_mismatch: db_mod.VersionMismatch = .{};
+
+pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     const io = init.io;
 
@@ -4957,6 +5244,27 @@ pub fn main(init: std.process.Init) !void {
     var backend = try tui.backend.init(allocator, io);
     defer backend.deinit();
 
+    // 启动闸门：数据库版本不符时先弹窗让用户明确选择（不静默进入内存模式）
+    const gate = runVersionGate(allocator, io, &backend);
+    switch (gate) {
+        .quit_cancelled => {
+            cliWriteStdout(io, "已取消：未对任何文件做改动。旧数据如需迁移，把 skynet.db 与 SkyNet 源码交给 AI 写一次性转换脚本即可（详见 README）。\n");
+            return 0;
+        },
+        .quit_newer_db => {
+            var eb: [320]u8 = undefined;
+            const msg = std.fmt.bufPrint(&eb, "错误: 数据库 schema 版本过新（库 v{d} > 程序 v{d}）——已拒绝打开，未对文件做任何修改。\n请升级 SkyNet 到最新版本后重试：https://github.com/NeonMedusa/SkyNet\n", .{ g_gate_mismatch.db_version, g_gate_mismatch.program_version }) catch "错误: 数据库版本过新——请升级 SkyNet 后重试：https://github.com/NeonMedusa/SkyNet\n";
+            cliWriteStderr(io, msg);
+            return 4;
+        },
+        .quit_rename_failed => {
+            cliWriteStderr(io, "错误: 重命名旧数据库失败（文件未被改动）。请检查是否有其他程序占用 skynet.db，或手动改名后重启。\n");
+            return 4;
+        },
+        .quit_terminal_unavailable => return 4,
+        .normal, .new_db => {},
+    }
+
     var terminal = try Terminal.init(allocator, backend.interface());
     defer terminal.deinit();
 
@@ -4978,9 +5286,9 @@ pub fn main(init: std.process.Init) !void {
     applyAmbiguousWidth(&state);
 
     // 打开数据库并恢复/新建会话
-    var db_ok = true;
-    state.db = db_mod.Db.open(allocator, io) catch blk: {
-        db_ok = false;
+    var db_open_err: ?anyerror = null;
+    state.db = db_mod.Db.open(allocator, io) catch |e| blk: {
+        db_open_err = e;
         break :blk null;
     };
     if (state.db) |*db| {
@@ -4989,7 +5297,6 @@ pub fn main(init: std.process.Init) !void {
             state.loadSessionContent(s.id);
         } else {
             state.session_id = db.createSession("") catch 0;
-            _ = db.insertMessage(.{ .session_id = state.session_id, .role = "system", .content = system_prompt }) catch {};
             state.appendHistory("system", system_prompt);
         }
     } else {
@@ -5022,8 +5329,22 @@ pub fn main(init: std.process.Init) !void {
     } else {
         state.addMessage("尚无提供商，输入 /models 后按 Ctrl+A 添加", .{ .fg = .dark_gray });
     }
-    if (!db_ok) {
-        state.addMessage("警告: 数据库打开失败，本次对话不会持久化", .{ .fg = .red });
+    if (db_open_err) |e| {
+        if (e == error.SchemaVersionMismatch) {
+            state.addMessage("警告: 数据库 schema 版本与程序不符，已拒绝打开（不迁移、不删除；详见日志）。本次对话不会持久化", .{ .fg = .red });
+        } else {
+            state.addMessage("警告: 数据库打开失败，本次对话不会持久化", .{ .fg = .red });
+        }
+    }
+    // 闸门重命名过旧库：对话区留下说明（红 + 灰两段），并提示迁移途径
+    if (gate == .new_db) {
+        const backup = g_gate_backup_name.buf[0..g_gate_backup_name.len];
+        var mb1: [640]u8 = undefined;
+        const m1 = std.fmt.bufPrint(&mb1, "警告: 检测到旧版本数据库（schema v{d} ≠ 当前 v{d}）。旧库已原样重命名为 {s}，并创建了新的 skynet.db——本次对话会正常保存。", .{ g_gate_mismatch.db_version, g_gate_mismatch.program_version, backup }) catch "";
+        state.addMessage(m1, .{ .fg = .red });
+        var mb2: [768]u8 = undefined;
+        const m2 = std.fmt.bufPrint(&mb2, "旧的会话记录仍在 {s} 中（数据未做任何修改）。如需迁移：把该文件与 SkyNet 源码一起交给 AI，请它写一个一次性转换脚本即可（Python 标准库的 sqlite3 最适合这类工作），也可以直接在这里让 SkyNet 代写。", .{backup}) catch "";
+        state.addMessage(m2, .{ .fg = .dark_gray });
     }
     defer {
         // 生成中退出：中断并等待线程结束，保留已生成内容
@@ -5152,6 +5473,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try terminal.showCursor();
+    return 0;
 }
 
 /// 处理单个终端事件（从 runTui 主循环抽出：主循环一次绘制后批量排空事件，
@@ -8379,7 +8701,7 @@ test "工具调用行格式（单行摘要）" {
     );
 }
 
-test "加载历史：工具交互恢复与 system prompt 升级" {
+test "加载历史：工具交互恢复与提示词政策（前置当前值）" {
     var state = AppState{};
     state.allocator = std.testing.allocator;
     defer {
@@ -8390,7 +8712,6 @@ test "加载历史：工具交互恢复与 system prompt 升级" {
     }
 
     const rows = [_]db_mod.MessageRow{
-        .{ .id = 1, .role = "system", .content = "OLD PROMPT" },
         .{ .id = 2, .role = "user", .content = "列出文件" },
         .{ .id = 3, .role = "assistant", .content = "", .tool_calls = "[{\"id\":\"call_1\",\"name\":\"ls\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}]" },
         .{ .id = 4, .role = "tool", .content = "src/\n", .tool_call_id = "call_1", .tool_name = "ls", .is_error = 0 },
@@ -8402,9 +8723,9 @@ test "加载历史：工具交互恢复与 system prompt 升级" {
         .{ .id = 8, .role = "assistant", .content = "", .tool_calls = "[{\"id\":\"call_3\",\"name\":\"edit\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}]" },
         .{ .id = 9, .role = "tool", .content = "Successfully replaced 1 block(s) in a.txt.", .tool_call_id = "call_3", .tool_name = "edit", .tool_display = "    1 - old\n    1 + new", .is_error = 0 },
     };
-    state.applyLoadedMessages(&rows);
+    state.applyLoadedMessages(&rows, true);
 
-    // 历史：system 升级；工具字段恢复
+    // 历史：前缀为当前提示词（库里不再有 system 行）；工具字段恢复
     try std.testing.expectEqual(@as(usize, 9), state.history.items.len);
     try std.testing.expectEqualStrings(system_prompt, state.history.items[0].content);
     try std.testing.expect(state.history.items[2].tool_calls != null);
@@ -9576,7 +9897,6 @@ test "旧工具输出折叠：批量触发、全文保留、重启后请求体�
         live.messages.deinit(alloc);
     }
 
-    _ = live.persistMessage(.{ .role = "system", .content = system_prompt });
     live.appendHistory("system", system_prompt);
     _ = live.persistMessage(.{ .role = "user", .content = "开始" });
     live.appendHistory("user", "开始");
@@ -9667,7 +9987,7 @@ test "旧工具输出折叠：批量触发、全文保留、重启后请求体�
         for (reloaded.messages.items) |m| reloaded.freeDisplayMessage(m);
         reloaded.messages.deinit(alloc);
     }
-    reloaded.applyLoadedMessages(rows);
+    reloaded.applyLoadedMessages(rows, true);
 
     var schemas: [tools_mod.tool_defs.len]ai.ToolSchema = undefined;
     for (tools_mod.tool_defs, 0..) |d, i| {
@@ -9692,6 +10012,69 @@ test "旧工具输出折叠：批量触发、全文保留、重启后请求体�
         }
     }
     try std.testing.expect(found_bash_block);
+}
+
+test "提示词政策：加载与新建都前置当前值；空会话同样带提示词" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    const db_path = "skynet_test_system_policy.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_system_policy.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_system_policy.db-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_system_policy.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_system_policy.db-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer if (state.db) |*d| d.deinit();
+    defer {
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+    }
+
+    // 会话 A：加载后历史 = 前置的当前提示词 + 库内消息
+    const sid_a = try state.db.?.createSession("A");
+    state.session_id = sid_a;
+    _ = try state.db.?.insertMessage(.{ .session_id = sid_a, .role = "user", .content = "你好" });
+
+    state.loadSessionContent(sid_a);
+    try std.testing.expectEqual(@as(usize, 2), state.history.items.len);
+    try std.testing.expectEqualStrings("system", state.history.items[0].role);
+    try std.testing.expectEqualStrings(system_prompt, state.history.items[0].content);
+    try std.testing.expectEqualStrings("你好", state.history.items[1].content);
+
+    // 会话 B：无 system 行（新政策下新建会话即如此）；加载后仍带当前提示词
+    const sid_b = try state.db.?.createSession("B");
+    _ = try state.db.?.insertMessage(.{ .session_id = sid_b, .role = "user", .content = "hi" });
+    state.loadSessionContent(sid_b);
+    try std.testing.expectEqual(@as(usize, 2), state.history.items.len);
+    try std.testing.expectEqualStrings(system_prompt, state.history.items[0].content);
+    try std.testing.expectEqualStrings("hi", state.history.items[1].content);
+
+    // 新建会话：不写 system 行；内存历史仍带当前提示词（估算同步刷新）
+    state.newSession();
+    const sid_new = state.session_id;
+    try std.testing.expectEqual(@as(usize, 1), state.history.items.len);
+    try std.testing.expectEqualStrings(system_prompt, state.history.items[0].content);
+    try std.testing.expectEqual(@as(usize, 0), (try state.db.?.loadMessages(sid_new)).len);
+    try std.testing.expect(state.usage_estimated);
+
+    // 重新加载空会话（早退路径）：历史 = 当前提示词，估算刷新
+    state.loadSessionContent(sid_new);
+    try std.testing.expectEqual(@as(usize, 1), state.history.items.len);
+    try std.testing.expectEqualStrings(system_prompt, state.history.items[0].content);
+    try std.testing.expect(state.usage_estimated);
 }
 
 test "外部写入增量刷新：追加新消息且不重复" {
@@ -9727,7 +10110,7 @@ test "外部写入增量刷新：追加新消息且不重复" {
 
     const sid = try state.db.?.createSession("t");
     state.session_id = sid;
-    state.last_seen_msg_id = try state.db.?.insertMessage(.{ .session_id = sid, .role = "system", .content = system_prompt });
+    state.last_seen_msg_id = 0; // 尚无落库消息（库里不含 system 行）
     state.appendHistory("system", system_prompt);
 
     // 外部进程（第二条连接）写入 user + assistant
@@ -9809,7 +10192,6 @@ test "集成：compaction（需本地 mock 服务器 127.0.0.1:18125）" {
     state.session_id = sid;
 
     // 构造：system + 可压缩区（user/assistant/tool）+ 最后一条 user（保留区）
-    _ = state.persistMessage(.{ .role = "system", .content = system_prompt });
     state.appendHistory("system", system_prompt);
     const uid1 = state.persistMessage(.{ .role = "user", .content = "OLD_MARKER 用户问题一" });
     state.appendHistoryMessage(.{ .role = "user", .content = "OLD_MARKER 用户问题一", .db_id = uid1 });
@@ -9965,8 +10347,8 @@ test "中途压缩：工具循环中压缩整段历史（含当前回合，需 m
     };
 
     var hist = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
-    const sys_row = state.persistMessage(.{ .role = "system", .content = system_prompt });
-    try hist.append(arena, .{ .role = "system", .content = try arena.dupe(u8, system_prompt), .db_id = sys_row });
+    // system 仅存在于内存历史（政策A：不落库）
+    try hist.append(arena, .{ .role = "system", .content = try arena.dupe(u8, system_prompt) });
     const old_u = "uuuu" ** 500;
     const old_a = "aaaa" ** 500;
     try hist.append(arena, try Turn.u(arena, &state, old_u));
@@ -10028,7 +10410,7 @@ test "中途压缩：工具循环中压缩整段历史（含当前回合，需 m
         reloaded.messages.deinit(alloc);
     }
     const rows = try state.db.?.loadMessages(sid);
-    reloaded.applyLoadedMessagesWithCheckpoint(rows, cp, true);
+    reloaded.applyLoadedMessagesWithCheckpoint(rows, cp, true, true);
     try std.testing.expectEqual(@as(usize, 4), reloaded.history.items.len);
     try std.testing.expectEqualStrings("assistant", reloaded.history.items[2].role);
     try std.testing.expectEqualStrings(a2, reloaded.history.items[2].content);
@@ -10188,7 +10570,6 @@ test "手动压缩：小会话自适应缩小保留窗口（需 mock 18125）" {
 
     const sid = try state.db.?.createSession("");
     state.session_id = sid;
-    _ = state.persistMessage(.{ .role = "system", .content = system_prompt });
     const f0 = "F0" ** 4000;
     const r1 = state.persistMessage(.{ .role = "user", .content = f0 });
     _ = r1;
@@ -10257,7 +10638,6 @@ test "历史往返一致：落库重读后的请求体与实时逐字节相同" 
         live.messages.deinit(std.testing.allocator);
     }
 
-    _ = try db.insertMessage(.{ .session_id = sid, .role = "system", .content = system_prompt });
     live.appendHistory("system", system_prompt);
 
     // user：前后空格、tab、行尾空格
@@ -10337,7 +10717,7 @@ test "历史往返一致：落库重读后的请求体与实时逐字节相同" 
         for (reloaded.messages.items) |m| reloaded.freeDisplayMessage(m);
         reloaded.messages.deinit(std.testing.allocator);
     }
-    reloaded.applyLoadedMessages(try db.loadMessages(sid));
+    reloaded.applyLoadedMessages(try db.loadMessages(sid), true);
 
     try std.testing.expectEqual(live.history.items.len, reloaded.history.items.len);
 
@@ -10508,7 +10888,7 @@ test "重启恢复：纯工具调用轮不产生空消息（工具间隔为一�
         .{ .id = 6, .role = "assistant", .content = "", .tool_calls = "[{\"id\":\"c3\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"zig build\\\"}\"}]" },
         .{ .id = 7, .role = "tool", .content = "ok\n", .tool_call_id = "c3", .tool_name = "bash" },
     };
-    state.applyLoadedMessagesWithCheckpoint(&rows, null, true);
+    state.applyLoadedMessagesWithCheckpoint(&rows, null, true, true);
 
     // 恢复出的显示消息：user / 思考 / read行 / edit块 / bash块（无空消息）
     try std.testing.expectEqual(@as(usize, 5), state.messages.items.len);
@@ -11070,7 +11450,6 @@ test "独立验证：折叠阈值边界与保护窗口（批量）" {
             st.messages.deinit(alloc);
         }
 
-        _ = st.persistMessage(.{ .role = "system", .content = system_prompt });
         st.appendHistory("system", system_prompt);
         _ = st.persistMessage(.{ .role = "user", .content = "开始" });
         st.appendHistory("user", "开始");
@@ -11198,7 +11577,6 @@ test "独立验证：重启后块工具用全文重建、大小统计按原文�
         live.messages.deinit(alloc);
     }
 
-    _ = live.persistMessage(.{ .role = "system", .content = system_prompt });
     live.appendHistory("system", system_prompt);
     _ = live.persistMessage(.{ .role = "user", .content = "开始" });
     live.appendHistory("user", "开始");
@@ -11266,7 +11644,7 @@ test "独立验证：重启后块工具用全文重建、大小统计按原文�
         for (reloaded.messages.items) |m| reloaded.freeDisplayMessage(m);
         reloaded.messages.deinit(alloc);
     }
-    reloaded.applyLoadedMessages(rows);
+    reloaded.applyLoadedMessages(rows, true);
 
     var schemas: [tools_mod.tool_defs.len]ai.ToolSchema = undefined;
     for (tools_mod.tool_defs, 0..) |d, i| {
@@ -11611,6 +11989,179 @@ test "进行中指示：drawInput 渲染（标题含盲文帧、边框忙碌变�
     for (0..60) |x| {
         const c = buf_idle.get(@intCast(x), 0).?.char;
         try std.testing.expect(c < 0x2800 or c > 0x28FF);
+    }
+}
+
+/// 测试辅助：把整个 Buffer 拼为 ASCII 文本（宽字符与非 ASCII 以 '?' 占位，行列间无分隔）
+fn gateBufferText(buf: *tui.render.Buffer, out: []u8) []const u8 {
+    var n: usize = 0;
+    for (0..buf.height) |row| {
+        for (0..buf.width) |col| {
+            if (n >= out.len) return out[0..n];
+            const cell = buf.get(@intCast(col), @intCast(row)).?;
+            out[n] = if (cell.char < 128) @intCast(cell.char) else '?';
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+test "启动闸门：正文折行（空格断行/硬断/宽字符）与弹窗高度自适应" {
+    // 空格断行：宽度 10，"aaa bbb ccc"（11 列）→ 2 行
+    try std.testing.expectEqual(@as(usize, 2), wrappedRowCount("aaa bbb ccc", 10));
+    // 恰好放下：1 行
+    try std.testing.expectEqual(@as(usize, 1), wrappedRowCount("aaa bbb", 7));
+    // 硬断：无空格长词 → 按宽度切
+    try std.testing.expectEqual(@as(usize, 3), wrappedRowCount("aaaaaaaaaaaaaaa", 6));
+    // 中文按 2 列宽：宽度 10 每行 5 字
+    try std.testing.expectEqual(@as(usize, 2), wrappedRowCount("十个汉字哦哦哦哦哦", 10));
+    // 空串 1 行
+    try std.testing.expectEqual(@as(usize, 1), wrappedRowCount("", 10));
+
+    // 折行切分：区间内容正确且逐行推进
+    {
+        const text = "aaa bbb ccc";
+        var it = wrapNextLine(text, 0, 10).?;
+        try std.testing.expectEqualStrings("aaa bbb", text[0..it.end]);
+        it = wrapNextLine(text, it.next, 10).?;
+        try std.testing.expectEqualStrings("ccc", text[it.next - 3 .. it.end]);
+    }
+
+    // 长行不再画到边框外：弹窗渲染后，检查正文行的内容不越过右边框
+    {
+        const long_line = "this is a very long explanatory line that used to overflow the dialog border and paint outside it, which looked broken";
+        const lines = [_][]const u8{ long_line, "" };
+        const buttons = [_]GateButton{
+            .{ .label = "[ No ]", .choice = .quit },
+            .{ .label = "[ Yes ]", .choice = .proceed },
+        };
+        var buf = try tui.render.Buffer.init(std.testing.allocator, 80, 20);
+        defer buf.deinit();
+        drawGateFrame(&buf, false, " gate ", &lines, &buttons, 1);
+
+        // 定位弹窗边框：找到 '╭'（左上角）同行最右的 '╮'（右上角）
+        var box_left: ?u16 = null;
+        var box_right: ?u16 = null;
+        var box_top: ?u16 = null;
+        outer: for (0..buf.height) |row| {
+            for (0..buf.width) |col| {
+                const cell = buf.get(@intCast(col), @intCast(row)).?;
+                if (cell.char == '╭') {
+                    box_top = @intCast(row);
+                    box_left = @intCast(col);
+                    var x = buf.width;
+                    while (x > col) {
+                        x -= 1;
+                        const c2 = buf.get(x, @intCast(row)).?;
+                        if (c2.char == '╮') {
+                            box_right = x;
+                            break;
+                        }
+                    }
+                    break :outer;
+                }
+            }
+        }
+        try std.testing.expect(box_left != null and box_right != null and box_top != null);
+        const l = box_left.?;
+        const r = box_right.?;
+        const top = box_top.?;
+        try std.testing.expect(r > l + 4);
+
+        // 弹窗区域内所有行：左右边框字符必须就位（正文没有画上去）
+        var row: u16 = top;
+        while (row < buf.height) : (row += 1) {
+            const left_cell = buf.get(l, row).?;
+            if (left_cell.char == ' ') {
+                // 弹窗到此结束
+                break;
+            }
+            try std.testing.expect(left_cell.char == '│' or left_cell.char == '╰' or left_cell.char == '╭');
+            const right_cell = buf.get(r, row).?;
+            try std.testing.expect(right_cell.char == '│' or right_cell.char == '╯' or right_cell.char == '╮');
+            // 右边框之外必须为空
+            var x = r + 1;
+            while (x < buf.width) : (x += 1) {
+                const cell = buf.get(x, row).?;
+                try std.testing.expect(cell.char == ' ');
+            }
+        }
+    }
+
+    // 两行文本都应完整显示（不因单行过长而挤掉后文）
+    {
+        const lines = [_][]const u8{
+            "first line is long enough to wrap once at least in a narrow dialog box for sure",
+            "SECOND_LINE_MARKER",
+        };
+        const buttons = [_]GateButton{.{ .label = "[ ok ]", .choice = .quit }};
+        var buf = try tui.render.Buffer.init(std.testing.allocator, 60, 20);
+        defer buf.deinit();
+        drawGateFrame(&buf, true, " t ", &lines, &buttons, 0);
+        var out: [60 * 20]u8 = undefined;
+        var n: usize = 0;
+        for (0..buf.height) |row| {
+            for (0..buf.width) |col| {
+                const cell = buf.get(@intCast(col), @intCast(row)).?;
+                out[n] = if (cell.char < 128) @intCast(cell.char) else '?';
+                n += 1;
+            }
+        }
+        try std.testing.expect(std.mem.indexOf(u8, out[0..n], "SECOND_LINE_MARKER") != null);
+    }
+}
+
+test "启动闸门：弹窗渲染含关键内容（标题/说明/按钮/项目地址）" {
+    const alloc = std.testing.allocator;
+
+    // 升级询问弹窗：备份名与两个按钮的 ASCII 部分必须出现
+    {
+        const lines = [_][]const u8{
+            "old schema v6 != v7, rename to skynet.old.db?",
+            "(data is preserved as-is), and create a new skynet.db?",
+            "",
+            "the old conversations stay in skynet.old.db; ask AI to migrate it later",
+            "with a one-off script (Python sqlite3 is best suited)",
+            "or ask SkyNet right here.",
+            "",
+            "note: no built-in auto-migration by design; see README",
+            "",
+        };
+        const buttons = [_]GateButton{
+            .{ .label = "[ No: quit ]", .choice = .quit },
+            .{ .label = "[ Yes: rename & continue ]", .choice = .proceed },
+        };
+        var buf = try tui.render.Buffer.init(alloc, 110, 15);
+        defer buf.deinit();
+        drawGateFrame(&buf, false, " legacy db detected ", &lines, &buttons, 1);
+        var out: [110 * 15]u8 = undefined;
+        const text = gateBufferText(&buf, &out);
+        try std.testing.expect(std.mem.indexOf(u8, text, "skynet.old.db") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "[ No: quit ]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "[ Yes: rename & continue ]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "legacy db detected") != null);
+    }
+
+    // 降级告知弹窗：项目地址与单一按钮必须出现
+    {
+        const lines = [_][]const u8{
+            "db schema v8 is newer than program v7",
+            "refusing to open; no modification will be made",
+            "",
+            "please upgrade SkyNet and retry:",
+            "https://github.com/NeonMedusa/SkyNet",
+            "",
+            "",
+        };
+        const buttons = [_]GateButton{.{ .label = "[ Got it ]", .choice = .quit }};
+        var buf = try tui.render.Buffer.init(alloc, 110, 13);
+        defer buf.deinit();
+        drawGateFrame(&buf, true, " database too new ", &lines, &buttons, 0);
+        var out: [110 * 13]u8 = undefined;
+        const text = gateBufferText(&buf, &out);
+        try std.testing.expect(std.mem.indexOf(u8, text, "https://github.com/NeonMedusa/SkyNet") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "[ Got it ]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "database too new") != null);
     }
 }
 
