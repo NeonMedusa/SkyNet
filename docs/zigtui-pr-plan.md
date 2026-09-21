@@ -65,8 +65,9 @@
 |---|---|---|---|---|
 | 1 | `render: tolerate malformed UTF-8 instead of panicking` | `utf8-tolerance` | 6c0105e 的英文移植 | **已合并**（upstream `1002ef6`，PR #38） |
 | 2 | `fix(windows): arm terminal restore hook and save console state` | `windows-restore` | b173771 的 restore 部分 | **已合并**（upstream `69b3f34`，PR #39） |
-| 3 | `terminal: emit pending cursor as the last instruction of a frame` | `cursor-frame-tail`（待建） | 0b3b877 的英文移植（`pending_cursor` + mock backend 测试） | 本地已有（skynet 分支 `0b3b877`），待移植/推送 |
-| 4 | `terminal: DECSCUSR cursor shape support` | `decscusr`（待建） | e762dda 的英文移植（`CursorShape` + `setCursorShape` + 退出复位） | 本地已有（skynet 分支 `e762dda`），待移植/推送 |
+| 2.5 | `feat: wide character support (windows input + widget layout)` | `wide-char-support` | 代理对输入 + TextInput/Tabs/Paragraph 按显示宽度布局（一个 PR 四个 commit） | **已合并**（upstream `e1c7c4a`，PR #42） |
+| 3 | `terminal: emit pending cursor as the last instruction of a frame` | `cursor-frame-tail`（待建） | 0b3b877 的英文移植（`pending_cursor` + mock backend 测试） | 本地已有（skynet 分支），待移植/推送 |
+| 4 | `terminal: DECSCUSR cursor shape support` | `decscusr`（待建） | e762dda 的英文移植（`CursorShape` + `setCursorShape` + 退出复位） | 本地已有（skynet 分支），待移植/推送 |
 | 5 | `feat: bracketed paste events (POSIX backend)` | `bracketed-paste`（待建） | Parser + POSIX 接线 + LF 语义 | 未开始 |
 | 6 | `feat(windows): VT input mode with bracketed paste and SGR mouse` | 待定 | windows.zig 主体（先 issue 探路） | 未开始 |
 | 7 | `feat: East Asian ambiguous width support (opt-in)` | `ambiguous-width`（待建） | 宽度表 + options 化 + 补格（先 issue 探路） | 未开始 |
@@ -95,6 +96,54 @@ IME 漂移/闪烁问题已在真实环境解决，说服力强；mock backend �
 - 跨平台验证：本机 Windows `zig build test`（70/70）+ `zig build examples` + 对
   `x86_64-linux-gnu` 的 `zig test -fno-emit-bin` 交叉编译检查（restore.zig 与 lib.zig）。
 
+## PR-3 语义备忘（wide-char-support，2026-09-22）
+
+合并为一个 PR、四个 commit（输入 + 三个组件的布局修复），上游接受（`e1c7c4a`）。
+要点：
+
+- **Windows 输入**：`codeUnitToUtf8`（上游版 `resolveSurrogate` 的 fork 增强版）——
+  **两版的关键差异**：上游版只处理代理对；fork 版额外修复 **Latin-1 补充字符
+  （U+0080–U+00FF，如 é/ü）**——旧逻辑把它们当"原始字节"透传，单字节不构成合法
+  UTF-8 序列，会静默丢字符甚至吞掉后续字符。**回贡时未包含这部分**（当时 PR 只移植了
+  代理对逻辑），rebase 后保留 fork 版并删除上游版；
+- **Widgets 布局**：TextInput/Tabs/Paragraph 此前按"码点计数"推进而非显示宽度，
+  宽字符（CJK/emoji）的第二列会被后继字符覆盖、整对清空 → 表现为"字符不显示"。
+  统一改用 `codepointWidth` 计列；
+- **测试**：`combineSurrogates` 边界 + 代理对状态机 + 三个组件的宽字符布局。
+
+## 流程教训：rebase 会静默剥离"fork 独有的增强"
+
+**2026-09-22 实例**：`skynet` rebase 到 PR #42 后，`codeUnitToUtf8` 的**调用点**
+被退回旧逻辑（`uch <= 0xFF` 直接透传字节），函数本身也消失；**编译与测试都能过**
+（上游测试只覆盖代理对，不覆盖 Latin-1），是**静默的功能回归**——只有对照 fork
+版 diff 才发现。
+
+**下次 rebase 的检查清单**：
+1. rebase 后 `git diff <fork备份> skynet -- <冲突文件>` 逐文件对照，确认 fork 的
+   增强**仍在**（不只是"测试通过"）；
+2. 特别检查"上游也有类似函数、但 fork 版更强"的场景（如 `resolveSurrogate` vs
+   `codeUnitToUtf8`）——这类冲突 git 会倾向选上游，需要人工判断保留哪版；
+3. 备份分支（`skynet-backup*`）在确认稳定前不要删；
+4. **跑完整测试 + TUI 冒烟**（`zig build test` + `zig build examples`；SkyNet 侧
+   `zig build test` 全量 mock + 真机启动一次）——测试覆盖不到的场景（如 Latin-1
+   字符）靠真机操作补。
+
+**标准四步**：rebase → **diff 对照备份** → 完整测试/冒烟 → force-push。
+
+## Rebase 记录（2026-09-22：PR #42 合并后）
+
+- `upstream/master` 合入 PR #42（`e1c7c4a`）——即我们回贡的 4 个提交（宽字符支持）；
+- `skynet` rebase（备份 `skynet-backup2` @ `8e4c585`）。`windows.zig` 冲突 6 处：
+  - 字段：**保留双方**（VT `input` parser + `pending_high_surrogate`）；
+  - `pollEvent` 主体：**取 fork 版**（VT 路径用 parser 接管事件；上游的直接
+    KEY_EVENT/MOUSE switch 已被取代）；
+  - `resolveSurrogate` vs `codeUnitToUtf8`：**保留 fork 版**（多 Latin-1 修复），
+    删除上游版及其测试；
+  - **修复被 rebase 剥离的调用点**（见上节流程教训）；
+- 验证：zigtui **111/111**（比 rebase 前多 6 个：吸收上游 widgets 测试 + 保留
+  Latin-1 覆盖）+ examples；SkyNet 168 pass（无 mock）+ 构建；
+- `skynet` force-push（`8e4c585` → `9d0af03`）。
+
 ### fork 遗留问题（已解决）
 
 - ~~`skynet` 分支的 `restore.arm` 在 Windows 上于进入 raw 模式之后调用、快照到 raw 模式~~
@@ -116,6 +165,9 @@ IME 漂移/闪烁问题已在真实环境解决，说服力强；mock backend �
 - 验证：zigtui `zig build test` 101/101、`zig build examples` 通过；SkyNet 全量
   168/168（5 mock）、TUI 冒烟正常；`skynet` 已 force-push 回 fork（`fad915e` → `8e4c585`），
   主仓库 submodule 指针同步更新。
+- **注**：本记录中的 `0b3b877`/`e762dda`/`c0a8f25` 等 hash 是那次 rebase **之前**的
+  提交号；后续每次 rebase 都会重写（2026-09-22 后对应 `df7c9b3`/`1f674df`/`f60c31a`）。
+  引用 fork 提交时以"标题 + 分支"为准，别依赖 hash。
 
 ## 每个 PR 的工作流
 
