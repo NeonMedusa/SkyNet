@@ -57,9 +57,9 @@ pub const tool_defs = [_]ToolDef{
     },
     .{
         .name = "ls",
-        .description = "List directory contents sorted by name, with '/' suffix for directories. Output is capped at limit entries (default 500) and 50KB.",
+        .description = "List directory contents sorted by name, with '/' suffix for directories. Set depth>0 to recurse (paths are then relative, directories keep the '/' suffix). Output is capped at limit entries (default 500) and 50KB.",
         .parameters =
-        \\{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default: current directory)"},"limit":{"type":"integer","description":"Maximum number of entries (default 500)"}}}
+        \\{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default: current directory)"},"limit":{"type":"integer","description":"Maximum number of entries (default 500)"},"depth":{"type":"integer","description":"Recursion depth: 0 = current level only (default); N > 0 = recurse N levels"}}}
         ,
     },
 };
@@ -370,6 +370,76 @@ fn toolRead(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8
     return .{ .content = try finishCapped(allocator, cap.text, cap.notice), .is_error = false };
 }
 
+// ── edit 匹配失败的诊断 ──
+
+/// 把文本按"忽略行尾空白"归一化（借鉴 pi 的 normalizeForFuzzyMatch，仅用于诊断）。
+/// 返回归一化后的文本；调用者负责释放。失败时返回 null。
+fn normalizeForDiag(allocator: Allocator, text: []const u8) ?[]u8 {
+    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var i: usize = 0;
+    while (i < text.len) {
+        const nl = std.mem.indexOfScalarPos(u8, text, i, '\n');
+        const line_end = nl orelse text.len;
+        var line = text[i..line_end];
+        // 去掉行尾空白（空格/Tab/CR）
+        while (line.len > 0 and (line[line.len - 1] == ' ' or line[line.len - 1] == '\t' or line[line.len - 1] == '\r')) {
+            line = line[0 .. line.len - 1];
+        }
+        out.appendSlice(allocator, line) catch {
+            out.deinit(allocator);
+            return null;
+        };
+        if (nl != null) {
+            out.append(allocator, '\n') catch {
+                out.deinit(allocator);
+                return null;
+            };
+            i = line_end + 1;
+        } else break;
+    }
+    return out.toOwnedSlice(allocator) catch {
+        out.deinit(allocator);
+        return null;
+    };
+}
+
+/// 匹配失败时给出诊断线索：尝试"忽略行尾空白"的归一化匹配，若能匹配则提示
+/// 差异可能是行尾空白；否则给出 old_string 首行在文件中的近似位置。
+/// 返回要追加到错误信息后的字符串（含前导空格）；无法诊断时返回空串。
+/// 内部分配失败时返回空串（诊断是尽力而为，不能影响主流程）。
+fn diagnoseEditMiss(allocator: Allocator, data: []const u8, old: []const u8) []const u8 {
+    // 1) 归一化（去行尾空白）后能否匹配？→ 提示行尾空白差异
+    if (normalizeForDiag(allocator, data)) |nd| {
+        defer allocator.free(nd);
+        if (normalizeForDiag(allocator, old)) |no| {
+            defer allocator.free(no);
+            if (no.len > 0 and std.mem.indexOf(u8, nd, no) != null) {
+                return std.fmt.allocPrint(
+                    allocator,
+                    " Hint: a match exists if trailing whitespace is ignored - check for trailing spaces, tabs, or line-ending (CRLF/LF) differences.",
+                    .{},
+                ) catch "";
+            }
+        }
+    }
+
+    // 2) old_string 首行（trim 后）在文件中的位置 → 提示近似位置
+    const first_nl = std.mem.indexOfScalar(u8, old, '\n');
+    const first_raw = if (first_nl) |n| old[0..n] else old;
+    const first = std.mem.trim(u8, first_raw, " \t\r");
+    if (first.len >= 4 and first.len <= 200) {
+        if (std.mem.indexOf(u8, data, first)) |at| {
+            const line_no = std.mem.count(u8, data[0..at], "\n") + 1;
+            return std.fmt.allocPrint(
+                allocator,
+                " Hint: the first line of old_string appears at line {d} - compare the surrounding text there.",
+                .{line_no},
+            ) catch "";
+        }
+    }
+    return "";
+}
+
 // ── write ──
 
 const WriteArgs = struct {
@@ -449,7 +519,9 @@ fn toolEdit(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8
     }
 
     if (matches == 0) {
-        return fail(allocator, "Could not find the exact text in {s}. The old_string must match exactly including all whitespace and newlines.", .{args.path});
+        // 诊断线索（arena 分配，随本次调用结束释放）
+        const hint = diagnoseEditMiss(args_arena.allocator(), data, args.old_string);
+        return fail(allocator, "Could not find the exact text in {s}. The old_string must match exactly including all whitespace and newlines.{s}", .{ args.path, hint });
     }
     if (matches > 1 and !args.replace_all) {
         return fail(allocator, "Found {d} occurrences of the text in {s}. The text must be unique. Please provide more context to make it unique, or set replace_all=true.", .{ matches, args.path });
@@ -1363,7 +1435,63 @@ fn toolFind(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8
 const LsArgs = struct {
     path: []const u8 = "",
     limit: i64 = 0,
+    /// 递归深度：0 = 只列当前层（默认，保持原行为）；N > 0 = 递归 N 层。
+    depth: i64 = 0,
 };
+
+/// ls 递归：自包含的深度受限遍历（不依赖 walk，输出"相对路径（目录带 /）"）。
+/// 复用 shouldSkipDir 跳过 .git 等目录。
+fn lsRecurse(
+    io: Io,
+    allocator: Allocator,
+    dir_abs: []const u8,
+    rel_prefix: []const u8,
+    remaining: u32,
+    out: *std.ArrayListUnmanaged([]u8),
+) error{OutOfMemory}!void {
+    if (remaining == 0) return;
+    var dir = Dir.openDirAbsolute(io, dir_abs, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    const Named = struct { name: []u8, is_dir: bool };
+    var entries = std.ArrayListUnmanaged(Named){ .items = &.{}, .capacity = 0 };
+    defer {
+        for (entries.items) |e| allocator.free(e.name);
+        entries.deinit(allocator);
+    }
+    var it = dir.iterate();
+    while (true) {
+        const maybe = it.next(io) catch break;
+        const entry = maybe orelse break;
+        if (shouldSkipDir(entry.name)) continue;
+        const name = try allocator.dupe(u8, entry.name);
+        try entries.append(allocator, .{ .name = name, .is_dir = entry.kind == .directory });
+    }
+    std.mem.sort(Named, entries.items, {}, struct {
+        fn lessThan(_: void, a: Named, b: Named) bool {
+            return std.ascii.lessThanIgnoreCase(a.name, b.name);
+        }
+    }.lessThan);
+
+    for (entries.items) |e| {
+        const rel = if (rel_prefix.len > 0)
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_prefix, e.name })
+        else
+            try allocator.dupe(u8, e.name);
+        if (e.is_dir) {
+            defer allocator.free(rel);
+            const line = try std.fmt.allocPrint(allocator, "{s}/", .{rel});
+            errdefer allocator.free(line);
+            try out.append(allocator, line);
+            const child_abs = try joinPath(allocator, dir_abs, e.name);
+            defer allocator.free(child_abs);
+            try lsRecurse(io, allocator, child_abs, rel, remaining - 1, out);
+        } else {
+            errdefer allocator.free(rel);
+            try out.append(allocator, rel);
+        }
+    }
+}
 
 fn toolLs(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8) error{OutOfMemory}!Result {
     var args_arena = std.heap.ArenaAllocator.init(allocator);
@@ -1381,6 +1509,40 @@ fn toolLs(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8) 
         } else {
             return fail(allocator, "Path not found: {s}", .{list_path});
         }
+    }
+
+    // depth > 0：递归列出（相对路径，目录带 '/' 后缀）
+    if (args.depth > 0) {
+        const depth: u32 = @intCast(@min(args.depth, 32));
+        var paths = std.ArrayListUnmanaged([]u8){ .items = &.{}, .capacity = 0 };
+        defer {
+            for (paths.items) |p| allocator.free(p);
+            paths.deinit(allocator);
+        }
+        try lsRecurse(io, allocator, abs, "", depth, &paths);
+        if (paths.items.len == 0) return ok(allocator, "(empty directory)", .{});
+
+        const limit: usize = if (args.limit > 0) @intCast(args.limit) else 500;
+        var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+        errdefer out.deinit(allocator);
+        var shown: usize = 0;
+        var byte_capped = false;
+        for (paths.items) |p| {
+            if (shown >= limit) break;
+            if (out.items.len + p.len + 1 > cap_bytes) {
+                byte_capped = true;
+                break;
+            }
+            try out.appendSlice(allocator, p);
+            try out.append(allocator, '\n');
+            shown += 1;
+        }
+        if (byte_capped or paths.items.len > limit) {
+            const notice = try std.fmt.allocPrint(allocator, "\n[Showing {d} of {d} entries. Use a narrower path or increase limit.]", .{ shown, paths.items.len });
+            defer allocator.free(notice);
+            try out.appendSlice(allocator, notice);
+        }
+        return .{ .content = try out.toOwnedSlice(allocator), .is_error = false };
     }
 
     var dir = Dir.openDirAbsolute(io, abs, .{ .iterate = true }) catch {
@@ -1696,6 +1858,125 @@ test "tools: edit 生成行号 diff 展示" {
             "    9   l8\n" ++
             "     …";
         try testing.expectEqualStrings(expected, r.display.?);
+    }
+}
+
+test "tools: edit 匹配失败时给出诊断线索" {
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    defer threaded.deinit();
+
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+
+    const root_name = "skynet_test_edit_diag";
+    const root = try std.fs.path.join(testing.allocator, &.{ cwd, root_name });
+    defer testing.allocator.free(root);
+    removeTree(io, testing.allocator, root);
+    defer removeTree(io, testing.allocator, root);
+
+    {
+        const r = try execute(testing.allocator, io, cwd, "write", "{\"path\":\"skynet_test_edit_diag/a.txt\",\"content\":\"alpha\\nbeta   \\ngamma\\n\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+    }
+    {
+        // 行尾空白差异：文件 "beta   \ngamma"，old "beta\ngamma" → 精确失败、归一化可匹配
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/a.txt\",\"old_string\":\"beta\\ngamma\",\"new_string\":\"B\\nG\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "trailing whitespace") != null);
+    }
+    {
+        // 近似位置：首行存在但整体不匹配
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/a.txt\",\"old_string\":\"gamma\\nDELTA_NOT_PRESENT\",\"new_string\":\"x\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "appears at line 3") != null);
+    }
+    {
+        // 完全无关：无 Hint（且不应崩）
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/a.txt\",\"old_string\":\"ZZZ_NOT_IN_FILE_AT_ALL\",\"new_string\":\"x\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "Hint:") == null);
+    }
+}
+
+test "tools: ls 递归（depth 参数、目录后缀、跳过规则、limit 提示）" {
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    defer threaded.deinit();
+
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+
+    const root_name = "skynet_test_ls_depth";
+    const root = try std.fs.path.join(testing.allocator, &.{ cwd, root_name });
+    defer testing.allocator.free(root);
+    removeTree(io, testing.allocator, root);
+    defer removeTree(io, testing.allocator, root);
+
+    // 构造：a.txt / sub/b.txt / sub/deep/c.txt / .git/ignored
+    {
+        const r = try execute(testing.allocator, io, cwd, "write", "{\"path\":\"skynet_test_ls_depth/a.txt\",\"content\":\"a\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+    }
+    {
+        const r = try execute(testing.allocator, io, cwd, "write", "{\"path\":\"skynet_test_ls_depth/sub/b.txt\",\"content\":\"b\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+    }
+    {
+        const r = try execute(testing.allocator, io, cwd, "write", "{\"path\":\"skynet_test_ls_depth/sub/deep/c.txt\",\"content\":\"c\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+    }
+    {
+        const r = try execute(testing.allocator, io, cwd, "write", "{\"path\":\"skynet_test_ls_depth/.git/ignored\",\"content\":\"x\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+    }
+
+    {
+        // depth=1：只列一层
+        const r = try execute(testing.allocator, io, cwd, "ls", "{\"path\":\"skynet_test_ls_depth\",\"depth\":1}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "a.txt") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "sub/") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "sub/b.txt") == null); // 未下钻
+        try testing.expect(std.mem.indexOf(u8, r.content, ".git") == null); // 跳过
+    }
+    {
+        // depth=2：下钻一层（相对路径、目录带 /）
+        const r = try execute(testing.allocator, io, cwd, "ls", "{\"path\":\"skynet_test_ls_depth\",\"depth\":2}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "sub/b.txt") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "sub/deep/") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "sub/deep/c.txt") == null); // 第三层不下钻
+    }
+    {
+        // depth=0（默认）：只列当前层，与原行为一致
+        const r = try execute(testing.allocator, io, cwd, "ls", "{\"path\":\"skynet_test_ls_depth\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "a.txt") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "sub") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "b.txt") == null); // 不递归
     }
 }
 
