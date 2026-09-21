@@ -8333,6 +8333,10 @@ fn drawInputStatus(state: *AppState, area: Rect, buf: *Buffer) void {
                 const hit_color: tui.style.Color = if (hit >= 80) .green else if (hit >= 50) .yellow else .red;
                 _ = drawStatusSegment(buf, x, end_x, area.y, hit_text, .{ .fg = hit_color });
             }
+        } else if (state.usage_estimated) {
+            // 尚无真实 usage（重启/新建会话后）：显示占位而非整块消失，
+            // 避免"缓存命中率去哪了"的困惑；发一条消息后由真实值替换
+            _ = drawStatusSegment(buf, x, end_x, area.y, " · 缓存 — 暂无数据 ", .{ .fg = .dark_gray });
         }
     } else if (provider_name.len > 0) {
         var sb: [192]u8 = undefined;
@@ -11861,6 +11865,48 @@ test "状态栏：缓存命中率百分比与着色" {
     const text3 = std.mem.trimEnd(u8, &line, " ");
     try std.testing.expect(std.mem.endsWith(u8, text3, " 20.0k/104.9k 19%"));
     try std.testing.expect(buf3.get(@intCast(std.mem.indexOf(u8, text3, "19%").?), 0).?.fg.eql(tui.style.Color.red));
+
+    // 估算态（重启/新建会话，无真实 usage）：显示占位而非整块消失
+    state.context_usage = .{ .input_tokens = 104_900 };
+    state.usage_estimated = true;
+    var buf4 = try tui.render.Buffer.init(std.testing.allocator, 200, 1);
+    defer buf4.deinit();
+    drawInputStatus(&state, .{ .x = 0, .y = 0, .width = 200, .height = 1 }, &buf4);
+    // 直接读原始 cell（绕过 renderRowText 的 ASCII 置换）验证占位文本。
+    // 整行远超 tail_buf，故从右往左收集再反转，只保留尾部。
+    const expected_tail = " · 缓存 — 暂无数据 ";
+    var tail_buf: [256]u8 = undefined;
+    var tail_len: usize = 0;
+    var col: usize = 200;
+    while (col > 0) {
+        col -= 1;
+        const cell = buf4.get(@intCast(col), 0).?;
+        if (cell.width == 0) continue; // 宽字符续格：无独立字符
+        if (cell.char == ' ' and tail_len == 0) continue; // 跳过行尾空白
+        var enc: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cell.char, &enc) catch 0;
+        if (tail_len + n > tail_buf.len) break;
+        var k: usize = n;
+        while (k > 0) {
+            k -= 1;
+            tail_buf[tail_len] = enc[k];
+            tail_len += 1;
+        }
+    }
+    // 反转得到正序尾部
+    std.mem.reverse(u8, tail_buf[0..tail_len]);
+    const raw4 = tail_buf[0..tail_len];
+    try std.testing.expect(std.mem.endsWith(u8, raw4, std.mem.trimEnd(u8, expected_tail, " ")));
+
+    // 有真实 usage 但缓存为 0（全 miss）：不显示占位，正常走命中率分支
+    state.context_usage = .{ .input_tokens = 104_900, .cached_tokens = 0 };
+    state.usage_estimated = false;
+    var buf5 = try tui.render.Buffer.init(std.testing.allocator, 160, 1);
+    defer buf5.deinit();
+    drawInputStatus(&state, .{ .x = 0, .y = 0, .width = 160, .height = 1 }, &buf5);
+    renderRowText(&buf5, &line);
+    const text5 = std.mem.trimEnd(u8, &line, " ");
+    try std.testing.expect(std.mem.indexOf(u8, text5, "缓存 —") == null);
 }
 
 test "进行中指示：spinner 帧按时间推导" {
