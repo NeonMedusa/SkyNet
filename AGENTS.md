@@ -62,7 +62,7 @@ zig-out/bin/SkyNet.exe compact -session 3 -db skynet.db --json # 手动压缩（
 - `--json` 字段：`session_id/content/model/input_tokens/cached_tokens/output_tokens/tool_calls/error_message`；
   **不含思考内容与工具原文**（那些只落库）
 - `--max-chars N` 截断文本模式回答；`--max-context N`、`--keep-tokens N` 用于小窗口测试自动压缩
-- 工具在**调用时的 cwd** 执行；沙箱目录可用 `C:\Users\32182\Develop\TEST`
+- 工具在**调用时的 cwd** 执行；需要隔离的沙箱目录用 `tmp/` 下自建（已 git 忽略）
 - 默认使用 `config.json` 里的真实 provider（会产生真实费用）；mock 测试建议在临时目录放置自己的
   `config.json` 并用 `-config`/`-db` 指向临时文件
 - Windows 控制台读 UTF-8 输出建议 `[System.IO.File]::ReadAllText($path, [Text.Encoding]::UTF8)`；
@@ -109,7 +109,7 @@ role='summary' 的消息（摘要原文，FTS 可搜）
   1. 坐标：每帧 `drawInput` 计算插入点屏幕坐标（`state.term_cursor_*`，基于 `inputCursorScreenPos`）；
   2. 定位：render 回调写入 `terminal.pending_cursor`，由 zigtui `flush` 作为**帧尾指令**随同步块输出
      （单一字节流通道）。**不要改回 `terminal.setCursor`**：独立 Win32 调用与帧字节流是两条通道、
-     时序不可控，IME UI 会在"最后写入格子"与目标位置间闪烁（已踩坑）；
+     时序不可控，IME UI 会在"最后写入格子"与目标位置间闪烁；
   3. 显隐：主循环按模式切换（`want_cursor`）——正常模式 `showCursor`，菜单模式 `hideCursor`；
   4. **主输入框禁用应用层方块光标**（`TextArea.draw_fake_cursor=false`）：方块与 IME 组合串重叠，
      且闪烁时重写该格会让终端连同组合串一起重绘（组合串闪烁的根因）；表单输入框保留方块光标
@@ -126,10 +126,15 @@ role='summary' 的消息（摘要原文，FTS 可搜）
   ④ 绘制循环依赖"缓存行数 == 逐行走行数"这一不变量（用于整条跳过视口之上的消息），改动
   `messageRowCount` 的计行逻辑时注意同步
 - 测试会话标题用 `agent-test` 前缀，方便识别和清理
-- 工具 bug 优先自己修，不要让 TUI 里的 AI 代劳（它的会话随时可能因 schema 变更被清空）
+- **临时脚本/一次性验证代码一律写到 `tmp/` 下**（该目录已被 `.gitignore` 排除，零误提交风险，
+  且可复用）。可复用的验证脚本沉淀在 `tmp/scripts/`（如 `scroll_mem_test.py` 滚动内存验证、
+  `idle_mem_test.py` 闲置零增长验证、`copy_live_db.py` 复制真实库+配置供测试）；
+  一次性脚本（如启动真进程 + 按键注入）不适合做成仓库内正式测试——正式回归用单元测试
+  （不弹窗），内存泄漏依赖 `std.testing.allocator` 检测
+- TUI 里的会话随时可能因 schema 变更被清空（拒绝打开/重命名闸门），不要依赖它保存重要信息
 - 改行为前先跑 `zig build test`；涉及真实 provider 的验证用小会话 + `--max-chars`
 - 模糊宽度 auto 档的内置推荐名单在 `src/main.zig` 的 `auto_recommended_wide`
-  （作者长期维护：发现「单格字形被挤压」的字符族就往里加范围；用户配置 `width_overrides` 永远优先）
+  （维护指引：发现「单格字形被挤压」的字符族就往里加范围；用户配置 `width_overrides` 永远优先）
 - **新增模块的测试要在 `src/main.zig` 末尾的聚合块里 `_ = @import("xxx.zig");`**，否则 `zig build test` 不会收集它们
 - 连接被拒（mock 未启动但标记残留、provider 未启动等）时，std 的 io worker 会向 stderr 打印
   `error.Unexpected NTSTATUS=0xc0000236 (CONNECTION_REFUSED)` 及整段堆栈——这是 Zig 0.16 std 的

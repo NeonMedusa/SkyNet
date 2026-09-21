@@ -5373,9 +5373,11 @@ const GateOutcome = enum {
 
 /// 判定并处理版本不符：弹窗让用户明确选择（不静默落入内存模式）。
 /// 文案中的版本号与备份名均取实际值。
-fn runVersionGate(allocator: Allocator, io: Io, backend: *tui.backend.NativeBackend) GateOutcome {
-    // TUI 只使用默认库；CLI 的 -db 走 fail-fast（见 cliOpenDb）
-    const path: [:0]const u8 = "skynet.db";
+fn runVersionGate(allocator: Allocator, io: Io, backend: *tui.backend.NativeBackend, db_path: []const u8) GateOutcome {
+    // 尊重 -db（与 TUI 打开库的路径一致）；CLI 子命令的 -db 走 fail-fast（见 cliOpenDb）
+    const path_z = allocator.dupeZ(u8, db_path) catch return .normal;
+    defer allocator.free(path_z);
+    const path: [:0]const u8 = path_z;
     const mm = db_mod.probeVersionMismatch(allocator, io, path) orelse return .normal;
     if (mm.db_version == mm.program_version) return .normal; // 版本一致：打开失败另有原因，维持原流程
 
@@ -5454,6 +5456,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer Log.deinit();
 
     // 无界面子命令（ask/new/sessions/messages/help）：不初始化终端，直接执行后退出
+    var tui_db_path: []const u8 = "skynet.db";
     {
         var arg_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
         defer arg_it.deinit();
@@ -5464,13 +5467,19 @@ pub fn main(init: std.process.Init) !u8 {
         if (arg_list.items.len > 0 and isCliCommand(arg_list.items[0])) {
             std.process.exit(runCli(init, arg_list.items));
         }
+        // TUI 分支：同样解析 -db（与 CLI 子命令一致；默认 skynet.db）
+        if (arg_list.items.len > 0) {
+            if (cli.parseCliArgs(arg_list.items)) |parsed| {
+                if (parsed.db_path.len > 0) tui_db_path = parsed.db_path;
+            }
+        }
     }
 
     var backend = try tui.backend.init(allocator, io);
     defer backend.deinit();
 
     // 启动闸门：数据库版本不符时先弹窗让用户明确选择（不静默进入内存模式）
-    const gate = runVersionGate(allocator, io, &backend);
+    const gate = runVersionGate(allocator, io, &backend, tui_db_path);
     switch (gate) {
         .quit_cancelled => {
             cliWriteStdout(io, "已取消：未对任何文件做改动。旧数据如需迁移，把 skynet.db 与 SkyNet 源码交给 AI 写一次性转换脚本即可（详见 README）。\n");
@@ -5510,12 +5519,17 @@ pub fn main(init: std.process.Init) !u8 {
     // 模糊宽度策略（①←≤…按 1 列还是 2 列）：必须在首次绘制前应用
     applyAmbiguousWidth(&state);
 
-    // 打开数据库并恢复/新建会话
+    // 打开数据库并恢复/新建会话（尊重 -db；默认 skynet.db，与 CLI 子命令一致）
     var db_open_err: ?anyerror = null;
-    state.db = db_mod.Db.open(allocator, io) catch |e| blk: {
-        db_open_err = e;
-        break :blk null;
-    };
+    const db_path_z = allocator.dupeZ(u8, tui_db_path) catch null;
+    defer if (db_path_z) |p| allocator.free(p);
+    state.db = if (db_path_z) |p|
+        db_mod.Db.openFile(allocator, io, p) catch |e| blk: {
+            db_open_err = e;
+            break :blk null;
+        }
+    else
+        null;
     if (state.db) |*db| {
         const latest = db.latestSession() catch null;
         if (latest) |s| {

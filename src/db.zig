@@ -256,10 +256,8 @@ pub const Db = struct {
     /// TUI 启动闸门据此提示用户：旧库可经确认重命名为备份后新建空库（见 main.zig）。
     pub const schema_version: i64 = 7;
 
-    pub fn open(allocator: Allocator, io: Io) !Db {
-        return openFile(allocator, io, "skynet.db");
-    }
-
+    /// 打开数据库。注意：不提供"默认路径"的便利函数——那会让调用方（曾导致
+    /// TUI 忽略 `-db` 的 bug）忘记传路径。所有调用方都显式给出 filename。
     pub fn openFile(allocator: Allocator, io: Io, filename: [:0]const u8) !Db {
         // 版本校验安排在打开 SQLite 之前（纯读文件头）：被拒绝的库连 WAL 恢复都不触发，
         // 真正做到"一个字节都不被改动"。current == 0 = 全新库（无 schema）。
