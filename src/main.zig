@@ -504,8 +504,12 @@ const StreamJob = struct {
     transcript: std.ArrayListUnmanaged(TranscriptEntry) = .{ .items = &.{}, .capacity = 0 },
     /// 当前回合累积的正文（arena 所有）
     content: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
-    /// 当前回合累积的思考内容（arena 所有，每轮清空）
+    /// 当前轮累积的思考内容（arena 所有，每轮清空）
     reasoning: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    /// 当前轮（最后一次尝试）的产出是否已写入转录。
+    /// 轮开始时置 false，appendAssistantTurn 成功后置 true；
+    /// finalize 据此判断"是否还需要用显示消息兜底落库"。
+    turn_flushed: bool = false,
     reasoning_start_ms: i64 = 0,
     reasoning_end_ms: i64 = 0,
     /// 工具渲染元数据（与 transcript 中的 tool 消息按 id 对应；arena 所有）
@@ -2685,11 +2689,50 @@ const AppState = struct {
     }
 
     /// 收尾：join 线程、转录入历史、落库、清理共享状态（err 非空时显示错误）
+    /// 把流缓冲里尚未消费的增量（正文/思考）搬进显示消息。
+    /// 与 pumpStream 的区别：不处理事件、不做状态检查（避免从 finalizeStream
+    /// 调用时递归），仅用于收尾前把最后一段增量补上。
+    fn drainStreamBuffers(self: *AppState) void {
+        var content: ?[]u8 = null;
+        var reasoning: ?[]u8 = null;
+        self.stream_mutex.lockUncancelable(self.io);
+        if (self.stream_buf.items.len > self.stream_consume_pos) {
+            const slice = self.stream_buf.items[self.stream_consume_pos..];
+            if (self.allocator.dupe(u8, slice)) |copy| {
+                content = copy;
+                self.stream_consume_pos = self.stream_buf.items.len;
+            } else |_| {}
+        }
+        if (self.stream_reasoning_buf.items.len > self.stream_reasoning_pos) {
+            const slice = self.stream_reasoning_buf.items[self.stream_reasoning_pos..];
+            if (self.allocator.dupe(u8, slice)) |copy| {
+                reasoning = copy;
+                self.stream_reasoning_pos = self.stream_reasoning_buf.items.len;
+            } else |_| {}
+        }
+        self.stream_mutex.unlock(self.io);
+
+        if (reasoning) |c| {
+            self.appendStreamReasoning(c);
+            self.allocator.free(c);
+        }
+        if (content) |c| {
+            self.appendStreamChunk(c);
+            self.allocator.free(c);
+        }
+    }
+
     fn finalizeStream(self: *AppState, err: ?ai.AIError) void {
         if (self.stream_thread) |t| {
             t.join();
             self.stream_thread = null;
         }
+
+        // 线程结束后补搬一次缓冲尾部：把网络线程最后写入、主循环还没搬走的增量
+        // （思考/正文）刷进显示消息，否则思考最后一段会被截。
+        // 注意：不能调用 pumpStream()——finalizeStream 本身可能由 pumpStream 调用
+        // （状态检查阶段），会无限递归；这里只做增量搬运。
+        self.drainStreamBuffers();
 
         // 收尾前折叠最后一个思考块（最终回答可能没有正文，或思考中被取消）
         self.collapseStreamingThought();
@@ -2719,11 +2762,6 @@ const AppState = struct {
                 error_detail = self.allocator.dupe(u8, job.error_detail) catch "";
             }
 
-            // 是否已有带正文的 assistant 回复（决定是否需要显示消息兜底落库）
-            var has_final = false;
-            for (job.transcript.items) |entry| {
-                if (std.mem.eql(u8, entry.msg.role, "assistant") and entry.msg.content.len > 0) has_final = true;
-            }
             var worker_persisted_max: i64 = 0;
 
             for (job.transcript.items) |entry| {
@@ -2785,12 +2823,15 @@ const AppState = struct {
             // worker 落库的行不算"外部写入"：同步游标，避免外部轮询把它们当新消息重复加载
             if (worker_persisted_max > self.last_seen_msg_id) self.last_seen_msg_id = worker_persisted_max;
 
-            // 取消/出错时当前回合可能未入转录：用显示消息兜底落库
-            if (!has_final) {
+            // 取消/出错时当前回合可能未入转录：用显示消息兜底落库。
+            // has_final 只看"整回合有没有带正文的 assistant"——工具轮之后的那一轮
+            // 中断时，前面轮次的正文会让它误判为已收尾。turn_flushed 精确标记
+            // "当前轮是否已进转录"，据此判断是否需要兜底。
+            if (!job.turn_flushed) {
                 if (self.streaming_msg_idx) |idx| {
                     if (idx < self.messages.items.len) {
                         const content = self.messages.items[idx].content;
-                        if (content.len > 0) {
+                        if (content.len > 0 or reasoning_text.len > 0) {
                             _ = self.persistMessage(.{
                                 .role = "assistant",
                                 .content = content,
@@ -6194,6 +6235,7 @@ fn appendAssistantTurn(job: *StreamJob, arena: Allocator, calls: []const ai.Tool
     };
     try job.transcript.append(arena, entry);
     job.history = try extendHistory(arena, job.history, &[_]ai.Message{msg});
+    job.turn_flushed = true;
 }
 
 /// 工具调用参数摘要（key=value 形式，截断到 ~120 字符）
@@ -6478,6 +6520,7 @@ fn streamWorker(job: *StreamJob) void {
             tool_calls = .{ .allocator = arena };
             job.content.clearRetainingCapacity();
             job.reasoning.clearRetainingCapacity();
+            job.turn_flushed = false;
             job.reasoning_start_ms = 0;
             job.reasoning_end_ms = 0;
 
@@ -6541,8 +6584,10 @@ fn streamWorker(job: *StreamJob) void {
         }
 
         if (terminal_err) |err| {
-            // 失败/取消：保留已累积的内容与工具调用后退出（同样实时落库）
-            if (job.content.items.len > 0 or tool_calls.items.items.len > 0) {
+            // 失败/取消：保留已累积的内容与工具调用后退出（同样实时落库）。
+            // 思考也要计入：只有思考、正文为空的轮次（思考中取消）同样要进转录，
+            // 否则 finalize 的兜底是唯一防线（而它依赖显示消息，链路更长）
+            if (job.content.items.len > 0 or tool_calls.items.items.len > 0 or job.reasoning.items.len > 0) {
                 if (appendAssistantTurn(job, arena, tool_calls.items.items)) |_| {
                     if (ensureWorkerDb(job, &worker_db)) |wdb| {
                         persistTranscriptEntry(job, wdb, job.transcript.items.len - 1, job.history.len - 1);
@@ -11181,6 +11226,156 @@ test "usage 锚点：只认正常结束的回合，取消不设锚点" {
     state.finalizeStream(null);
     try std.testing.expect(state.usage_anchor_len != null);
     try std.testing.expectEqual(@as(u64, 20_500), state.usage_anchor_tokens);
+}
+
+test "finalize 兜底落库：只有思考、正文为空时思考仍入库（思考中退出场景）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    const db_path: [:0]const u8 = "skynet_test_finalize_reasoning.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_finalize_reasoning.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_finalize_reasoning.db-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_finalize_reasoning.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_finalize_reasoning.db-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer if (state.db) |*d| d.deinit();
+    const sid = try state.db.?.createSession("");
+    state.session_id = sid;
+    defer {
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+    }
+    state.appendHistory("system", "sys");
+    state.appendHistory("user", "问");
+
+    // 模拟"思考中取消"：显示消息只有思考、正文为空
+    state.messages.append(alloc, .{
+        .content = "",
+        .style = .{},
+        .reasoning = alloc.dupe(u8, "思考到一半就退出了") catch unreachable,
+        .reasoning_ms = 500,
+    }) catch unreachable;
+    state.streaming_msg_idx = 0;
+
+    const job = try alloc.create(StreamJob);
+    job.* = .{
+        .app = &state,
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .io = io,
+        .cwd = ".",
+        .model = "m",
+        .endpoint = "",
+        .api_key = "",
+        .provider_name = "p",
+        .db_path = db_path,
+        .session_id_num = sid,
+        .history = &.{},
+    };
+    state.stream_job = job;
+    state.setStreamStatus(.canceled);
+
+    // finalizeStream 内部会 job.deinit() 并置空 stream_job（不能再手动释放）
+    state.finalizeStream(null);
+
+    // 思考仍应落库（正文为空不阻止落库）
+    const rows = try state.db.?.loadMessages(sid);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("assistant", rows[0].role);
+    try std.testing.expectEqualStrings("", rows[0].content);
+    try std.testing.expectEqualStrings("思考到一半就退出了", rows[0].reasoning);
+}
+
+test "finalize 兜底落库：工具轮之后的轮次中断，当前轮思考仍入库（has_final 误判修复）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    const db_path: [:0]const u8 = "skynet_test_finalize_midturn.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_finalize_midturn.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_finalize_midturn.db-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_finalize_midturn.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_finalize_midturn.db-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer if (state.db) |*d| d.deinit();
+    const sid = try state.db.?.createSession("");
+    state.session_id = sid;
+    defer {
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+    }
+    state.appendHistory("system", "sys");
+    state.appendHistory("user", "问");
+
+    // 显示消息：当前轮（工具轮之后）只有思考、正文为空
+    state.messages.append(alloc, .{
+        .content = "",
+        .style = .{},
+        .reasoning = alloc.dupe(u8, "第二轮思考到一半就中断了") catch unreachable,
+        .reasoning_ms = 300,
+    }) catch unreachable;
+    state.streaming_msg_idx = 0;
+
+    const job = try alloc.create(StreamJob);
+    job.* = .{
+        .app = &state,
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .io = io,
+        .cwd = ".",
+        .model = "m",
+        .endpoint = "",
+        .api_key = "",
+        .provider_name = "p",
+        .db_path = db_path,
+        .session_id_num = sid,
+        .history = &.{},
+    };
+    const arena = job.arena.allocator();
+
+    // 关键前置：转录里已有一条"带正文的 assistant"（工具轮 1 的产出）→ has_final 会被误判
+    try job.transcript.append(arena, .{
+        .msg = .{ .role = "assistant", .content = try arena.dupe(u8, "第一轮正文") },
+        .reasoning = "",
+        .reasoning_ms = 0,
+        .usage = .{},
+    });
+    // 当前轮（轮 2）在 job 侧的累积：只有思考
+    try job.reasoning.appendSlice(arena, "第二轮思考到一半就中断了");
+
+    state.stream_job = job;
+    state.setStreamStatus(.canceled);
+    state.finalizeStream(null);
+
+    // 两行都应落库：转录里的轮 1（未带 db_id，走批量落库）+ 当前轮思考兜底
+    const rows = try state.db.?.loadMessages(sid);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("第一轮正文", rows[0].content);
+    try std.testing.expectEqualStrings("", rows[1].content);
+    try std.testing.expectEqualStrings("第二轮思考到一半就中断了", rows[1].reasoning);
 }
 
 test "模糊宽度档位解析：显式 wide/narrow，其余一律 auto" {
