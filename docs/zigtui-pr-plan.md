@@ -63,8 +63,8 @@
 
 | # | 标题草案 | 分支 | 组成 | 状态 |
 |---|---|---|---|---|
-| 1 | `render: tolerate malformed UTF-8 instead of panicking` | `utf8-tolerance` | 6c0105e 的英文移植 | **已推送**（`653b2f2` @ origin/utf8-tolerance） |
-| 2 | `fix(windows): arm terminal restore hook and save console state` | `windows-restore` | b173771 的 restore 部分 | **已推送**（`fa4aadc` @ origin/windows-restore） |
+| 1 | `render: tolerate malformed UTF-8 instead of panicking` | `utf8-tolerance` | 6c0105e 的英文移植 | **已合并**（upstream `1002ef6`，PR #38） |
+| 2 | `fix(windows): arm terminal restore hook and save console state` | `windows-restore` | b173771 的 restore 部分 | **已合并**（upstream `69b3f34`，PR #39） |
 | 3 | `terminal: emit pending cursor as the last instruction of a frame` | `cursor-frame-tail`（待建） | 0b3b877 的英文移植（`pending_cursor` + mock backend 测试） | 本地已有（skynet 分支 `0b3b877`），待移植/推送 |
 | 4 | `terminal: DECSCUSR cursor shape support` | `decscusr`（待建） | e762dda 的英文移植（`CursorShape` + `setCursorShape` + 退出复位） | 本地已有（skynet 分支 `e762dda`），待移植/推送 |
 | 5 | `feat: bracketed paste events (POSIX backend)` | `bracketed-paste`（待建） | Parser + POSIX 接线 + LF 语义 | 未开始 |
@@ -95,13 +95,27 @@ IME 漂移/闪烁问题已在真实环境解决，说服力强；mock backend �
 - 跨平台验证：本机 Windows `zig build test`（70/70）+ `zig build examples` + 对
   `x86_64-linux-gnu` 的 `zig test -fno-emit-bin` 交叉编译检查（restore.zig 与 lib.zig）。
 
-### fork 遗留问题（待处理）
+### fork 遗留问题（已解决）
 
-- `skynet` 分支的 `restore.arm` 在 Windows 上于**进入 raw 模式之后**调用、且在
-  `arm` 内部用 `GetConsoleMode` 快照——快照到的是 raw 模式，panic 路径会把 raw
-  模式写回控制台（正常退出不受影响）。PR-2 已改为显式传入原始模式；
-  **该修复在 PR-2 合并、`skynet` rebase 后自动吸收**。若想提前修复（PR 未合并期间
-  也生效），可把 `skynet` 分支的快照点提前到 SetConsoleMode 之前（一行改动）。
+- ~~`skynet` 分支的 `restore.arm` 在 Windows 上于进入 raw 模式之后调用、快照到 raw 模式~~
+  ——PR-2 合并后 `skynet` 已 rebase（2026-09-21），上游 `WinMode` 显式传入原始模式，
+  问题根除；本分支的 restore.zig 已与上游完全一致（rebase 时整文件取上游版）。
+  本地对 restore.zig 的唯一残留差异是 leave_sequence 里的 `\x1b[0 q`（光标复位），
+  属 PR-4 组成，待 PR-4 移植时一并处理。
+
+## Rebase 记录（2026-09-21：PR-1/PR-2 合并后）
+
+- `upstream/master` 合入 PR #39（`69b3f34`）与 PR #38（`1002ef6`），并发布 tag `v0.1.0`；
+- `skynet` rebase 至新上游（备份分支 `skynet-backup` @ 旧 `fad915e`，保留至确认稳定后删除）；
+  过程中解决两类冲突：
+  - **已回贡部分 → 取上游版**：`restore.zig` 整文件、`render/mod.zig`+`width.zig` 的
+    UTF-8 解码路径（6c0105e 的内联解码被 PR-1 的 `decodeCharAt` 取代，语义等价）；
+  - **未回贡部分 → 保留本地并适配新 API**：`windows.zig` 的 VT 输入/bracketed paste
+    （与上游 `restore.arm` 新签名融合）、模糊宽度（`c0a8f25` 整体保留，解码处改用
+    `decodeCharAt`）、光标两项（`0b3b877`/`e762dda`，无冲突）；
+- 验证：zigtui `zig build test` 101/101、`zig build examples` 通过；SkyNet 全量
+  168/168（5 mock）、TUI 冒烟正常；`skynet` 已 force-push 回 fork（`fad915e` → `8e4c585`），
+  主仓库 submodule 指针同步更新。
 
 ## 每个 PR 的工作流
 
