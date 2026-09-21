@@ -185,6 +185,14 @@ const Message = struct {
     /// 定格后的思考耗时（毫秒；从数据库恢复时直接使用）
     reasoning_ms: i64 = 0,
     reasoning_expanded: bool = false,
+    /// 来源数据库行 id（0 = 实时生成/内存消息）。窗口化按需重载的键。
+    db_id: i64 = 0,
+    /// 内容是否驻留内存（窗口化）：false 时 content/reasoning/md 已被卸载，
+    /// 仅保留行数缓存供滚动定位；滚回视口时按 db_id 从库里重新加载。
+    content_loaded: bool = true,
+    /// 工具块首行标题（窗口化重载时与 capBlockBody 重新拼回 content）。
+    /// 仅 db_id != 0 的加载路径工具块使用；实时消息不设。
+    tool_header: []const u8 = "",
     /// 行数缓存：drawMessages 每帧需要全部消息的行数，长会话下逐字符重算
     /// 会把输入/框选响应拖到不可用。缓存键 = 宽度 + 展开态 + 正文/思考字节数：
     /// 内容增改（各 append* 都是重新分配）、宽度变化、展开切换都会自动失效；
@@ -331,17 +339,10 @@ fn extractSelectionText(
     return out.toOwnedSlice(allocator);
 }
 
-const Utf8Char = struct { cp: u21, len: usize };
-
-fn decodeUtf8At(text: []const u8, i: usize) Utf8Char {
-    var len: usize = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-    if (i + len > text.len) len = 1;
-    const cp: u21 = if (len == 1)
-        text[i]
-    else
-        std.unicode.utf8Decode(text[i .. i + len]) catch 0xFFFD;
-    return .{ .cp = cp, .len = len };
-}
+// UTF-8 解码统一到 src/utf8.zig（此前 main/markdown/textarea 各有一份相同实现）
+const utf8 = @import("utf8.zig");
+const Utf8Char = utf8.Decoded;
+const decodeUtf8At = utf8.decodeAt;
 
 /// 片段内列偏移 → 字节偏移
 fn offsetInSegment(seg: SelSegment, col_off: u16) usize {
@@ -447,6 +448,8 @@ const StreamEvent = struct {
     /// 块内容（bash 输出 / edit diff 文本）
     payload: []u8 = &.{},
     is_error: bool = false,
+    /// 关联的数据库行 id（窗口化：回填到显示消息，使其滚出视口后可卸载/重载）
+    db_id: i64 = 0,
 };
 
 /// 单个工具调用的渲染元数据（落库 + 重启后重建工具块用；arena 所有）
@@ -660,6 +663,8 @@ const AppState = struct {
     terminal_height: u16 = 0,
     menu_visible_rows: usize = 0,
     message_visible_rows: usize = 0,
+    /// 窗口化开关：仅真实 TUI 运行时启用（测试与 CLI 关闭，避免干扰既有断言）
+    windowing_enabled: bool = false,
 
     // 会话选择状态
     session_list: []const db_mod.SessionListRow = &.{},
@@ -770,12 +775,18 @@ const AppState = struct {
 
     /// 用户消息：绿色文字 + 左侧粉紫色竖条
     fn addUserMessage(self: *AppState, content: []const u8) void {
+        self.addUserMessageDb(content, 0);
+    }
+
+    /// 带 db_id 的用户消息（窗口化按需重载的键；实时消息传 0）
+    fn addUserMessageDb(self: *AppState, content: []const u8, db_id: i64) void {
         if (content.len == 0) return;
         const owned = self.allocator.dupe(u8, content) catch return;
         self.messages.append(self.allocator, .{
             .content = owned,
             .style = .{ .fg = .green },
             .user = true,
+            .db_id = db_id,
         }) catch {
             self.allocator.free(owned);
             return;
@@ -821,6 +832,91 @@ const AppState = struct {
         if (msg.content.len > 0) self.allocator.free(msg.content);
         if (msg.reasoning) |r| self.allocator.free(r);
         if (msg.md) |md| md_mod.free(self.allocator, md);
+        if (msg.tool_header.len > 0) self.allocator.free(msg.tool_header);
+    }
+
+    /// 窗口化：卸载一条消息的驻留内容（保留行数缓存与元数据）。
+    /// 只对来自数据库（db_id != 0）、非展开思考、且确实占内存的消息生效。
+    fn unloadMessage(self: *AppState, msg: *Message, width: usize) void {
+        if (!msg.content_loaded or msg.db_id == 0) return;
+        // 先固化行数缓存（卸载后 messageRowCountCached 直接返回它）
+        _ = messageRowCountCached(msg, width);
+        if (msg.content.len > 0) {
+            self.allocator.free(msg.content);
+            msg.content = "";
+        }
+        if (msg.reasoning) |r| {
+            self.allocator.free(r);
+            msg.reasoning = null;
+        }
+        if (msg.md) |md| {
+            md_mod.free(self.allocator, md);
+            msg.md = null;
+        }
+        // 注意：tool_header 保留——它是重载工具块时拼回 content 的必需信息
+        // （来自 assistant 行的调用参数，单行重载时无法再取到），且只有一行文本
+        msg.content_loaded = false;
+    }
+
+    /// 窗口化：从数据库重载一条消息的内容（内容字段 + md 解析）。
+    /// 返回 false 表示无法重载（db 不可用/行已不存在），调用方应保留占位。
+    fn reloadMessage(self: *AppState, msg: *Message, width: usize) bool {
+        if (msg.content_loaded) return true;
+        const db = if (self.db) |*d| d else return false;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const rows = db.loadMessagesRange(scratch.allocator(), self.session_id, msg.db_id, msg.db_id) catch return false;
+        if (rows.len == 0) return false;
+        const row = rows[0];
+
+        // 按角色重建内容（与 addLoaded* 路径一致的形态）
+        if (msg.tool_block) |kind| {
+            const name = row.tool_name;
+            const display_text: []const u8 = if (row.tool_full.len > 0) row.tool_full else row.content;
+            const raw: []const u8 = if (row.is_error != 0)
+                display_text
+            else if (row.tool_display.len > 0)
+                row.tool_display
+            else
+                display_text;
+            const max_lines: usize = if (kind == .diff) 40 else 20;
+            const capped = capBlockBody(self.allocator, raw, max_lines) catch null;
+            defer if (capped) |c| self.allocator.free(c);
+            const body: []const u8 = if (capped) |c| c else raw;
+            const header: []const u8 = if (msg.tool_header.len > 0) msg.tool_header else name;
+            const joined = std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ header, body }) catch return false;
+            msg.content = joined;
+        } else if (msg.user) {
+            msg.content = self.allocator.dupe(u8, row.content) catch return false;
+        } else if (msg.tool_header.len > 0) {
+            // 非块工具的调用行（`→ Read path [limit=..] (982B)`）：
+            // 调用行文本存在 tool_header（卸载前保存），结果摘要从 DB 行重算，
+            // 拼回与实时路径一致的形态
+            const result = tools_mod.Result{
+                .content = @constCast(if (row.tool_full.len > 0) row.tool_full else row.content),
+                .is_error = row.is_error != 0,
+            };
+            const summary = summarizeToolResult(scratch.allocator(), result) catch "";
+            if (summary.len > 0) {
+                msg.content = std.fmt.allocPrint(self.allocator, "{s} ({s})", .{ msg.tool_header, summary }) catch return false;
+            } else {
+                msg.content = self.allocator.dupe(u8, msg.tool_header) catch return false;
+            }
+        } else {
+            // assistant：正文 + 思考
+            if (row.content.len > 0) {
+                const owned = self.allocator.dupe(u8, row.content) catch return false;
+                msg.content = owned;
+                msg.md = md_mod.parse(self.allocator, owned, md_mod.default_styles) catch null;
+            }
+            if (row.reasoning.len > 0) {
+                msg.reasoning = self.allocator.dupe(u8, row.reasoning) catch null;
+            }
+        }
+        msg.content_loaded = true;
+        msg.row_count_width = 0; // 让行数缓存按重载后的内容重算
+        _ = width;
+        return true;
     }
 
     /// 向对话历史追加一条消息（role 与 content 都会被复制，退出时统一释放）
@@ -907,7 +1003,10 @@ const AppState = struct {
             return;
         }
 
-        const rows = db.loadMessagesAfter(self.session_id, self.last_seen_msg_id) catch return;
+        // 增量加载同样走临时 arena：轮询是周期性的，滞留在 session arena 会持续累积
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const rows = db.loadMessagesAfterWith(scratch.allocator(), self.session_id, self.last_seen_msg_id) catch return;
         if (rows.len == 0) return;
 
         const offset_before = self.scroll_offset;
@@ -1290,6 +1389,17 @@ const AppState = struct {
             return;
         }
 
+        // 窗口化保护：选区跨到的消息若已卸载，先重载（否则复制出空内容）
+        if (self.windowing_enabled) {
+            const lo = @min(self.sel_anchor.msg, self.sel_current.msg);
+            const hi = @max(self.sel_anchor.msg, self.sel_current.msg);
+            if (hi < self.messages.items.len) {
+                for (self.messages.items[lo .. hi + 1]) |*m| {
+                    if (!m.content_loaded) _ = self.reloadMessage(m, self.message_wrap_width);
+                }
+            }
+        }
+
         const contents = self.allocator.alloc([]const u8, self.messages.items.len) catch return;
         defer self.allocator.free(contents);
         const reasonings = self.allocator.alloc([]const u8, self.messages.items.len) catch return;
@@ -1487,7 +1597,7 @@ const AppState = struct {
                     });
                 }
                 // 先恢复正文，再补工具提示行/块（与实时渲染顺序一致）
-                if (with_display) self.addLoadedAssistantMessage(row.content, row.reasoning, row.reasoning_ms);
+                if (with_display) self.addLoadedAssistantMessage(row.content, row.reasoning, row.reasoning_ms, row.id);
                 if (calls) |cs| {
                     for (cs) |c| {
                         call_idx.append(arena, .{ .id = c.id, .name = c.name, .arguments = c.arguments }) catch {};
@@ -1508,7 +1618,7 @@ const AppState = struct {
                 self.appendHistoryMessage(.{ .role = row.role, .content = row.content, .db_id = row.id });
             }
             if (with_display and std.mem.eql(u8, row.role, "user")) {
-                self.addUserMessage(row.content);
+                self.addUserMessageDb(row.content, row.id);
             }
         }
 
@@ -1520,7 +1630,7 @@ const AppState = struct {
     }
 
     /// 从数据库恢复的 AI 回复（Markdown + 思考块，思考块默认折叠）
-    fn addLoadedAssistantMessage(self: *AppState, content: []const u8, reasoning: []const u8, reasoning_ms: i64) void {
+    fn addLoadedAssistantMessage(self: *AppState, content: []const u8, reasoning: []const u8, reasoning_ms: i64, db_id: i64) void {
         // 纯工具调用轮（无正文也无思考）没有可显示内容：不创建空消息，否则 0 行消息
         // 会让相邻消息的间隔叠成两个空行（实时路径对这类回合也不会创建显示消息）
         if (content.len == 0 and reasoning.len == 0) return;
@@ -1543,6 +1653,7 @@ const AppState = struct {
             .md = parsed,
             .reasoning = owned_reasoning,
             .reasoning_ms = reasoning_ms,
+            .db_id = db_id,
         }) catch {
             if (owned_content.len > 0) self.allocator.free(owned_content);
             if (parsed) |md| md_mod.free(self.allocator, md);
@@ -1555,7 +1666,12 @@ const AppState = struct {
     /// 加载会话内容（含 compaction checkpoint；会清空当前历史/显示）
     fn loadSessionContent(self: *AppState, session_id: i64) void {
         const db = if (self.db) |*d| d else return;
-        const rows = db.loadMessages(session_id) catch {
+        // 大结果集用临时 arena 承接，处理完立即整体释放：
+        // fridge 的 fetchAll 默认分配在 session arena（仅 deinit 时释放），
+        // 长会话每次加载都会把全部行永久滞留其中
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const rows = db.loadMessagesWith(scratch.allocator(), session_id) catch {
             self.addMessage("加载会话失败", .{ .fg = .red });
             return;
         };
@@ -1582,7 +1698,10 @@ const AppState = struct {
     /// 仅重建内存历史（不动显示）：工具循环中途压缩后让主线程与 DB 对齐
     fn rebuildHistoryFromDb(self: *AppState) void {
         const db = if (self.db) |*d| d else return;
-        const rows = db.loadMessages(self.session_id) catch return;
+        // 同上：大结果集走临时 arena，处理完即释放
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const rows = db.loadMessagesWith(scratch.allocator(), self.session_id) catch return;
         const checkpoint = db.latestCompaction(self.session_id) catch null;
         self.clearHistory();
         self.last_seen_msg_id = 0;
@@ -2336,16 +2455,28 @@ const AppState = struct {
         const header = toolHeaderText(arena_state.allocator(), name, args_json) orelse return false;
 
         const owned = self.allocator.dupe(u8, header) catch return false;
+        // 窗口化：块标题单独留一份（卸载后重载时拼回内容用）
+        const header_owned = self.allocator.dupe(u8, header) catch "";
         self.messages.append(self.allocator, .{
             .content = owned,
             .style = .{ .fg = .white },
             .tool_block = kind,
+            .tool_header = header_owned,
         }) catch {
             self.allocator.free(owned);
+            if (header_owned.len > 0) self.allocator.free(header_owned);
             return false;
         };
         self.preserveViewOnAppend();
         return true;
+    }
+
+    /// 窗口化：给最后一条消息记下工具调用行文本（卸载后重载时恢复该行）
+    fn setLastToolHeader(self: *AppState, line: []const u8) void {
+        if (self.messages.items.len == 0) return;
+        const msg = &self.messages.items[self.messages.items.len - 1];
+        if (msg.tool_header.len > 0) self.allocator.free(msg.tool_header);
+        msg.tool_header = self.allocator.dupe(u8, line) catch "";
     }
 
     /// 向最近的工具块追加正文（bash 输出 / diff）；失败返回 false
@@ -2571,7 +2702,19 @@ const AppState = struct {
             for (events.items) |ev| {
                 const block_kind = toolBlockKind(ev.name);
                 switch (ev.kind) {
-                    .turn_end => self.closeCurrentTurn(),
+                    .turn_end => {
+                        // 窗口化：把刚落库的 assistant 行 id 回填到当前显示消息，
+                        // 使其滚出视口后可被卸载/重载（必须在 closeCurrentTurn 之前，
+                        // 后者会清空 streaming_msg_idx）
+                        if (ev.db_id != 0) {
+                            if (self.streaming_msg_idx) |idx| {
+                                if (idx < self.messages.items.len) {
+                                    self.messages.items[idx].db_id = ev.db_id;
+                                }
+                            }
+                        }
+                        self.closeCurrentTurn();
+                    },
                     .user_sent => self.setToast("排队消息已送达"),
                     .retry_start => {
                         // 丢弃失败尝试的部分显示（思考/正文），改为一行重试提示
@@ -2586,6 +2729,8 @@ const AppState = struct {
                             defer arena_state.deinit();
                             const line = formatToolCallLine(arena_state.allocator(), ev.name, ev.args);
                             self.addStreamMessage(line, tool_call_style);
+                            // 窗口化：调用行文本留一份（卸载后重载时恢复该行）
+                            self.setLastToolHeader(line);
                         }
                     },
                     .tool_end => {
@@ -2600,6 +2745,26 @@ const AppState = struct {
                                 self.addToolNoteLine("↳ 失败 · {s}", .{ev.text}, .{ .fg = .red });
                             } else {
                                 self.appendLastNoteSuffix(ev.text);
+                            }
+                        }
+                        // 窗口化：工具行的 db_id 回填到刚处理的显示消息
+                        // （块工具 → 块消息；非块工具 → 调用行/错误行）
+                        if (ev.db_id != 0) {
+                            if (block_kind != null) {
+                                // 块：从末尾回找最近的块消息
+                                var k: usize = self.messages.items.len;
+                                while (k > 0) {
+                                    k -= 1;
+                                    const m = &self.messages.items[k];
+                                    if (m.tool_block != null) {
+                                        m.db_id = ev.db_id;
+                                        break;
+                                    }
+                                    if (m.tool_block == null and m.user) break; // 越过了本轮
+                                }
+                            } else if (self.messages.items.len > 0) {
+                                const m = &self.messages.items[self.messages.items.len - 1];
+                                if (!m.user and m.md == null and m.tool_block == null) m.db_id = ev.db_id;
                             }
                         }
                     },
@@ -2832,7 +2997,7 @@ const AppState = struct {
                     if (idx < self.messages.items.len) {
                         const content = self.messages.items[idx].content;
                         if (content.len > 0 or reasoning_text.len > 0) {
-                            _ = self.persistMessage(.{
+                            const fallback_id = self.persistMessage(.{
                                 .role = "assistant",
                                 .content = content,
                                 .model = job.model,
@@ -2840,6 +3005,25 @@ const AppState = struct {
                                 .reasoning = reasoning_text,
                                 .reasoning_ms = reasoning_ms,
                             });
+                            // 窗口化：兜底落库的行 id 同样回填，使该消息可卸载/重载
+                            if (fallback_id != 0) self.messages.items[idx].db_id = fallback_id;
+                        }
+                    }
+                }
+            }
+
+            // 窗口化：最终轮（无工具调用，不会有 turn_end 事件）的 assistant 行 id
+            // 回填——取转录里最后一条 assistant（其 db_id 由 persistTranscriptEntry
+            // 或上面的批量落库写入）。必须在 closeCurrentTurn 前做。
+            if (self.streaming_msg_idx) |idx| {
+                if (idx < self.messages.items.len and self.messages.items[idx].db_id == 0) {
+                    var k: usize = job.transcript.items.len;
+                    while (k > 0) {
+                        k -= 1;
+                        const e = job.transcript.items[k];
+                        if (std.mem.eql(u8, e.msg.role, "assistant") and e.msg.db_id != 0) {
+                            self.messages.items[idx].db_id = e.msg.db_id;
+                            break;
                         }
                     }
                 }
@@ -5346,6 +5530,8 @@ pub fn main(init: std.process.Init) !u8 {
     }
     // 启动即显示上下文估算（加载路径里也会刷新）
     state.refreshEstimatedUsage();
+    // 窗口化：长会话只驻留视口附近的消息内容（见 updateMessageWindow）
+    state.windowing_enabled = true;
     Log.info(.startup, "TUI 启动 db={s} session={d} provider={s} model={s}", .{
         if (state.db != null) "ok" else "memory",
         state.session_id,
@@ -5682,6 +5868,8 @@ fn parseToolCalls(allocator: Allocator, json: []const u8) ?[]ai.ToolCall {
 fn addLoadedToolCallNote(self: *AppState, arena: Allocator, name: []const u8, args: []const u8) void {
     const line = formatToolCallLine(arena, name, args);
     self.addMessage(line, tool_call_style);
+    // 窗口化：调用行文本留一份（卸载后重载时恢复该行）
+    self.setLastToolHeader(line);
 }
 
 /// 恢复一条工具结果：块类工具（bash/edit）重建工具块，其余回填统计或补错误行。
@@ -5703,13 +5891,17 @@ fn addLoadedToolDisplay(self: *AppState, arena: Allocator, name: []const u8, arg
             defer if (capped) |c| self.allocator.free(c);
             const body: []const u8 = if (capped) |c| c else raw;
             const joined = std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ header, body }) catch return;
+            const header_owned = self.allocator.dupe(u8, header) catch null;
             self.messages.append(self.allocator, .{
                 .content = joined,
                 .style = .{ .fg = .white },
                 .tool_block = kind,
                 .tool_error = row.is_error != 0,
+                .db_id = row.id,
+                .tool_header = if (header_owned) |h| h else "",
             }) catch {
                 self.allocator.free(joined);
+                if (header_owned) |h| self.allocator.free(h);
                 return;
             };
             self.scroll_offset = 0;
@@ -5721,7 +5913,11 @@ fn addLoadedToolDisplay(self: *AppState, arena: Allocator, name: []const u8, arg
     if (row.is_error == 0) {
         const result = tools_mod.Result{ .content = @constCast(display_text), .is_error = false };
         const summary = summarizeToolResult(arena, result) catch "";
-        if (line_idx) |idx| self.appendNoteSuffixAt(idx, summary);
+        if (line_idx) |idx| {
+            self.appendNoteSuffixAt(idx, summary);
+            // 窗口化：调用行承载完整信息（调用文本 + 结果摘要），db_id 给它
+            if (idx < self.messages.items.len) self.messages.items[idx].db_id = row.id;
+        }
         return;
     }
     const result = tools_mod.Result{ .content = @constCast(display_text), .is_error = true };
@@ -6308,6 +6504,20 @@ fn pushStreamEvent(
     payload: []const u8,
     is_error: bool,
 ) void {
+    pushStreamEventDb(app, kind, name, text, args, payload, is_error, 0);
+}
+
+/// 带 db_id 的事件入队（窗口化回填用；db_id = 0 表示无关联行）
+fn pushStreamEventDb(
+    app: *AppState,
+    kind: StreamEventKind,
+    name: []const u8,
+    text: []const u8,
+    args: []const u8,
+    payload: []const u8,
+    is_error: bool,
+    db_id: i64,
+) void {
     app.stream_mutex.lockUncancelable(app.io);
     defer app.stream_mutex.unlock(app.io);
     const name_copy = app.allocator.dupe(u8, name) catch return;
@@ -6333,6 +6543,7 @@ fn pushStreamEvent(
         .args = args_copy,
         .payload = payload_copy,
         .is_error = is_error,
+        .db_id = db_id,
     }) catch {
         app.allocator.free(name_copy);
         app.allocator.free(text_copy);
@@ -6610,10 +6821,14 @@ fn streamWorker(job: *StreamJob) void {
 
         const has_content = job.content.items.len > 0;
         const has_calls = tool_calls.items.items.len > 0;
+        var turn_db_id: i64 = 0;
         if (has_content or has_calls) {
             if (appendAssistantTurn(job, arena, tool_calls.items.items)) |_| {
                 if (ensureWorkerDb(job, &worker_db)) |wdb| {
                     persistTranscriptEntry(job, wdb, job.transcript.items.len - 1, job.history.len - 1);
+                    // 窗口化：把刚落库的行 id 随 turn_end 回传给主线程，
+                    // 由主线程回填到对应显示消息（滚出视口后可卸载/重载）
+                    turn_db_id = job.transcript.items[job.transcript.items.len - 1].msg.db_id;
                 }
             } else |_| {}
         }
@@ -6624,7 +6839,7 @@ fn streamWorker(job: *StreamJob) void {
 
         // 确保主线程已显示完本轮正文，再进入工具阶段
         waitDrained(app);
-        pushStreamEvent(app, .turn_end, "", "", "", "", false);
+        pushStreamEventDb(app, .turn_end, "", "", "", "", false, turn_db_id);
 
         for (tool_calls.items.items) |tc| {
             if (app.stream_cancel.load(.acquire)) {
@@ -6658,7 +6873,6 @@ fn streamWorker(job: *StreamJob) void {
                 exec_result.content
             else
                 "";
-            pushStreamEvent(app, .tool_end, tc.name, result_summary, tc.arguments, payload, exec_result.is_error);
 
             // 记录渲染元数据（落库后供重启恢复工具块）
             job.tool_meta.append(arena, .{
@@ -6677,10 +6891,14 @@ fn streamWorker(job: *StreamJob) void {
             };
             job.transcript.append(arena, .{ .msg = tool_msg }) catch break;
             job.history = extendHistory(arena, job.history, &[_]ai.Message{tool_msg}) catch break;
-            // 工具结果立即落库：意外退出也能保住已执行的结果
+            // 工具结果立即落库：意外退出也能保住已执行的结果。
+            // 先落库再推事件——窗口化需要把行 id 随事件回传（供显示消息卸载/重载）
+            var tool_db_id: i64 = 0;
             if (ensureWorkerDb(job, &worker_db)) |wdb| {
                 persistTranscriptEntry(job, wdb, job.transcript.items.len - 1, job.history.len - 1);
+                tool_db_id = job.transcript.items[job.transcript.items.len - 1].msg.db_id;
             }
+            pushStreamEventDb(app, .tool_end, tc.name, result_summary, tc.arguments, payload, exec_result.is_error, tool_db_id);
         }
 
         waitDrained(app);
@@ -6923,6 +7141,10 @@ fn invalidateRowCount(msg: *Message) void {
 /// 缓存键与失效规则见 Message.row_count 字段的注释。
 fn messageRowCountCached(msg: *Message, width: usize) usize {
     if (width == 0) return messageRowCount(msg.*, width);
+    // 已卸载（窗口化）：行数是唯一真相（卸载时已固化）。宽度变化后该值可能
+    // 略有偏差（近似），但消息一旦进入视口就会被重载并重算，自愈。
+    // 不做"宽度变化就全量重载"——交互式调整窗口大小时会每帧触发全量重载。
+    if (!msg.content_loaded) return msg.row_count;
     const rlen: usize = if (msg.reasoning) |r| r.len else 0;
     if (msg.row_count_width == width and
         msg.row_count_expanded == msg.reasoning_expanded and
@@ -6986,6 +7208,10 @@ fn thoughtRowAt(state: *AppState, y: u16) ?usize {
 fn setThoughtExpanded(state: *AppState, msg_idx: usize, expanded: bool, keep_view: bool) void {
     if (msg_idx >= state.messages.items.len) return;
     const msg = &state.messages.items[msg_idx];
+    // 窗口化：已卸载的消息先重载（否则 reasoning 为 null 会静默失败）
+    if (!msg.content_loaded) {
+        if (!state.reloadMessage(msg, state.message_wrap_width)) return;
+    }
     if (msg.reasoning == null) return;
     if (msg.reasoning_expanded == expanded) return;
 
@@ -7009,11 +7235,66 @@ fn toggleThought(state: *AppState, msg_idx: usize) void {
     setThoughtExpanded(state, msg_idx, !msg.reasoning_expanded, true);
 }
 
+/// ── 窗口化：按视口卸载/重载消息内容 ──
+///
+/// 长会话（数千条）全量驻留内容会占几十 MB。这里按"视口 ± 若干屏"维护一个
+/// 驻留窗口：窗口外的消息卸载内容（释放 content/reasoning/md，保留行数缓存
+/// 供滚动定位），滚回时按 db_id 从库中重载。
+/// 只处理 db_id != 0 的历史消息；实时生成/系统提示等内存消息永不卸载。
+const window_keep_screens: usize = 4; // 视口上下各保留的屏数
+
+fn updateMessageWindow(state: *AppState, width: usize, viewport_rows: usize) void {
+    if (!state.windowing_enabled) return;
+    if (width == 0 or viewport_rows == 0) return;
+    if (state.messages.items.len == 0) return;
+    // 注意：流式期间同样执行卸载。会随生成变化的消息（正在生成的 assistant、
+    // 工具块、提示行）全部是 db_id == 0，已被 unloadMessage 的第一道守卫挡住；
+    // 从 DB 加载的历史消息在流式期间不会被修改，可以安全卸载。
+    //
+    // 宽度变化：已卸载消息的行数是按旧宽度固化的近似值。不在此处全量重载
+    // （调整窗口大小时会每帧触发）；偏差由"进入视口即重载重算"自愈。
+
+    // 1) 全量行数（卸载的走缓存，O(消息数)）
+    var total_lines: usize = 0;
+    for (state.messages.items) |*msg| {
+        total_lines += messageRowCountCached(msg, width);
+    }
+    if (state.messages.items.len > 1) total_lines += state.messages.items.len - 1;
+
+    const max_offset = if (total_lines > viewport_rows) total_lines - viewport_rows else 0;
+    const offset = @min(state.scroll_offset, max_offset);
+    const start_line = total_lines -| viewport_rows -| offset;
+
+    // 2) 计算驻留窗口的绝对行区间 [keep_lo, keep_hi)
+    const keep = viewport_rows *| window_keep_screens;
+    const keep_lo = start_line -| keep;
+    const keep_hi = start_line +| viewport_rows +| keep;
+
+    // 3) 逐条判定：窗口内重载、窗口外卸载
+    var line: usize = 0;
+    for (state.messages.items) |*msg| {
+        const rows = messageRowCountCached(msg, width);
+        const sep: usize = 1; // 消息间隔（末条多算 1 行无碍）
+        const msg_hi = line +| rows +| sep;
+        const outside = msg_hi <= keep_lo or line >= keep_hi;
+
+        if (outside and msg.content_loaded) {
+            state.unloadMessage(msg, width);
+        } else if (!outside and !msg.content_loaded) {
+            _ = state.reloadMessage(msg, width);
+        }
+        line = msg_hi;
+    }
+}
+
 fn drawMessages(state: *AppState, area: Rect, buf: *Buffer) void {
     if (area.height == 0 or area.width == 0) return;
 
     const width: usize = area.width;
     const visible_lines = @as(usize, area.height);
+
+    // 窗口化：先按视口位置卸载/重载消息内容（保证视口附近的内容已驻留）
+    updateMessageWindow(state, width, visible_lines);
 
     state.sel_row_count = 0;
     state.thought_row_count = 0;
@@ -7035,6 +7316,24 @@ fn drawMessages(state: *AppState, area: Rect, buf: *Buffer) void {
     const offset = @min(state.scroll_offset, max_offset);
     state.scroll_offset = offset;
     const start_line = total_lines -| visible_lines -| offset;
+
+    // 防御：窗口更新与本处之间若出现未重载消息（如重载后行数变化导致可视区间偏移），
+    // 只补载与**可视区间相交**的消息。不可放宽为"起点之后全部"——上滚时那会把
+    // 视口下方的消息全量重载，窗口化形同虚设。
+    if (state.windowing_enabled) {
+        const vis_lo = start_line;
+        const vis_hi = start_line +| visible_lines;
+        var l: usize = 0;
+        for (state.messages.items) |*msg| {
+            const rows = messageRowCountCached(msg, width);
+            const sep: usize = 1;
+            const msg_hi = l +| rows +| sep;
+            if (!msg.content_loaded and l < vis_hi and msg_hi > vis_lo) {
+                if (state.reloadMessage(msg, width)) _ = messageRowCountCached(msg, width);
+            }
+            l = msg_hi;
+        }
+    }
 
     // 从 start_line 开始绘制（同时构建选择映射）
     var current_line: usize = 0;
@@ -11008,6 +11307,105 @@ test "行数缓存：命中、自动失效（内容/宽度/展开）与显式失
     try std.testing.expectEqual(messageRowCount(msg, 10), expanded);
 }
 
+test "窗口化：卸载后行数保持，重载后内容与行数一致（含工具块/思考/用户消息）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    const db_path: [:0]const u8 = "skynet_test_window.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_window.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_window.db-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_window.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_window.db-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer if (state.db) |*d| d.deinit();
+    const sid = try state.db.?.createSession("");
+    state.session_id = sid;
+    defer {
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+    }
+
+    // 造三条不同类型的历史消息：assistant（正文+思考）、tool 块、user
+    const assistant_id = try state.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "assistant",
+        .content = "正文内容 here\n第二行",
+        .reasoning = "思考内容" ** 20,
+        .reasoning_ms = 1234,
+    });
+    const tool_id = try state.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "tool",
+        .content = "tool output line1\nline2\nline3",
+        .tool_call_id = "c1",
+        .tool_name = "bash",
+    });
+    const user_id = try state.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "user",
+        .content = "用户消息",
+    });
+
+    state.applyLoadedMessages(try state.db.?.loadMessages(sid), true);
+    try std.testing.expectEqual(@as(usize, 3), state.messages.items.len);
+
+    // 记录原始状态
+    const width: usize = 40;
+    var rows_before: [3]usize = undefined;
+    for (state.messages.items, 0..) |*m, i| rows_before[i] = messageRowCountCached(m, width);
+
+    // 卸载全部（模拟滚动到远处）
+    for (state.messages.items) |*m| state.unloadMessage(m, width);
+    for (state.messages.items, 0..) |*m, i| {
+        try std.testing.expect(!m.content_loaded);
+        try std.testing.expectEqual(@as(usize, 0), m.content.len);
+        try std.testing.expect(m.reasoning == null);
+        try std.testing.expect(m.md == null);
+        // 行数保持（滚动定位依赖它）
+        try std.testing.expectEqual(rows_before[i], messageRowCountCached(m, width));
+    }
+
+    // 重载：内容与行数恢复一致
+    for (state.messages.items) |*m| {
+        try std.testing.expect(state.reloadMessage(m, width));
+        try std.testing.expect(m.content_loaded);
+    }
+    try std.testing.expectEqualStrings("正文内容 here\n第二行", state.messages.items[0].content);
+    try std.testing.expectEqualStrings("思考内容" ** 20, state.messages.items[0].reasoning.?);
+    try std.testing.expect(state.messages.items[0].md != null);
+    try std.testing.expectEqualStrings("用户消息", state.messages.items[2].content);
+    // 工具块：重载后含标题 + 正文（capBlockBody 后的形态）
+    try std.testing.expect(state.messages.items[1].tool_block != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.messages.items[1].content, "line1") != null);
+    for (state.messages.items, 0..) |*m, i| {
+        try std.testing.expectEqual(rows_before[i], messageRowCountCached(m, width));
+    }
+
+    // 未加载的消息不参与卸载（实时消息 db_id=0 永不卸载）
+    var live_msg = Message{ .content = try alloc.dupe(u8, "live"), .style = .{} };
+    defer alloc.free(live_msg.content);
+    state.unloadMessage(&live_msg, width);
+    try std.testing.expect(live_msg.content_loaded);
+
+    // db_id 键正确性（重载按 id 精确取行）
+    try std.testing.expectEqual(assistant_id, state.messages.items[0].db_id);
+    try std.testing.expectEqual(tool_id, state.messages.items[1].db_id);
+    try std.testing.expectEqual(user_id, state.messages.items[2].db_id);
+}
+
 test "绘制跳过：视口之上的消息不逐行走，滚动位置正确" {
     var state = AppState{};
     state.allocator = std.testing.allocator;
@@ -11376,6 +11774,192 @@ test "finalize 兜底落库：工具轮之后的轮次中断，当前轮思考�
     try std.testing.expectEqualStrings("第一轮正文", rows[0].content);
     try std.testing.expectEqualStrings("", rows[1].content);
     try std.testing.expectEqualStrings("第二轮思考到一半就中断了", rows[1].reasoning);
+}
+
+test "窗口化：流式期间照常卸载历史消息，实时消息受保护（回归：isStreaming 守卫）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    const db_path: [:0]const u8 = "skynet_test_window_stream.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_window_stream.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_window_stream.db-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_window_stream.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_window_stream.db-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer if (state.db) |*d| d.deinit();
+    const sid = try state.db.?.createSession("");
+    state.session_id = sid;
+    state.windowing_enabled = true;
+    defer {
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+    }
+
+    // 造若干历史消息（足够撑出多屏），再模拟"正在生成"
+    var n: usize = 0;
+    while (n < 40) : (n += 1) {
+        _ = try state.db.?.insertMessage(.{
+            .session_id = sid,
+            .role = "assistant",
+            .content = "历史消息内容 repeated repeated repeated",
+        });
+    }
+    state.applyLoadedMessages(try state.db.?.loadMessages(sid), true);
+    try std.testing.expectEqual(@as(usize, 40), state.messages.items.len);
+    for (state.messages.items) |*m| try std.testing.expect(m.db_id != 0);
+
+    // 追加一条实时消息（db_id == 0，模拟正在流式生成）
+    const live_content = try alloc.dupe(u8, "正在生成的实时消息");
+    state.messages.append(alloc, .{
+        .content = live_content,
+        .style = .{ .fg = .white },
+    }) catch unreachable;
+    const live_idx = state.messages.items.len - 1;
+    try std.testing.expectEqual(@as(i64, 0), state.messages.items[live_idx].db_id);
+
+    // 进入流式状态
+    state.setStreamStatus(.running);
+
+    // 滚到最顶：窗口外的历史消息应被卸载（流式守卫已移除）
+    state.scroll_offset = 100_000;
+    updateMessageWindow(&state, 40, 10);
+
+    var unloaded_count: usize = 0;
+    for (state.messages.items[0..live_idx]) |*m| {
+        if (!m.content_loaded) unloaded_count += 1;
+    }
+    try std.testing.expect(unloaded_count > 0); // 流式期间卸载仍生效
+    // 实时消息（db_id == 0）必须始终驻留
+    try std.testing.expect(state.messages.items[live_idx].content_loaded);
+    try std.testing.expectEqualStrings("正在生成的实时消息", state.messages.items[live_idx].content);
+}
+
+test "窗口化 2a/2b/2c：回填 db_id 后三类实时消息均可卸载并原样重载" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    const db_path: [:0]const u8 = "skynet_test_window_fill.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_window_fill.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_window_fill.db-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_window_fill.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_window_fill.db-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer if (state.db) |*d| d.deinit();
+    const sid = try state.db.?.createSession("");
+    state.session_id = sid;
+    state.windowing_enabled = true;
+    defer {
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+    }
+
+    const width: usize = 60;
+
+    // ── 2a：assistant 消息（正文 + 思考），模拟落库后回填 db_id ──
+    const a_id = try state.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "assistant",
+        .content = "这是正文\n第二行",
+        .reasoning = "这是思考内容",
+        .reasoning_ms = 500,
+    });
+    state.addStreamMessage("这是正文\n第二行", .{ .fg = .white });
+    {
+        // 模拟 turn_end 回填
+        const idx = state.messages.items.len - 1;
+        state.messages.items[idx].reasoning = try alloc.dupe(u8, "这是思考内容");
+        state.messages.items[idx].reasoning_ms = 500;
+        state.messages.items[idx].db_id = a_id;
+    }
+
+    // ── 2b：块工具（bash），模拟落库后回填 db_id ──
+    const t_id = try state.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "tool",
+        .content = "line one\nline two\nline three",
+        .tool_call_id = "call_bash",
+        .tool_name = "bash",
+    });
+    _ = state.beginToolBlock("bash", "{\"command\":\"echo hi\"}", .shell);
+    _ = state.appendToolBlockBody(.shell, "line one\nline two\nline three", false);
+    {
+        const idx = state.messages.items.len - 1;
+        state.messages.items[idx].db_id = t_id;
+    }
+
+    // ── 2c：非块工具（read），调用行 + 后缀，db_id 给调用行 ──
+    const r_id = try state.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "tool",
+        .content = "file content here",
+        .tool_call_id = "call_read",
+        .tool_name = "read",
+    });
+    state.addStreamMessage("→ Read src/foo.zig [limit=20, offset=5]", tool_call_style);
+    state.setLastToolHeader("→ Read src/foo.zig [limit=20, offset=5]");
+    // 后缀与 DB 行内容长度一致（重载时从 DB 重算，两边必须能对上）
+    state.appendLastNoteSuffix("17B");
+    {
+        const idx = state.messages.items.len - 1;
+        state.messages.items[idx].db_id = r_id;
+    }
+
+    // 记录三条消息卸载前的行数与内容
+    const n = state.messages.items.len;
+    try std.testing.expectEqual(@as(usize, 3), n);
+    var rows_before: [3]usize = undefined;
+    var contents_before: [3][]u8 = undefined;
+    for (state.messages.items, 0..) |*m, i| {
+        rows_before[i] = messageRowCountCached(m, width);
+        contents_before[i] = try alloc.dupe(u8, m.content);
+    }
+    defer for (contents_before) |c| alloc.free(c);
+
+    // 全部卸载
+    for (state.messages.items) |*m| state.unloadMessage(m, width);
+    for (state.messages.items) |*m| try std.testing.expect(!m.content_loaded);
+    // 行数保持
+    for (state.messages.items, 0..) |*m, i| {
+        try std.testing.expectEqual(rows_before[i], messageRowCountCached(m, width));
+    }
+
+    // 重载：2a 正文+思考恢复；2b 块（标题+正文）恢复；2c 调用行+后缀恢复
+    for (state.messages.items) |*m| try std.testing.expect(state.reloadMessage(m, width));
+    try std.testing.expectEqualStrings(contents_before[0], state.messages.items[0].content);
+    try std.testing.expect(state.messages.items[0].reasoning != null);
+    try std.testing.expectEqualStrings("这是思考内容", state.messages.items[0].reasoning.?);
+    try std.testing.expectEqualStrings(contents_before[1], state.messages.items[1].content);
+    try std.testing.expectEqualStrings(contents_before[2], state.messages.items[2].content);
+    // 行数一致
+    for (state.messages.items, 0..) |*m, i| {
+        try std.testing.expectEqual(rows_before[i], messageRowCountCached(m, width));
+    }
 }
 
 test "模糊宽度档位解析：显式 wide/narrow，其余一律 auto" {

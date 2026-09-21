@@ -125,6 +125,7 @@ O(全会话字符数) 降为 O(消息数)（3000 条实测 5.7ms → 0.44ms，De
 | macOS / Linux 未验证 | 按需 | 真光标/IME/路径/进程句柄等跨平台项待排查 |
 | schema 版本不符 | 拒绝打开（不迁移、不重建）；TUI 弹窗让用户选"重命名旧库并新建"/"退出" | 2026-09 清空全部迁移代码（无外部用户）；专门的迁移模块待将来设计；重命名=文件搬迁，数据零改动 |
 | `skynet` fork 分支 `restore.arm` 快照时机（Windows panic 还原 raw 模式） | 低 | PR-2 已修，合并后 rebase 自动吸收（见 pr-plan"fork 遗留问题"）|
+| 窗口化重载后的工具结果摘要可能显示折叠后（stub）的长度 | 低（仅影响摘要括号里的数字） | `summarizeToolResult` 目前用 `content` 长度；重载路径应优先用 `tool_full` 长度。待 review |
 
 ### 2.4 搁置的实验（存档）
 
@@ -327,6 +328,34 @@ pi 已实现该场景（`session-cwd.ts`）——会话 cwd 不存在时：交�
 | usage 锚点（真实 + 增量） | bytes/4 对中文低估约 35%；压缩/清史/重建立即失效防误配 |
 | 双缓冲 + 同步输出 + 帧尾光标 | 每帧一次渲染（防闪烁）；IME 定位与帧同字节流（防跳变） |
 | 显示/历史两套数据 | 渲染态（思考块/工具块/展开）与 API 格式解耦 |
+
+### 3.4 内存行为说明（排查时先读这里）
+
+长会话的内存治理见本文件 2.6 与窗口化实现（`updateMessageWindow` / `unloadMessage` /
+`reloadMessage`，以及 `src/db_query.zig` 绕开 fridge session arena）。以下现象是**正常行为**，
+不要误判为泄漏：
+
+**"滚动时内存缓涨 + 突然断崖下跌"**：
+
+- **缓涨**：滚动触发消息重载（分配 `content`/`reasoning`/`md`）。Zig 的默认分配器是
+  `DebugAllocator`（`std.process.Init.gpa`），**小分配释放后留在进程内的空闲桶里复用**
+  （不归还 OS）——这是性能优化（避免频繁系统调用），不是泄漏；
+- **断崖跌**：窗口滑出视口的消息被 `unloadMessage` 卸载，释放的 `reasoning`/`content`
+  常是几十 KB 的**大块**；GPA 对 `large_allocations`（≥ 页大小）走 `freeLarge` →
+  `rawFree` → **真正 munmap 归还 OS** → RSS 骤降；
+- 整体有界（实测：会话 4 启动 ~45MB，滚动往返在 16-26MB 间波动，闲置 90 秒零增长）。
+
+**想验证"是否真零增长"**：把入口的 `init.gpa` 换成 `std.heap.smp_allocator`（生产级，
+分配/释放更接近直接向 OS 要/还）再测——GPA 的空闲桶复用会掩盖小分配的泄漏。
+代价：失去 GPA 的泄漏检测（debug 构建下的双释放/越界检查），**仅用于一次性验证，不要提交**。
+
+**历史教训**（已修，勿回退）：
+- `fridge` 的查询构造全部分配在 session arena（仅 `deinit` 释放），长驻进程频繁小查询
+  会持续泄漏（实测 2892B/次）。所有**高频**查询必须走 `src/db_query.zig`（临时 arena）；
+  新增查询时若走 `sess.raw(...).fetchAll(...)`，请评估调用频率；
+- 窗口化的 `updateMessageWindow` **不能**加 `isStreaming` 早退（会退化成"只重载不卸载"，
+  生成中滚动内存暴涨）；
+- 实时生成的消息必须回填 `db_id`（否则永不满足卸载条件，长会话只增不减）。
 
 ---
 

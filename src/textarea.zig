@@ -5,6 +5,10 @@ const Buffer = tui.render.Buffer;
 const Rect = tui.render.Rect;
 const codepointWidth = tui.render.codepointWidth;
 const Allocator = std.mem.Allocator;
+// UTF-8 解码统一到 src/utf8.zig（此前本文件有一份与 main/markdown 相同的实现）
+const utf8 = @import("utf8.zig");
+const Decoded = utf8.Decoded;
+const decodeAt = utf8.decodeAt;
 
 /// 输入框软上限：防止异常超大粘贴耗尽内存（堆上动态缓冲，正常使用远达不到）
 pub const max_input_bytes: usize = 8 * 1024 * 1024;
@@ -401,32 +405,14 @@ pub const TextArea = struct {
     }
 
     fn prevCpLen(self: *const Self) usize {
-        var i = self.cursor;
-        while (i > 0) {
-            i -= 1;
-            if (self.buf.items[i] & 0xC0 != 0x80) break;
-        }
-        return self.cursor - i;
+        return utf8.prevLen(self.buf.items, self.cursor);
     }
 
     fn nextCpLen(self: *const Self) usize {
         if (self.cursor >= self.buf.items.len) return 0;
-        const n = std.unicode.utf8ByteSequenceLength(self.buf.items[self.cursor]) catch return 1;
-        return @min(n, self.buf.items.len - self.cursor);
+        return utf8.nextLen(self.buf.items, self.cursor);
     }
 };
-
-const Decoded = struct { cp: u21, len: usize };
-
-fn decodeAt(text: []const u8, i: usize) Decoded {
-    var len: usize = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-    if (i + len > text.len) len = 1;
-    const cp: u21 = if (len == 1)
-        text[i]
-    else
-        std.unicode.utf8Decode(text[i .. i + len]) catch 0xFFFD;
-    return .{ .cp = cp, .len = len };
-}
 
 /// 从行首 start 起，找到列 >= target_col 的字节位置（不超过该行行尾）
 fn findColInRow(text: []const u8, width: usize, start: usize, target_col: usize) usize {

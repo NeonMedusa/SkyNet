@@ -3,6 +3,11 @@ const fr = @import("fridge");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Log = @import("log.zig");
+const db_query = @import("db_query.zig");
+
+test {
+    _ = db_query;
+}
 
 pub const MessageRow = struct {
     id: i64 = 0,
@@ -343,25 +348,37 @@ pub const Db = struct {
 
     /// SQLite data_version：其他连接提交后会变化（用于发现外部写入）
     pub fn dataVersion(self: *Db) !i64 {
+        // 走 db_query 路径（临时 arena）：本函数被主循环每 500ms 轮询一次，
+        // 若走 fridge 的 session arena 会持续泄漏（实测 ~2.9KB/次）
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
         const Row = struct { data_version: i64 = 0 };
-        const rows = try self.sess.raw("SELECT data_version FROM pragma_data_version", .{}).fetchAll(Row);
+        const rows = try db_query.queryAll0(&self.sess, scratch.allocator(), Row, "SELECT data_version FROM pragma_data_version");
         return if (rows.len > 0) rows[0].data_version else 0;
     }
 
     /// 加载某会话中 id 大于 after_id 的消息（按 id 升序，用于增量刷新）
+    /// 消息行的完整列清单（多处查询共用，避免改动时遗漏）
+    const message_cols = "id, session_id, role, content, model, provider, created_at, reasoning, reasoning_ms, tool_calls, tool_call_id, tool_name, tool_display, tool_full, is_error, input_tokens, cached_tokens, output_tokens";
+
     pub fn loadMessagesAfter(self: *Db, session_id: i64, after_id: i64) ![]const MessageRow {
         return try self.sess.raw(
-            "SELECT id, session_id, role, content, model, provider, created_at, reasoning, reasoning_ms, tool_calls, tool_call_id, tool_name, tool_display, tool_full, is_error, input_tokens, cached_tokens, output_tokens FROM \"message\"",
+            "SELECT " ++ message_cols ++ " FROM \"message\"",
             .{},
         ).where("session_id = ? AND id > ?", .{ session_id, after_id }).orderBy("id").fetchAll(MessageRow);
     }
 
-    /// 加载某会话中 id >= min_id 的消息（压缩后加载保留区）
-    pub fn loadMessagesFrom(self: *Db, session_id: i64, min_id: i64) ![]const MessageRow {
-        return try self.sess.raw(
-            "SELECT id, session_id, role, content, model, provider, created_at, reasoning, reasoning_ms, tool_calls, tool_call_id, tool_name, tool_display, tool_full, is_error, input_tokens, cached_tokens, output_tokens FROM \"message\"",
-            .{},
-        ).where("session_id = ? AND id >= ?", .{ session_id, min_id }).orderBy("id").fetchAll(MessageRow);
+    /// 同 `loadMessagesAfter`，但结果与参数都分配在调用者的 allocator
+    /// （临时 arena 用完即释放；不走 fridge 的 session arena，避免长驻进程累积）
+    pub fn loadMessagesAfterWith(self: *Db, allocator: Allocator, session_id: i64, after_id: i64) ![]const MessageRow {
+        return db_query.queryAll2(
+            &self.sess,
+            allocator,
+            MessageRow,
+            "SELECT " ++ message_cols ++ " FROM \"message\" WHERE session_id = ? AND id > ? ORDER BY id",
+            session_id,
+            after_id,
+        );
     }
 
     /// 写入一条压缩 checkpoint（summary_message_id 指向 role='summary' 的消息行）
@@ -449,9 +466,36 @@ pub const Db = struct {
     /// 加载指定会话的全部消息（按时间顺序）
     pub fn loadMessages(self: *Db, session_id: i64) ![]const MessageRow {
         return try self.sess.raw(
-            "SELECT id, session_id, role, content, model, provider, created_at, reasoning, reasoning_ms, tool_calls, tool_call_id, tool_name, tool_display, tool_full, is_error, input_tokens, cached_tokens, output_tokens FROM \"message\"",
+            "SELECT " ++ message_cols ++ " FROM \"message\"",
             .{},
         ).where("session_id = ?", .{session_id}).orderBy("id").fetchAll(MessageRow);
+    }
+
+    /// 同上，但结果与参数都分配在调用者提供的 allocator（而非 session arena）。
+    /// 调用方可用临时 arena 承接大结果集并在处理完后整体释放，
+    /// 避免大批消息永久滞留在 session arena（长会话内存治理）。
+    pub fn loadMessagesWith(self: *Db, allocator: Allocator, session_id: i64) ![]const MessageRow {
+        return db_query.queryAll1(
+            &self.sess,
+            allocator,
+            MessageRow,
+            "SELECT " ++ message_cols ++ " FROM \"message\" WHERE session_id = ? ORDER BY id",
+            session_id,
+        );
+    }
+
+    /// 加载 id 落在 [lo, hi] 区间（含端点）的消息，按 id 升序。
+    /// 窗口化加载用：按滚动位置加载一段，而不是整个会话。
+    pub fn loadMessagesRange(self: *Db, allocator: Allocator, session_id: i64, lo_id: i64, hi_id: i64) ![]const MessageRow {
+        return db_query.queryAll3(
+            &self.sess,
+            allocator,
+            MessageRow,
+            "SELECT " ++ message_cols ++ " FROM \"message\" WHERE session_id = ? AND id >= ? AND id <= ? ORDER BY id",
+            session_id,
+            lo_id,
+            hi_id,
+        );
     }
 
     /// 会话标题为空时，用首条用户消息设置标题

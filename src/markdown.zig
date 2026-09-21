@@ -5,6 +5,10 @@ const Style = tui.style.Style;
 const Buffer = tui.render.Buffer;
 const codepointWidth = tui.render.codepointWidth;
 const stringWidth = tui.render.stringWidth;
+// UTF-8 解码统一到 src/utf8.zig（此前本文件有一份与 main/textarea 相同的实现）
+const utf8 = @import("utf8.zig");
+const Decoded = utf8.Decoded;
+const decodeAt = utf8.decodeAt;
 
 pub const Run = struct {
     text: []const u8,
@@ -321,18 +325,6 @@ pub fn rowSegments(line: *const Line, width: usize, target_row: usize, out: []Se
         }
     }
     return count;
-}
-
-const Decoded = struct { cp: u21, len: usize };
-
-fn decodeAt(text: []const u8, i: usize) Decoded {
-    var len: usize = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-    if (i + len > text.len) len = 1;
-    const cp: u21 = if (len == 1)
-        text[i]
-    else
-        std.unicode.utf8Decode(text[i .. i + len]) catch 0xFFFD;
-    return .{ .cp = cp, .len = len };
 }
 
 fn readLine(content: []const u8, pos: *usize) ?[]const u8 {
