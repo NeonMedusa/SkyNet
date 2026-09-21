@@ -349,6 +349,15 @@ fn toolRead(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8
     };
     defer allocator.free(data);
 
+    // 二进制文件：输出乱码只会浪费 token，直接说明并用 bash 兜底（与 grep 的 isBinary 一致）
+    if (isBinary(data)) {
+        return ok(allocator, "File appears to be binary ({d} bytes): {s}. Use bash (e.g. Get-Content/xxd) if you need its raw content.", .{ data.len, args.path });
+    }
+    // 空文件：显式说明，避免与"读取失败"混淆
+    if (data.len == 0) {
+        return ok(allocator, "(empty file: {s})", .{args.path});
+    }
+
     const total_lines = countLines(data);
     const start_line: usize = if (args.offset > 1) @intCast(args.offset - 1) else 0;
     if (start_line >= total_lines and total_lines > 0) {
@@ -456,6 +465,10 @@ fn toolWrite(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u
 
     const abs = try resolvePath(allocator, cwd, args.path);
     defer allocator.free(abs);
+
+    if (isDir(io, abs)) {
+        return fail(allocator, "Path is a directory, not a file: {s}", .{args.path});
+    }
 
     writeFileBytes(io, abs, args.content) catch |err| {
         return fail(allocator, "Could not write file {s}: {s}", .{ args.path, @errorName(err) });
@@ -1666,6 +1679,15 @@ test "tools: read/write/edit/ls/find/grep 基础流程" {
         try testing.expect(std.mem.indexOf(u8, r.content, "Successfully wrote") != null);
     }
 
+    // write：目标是已存在的目录 → 明确报错（而不是模糊的 IO 错误）
+    {
+        const r = try execute(testing.allocator, io, cwd, "write", "{\"path\":\"skynet_test_tools/src\",\"content\":\"x\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "directory, not a file") != null);
+    }
+
     // read：offset/limit（附续读提示；行号前缀为绝对行号）
     {
         const r = try execute(testing.allocator, io, cwd, "read", "{\"path\":\"skynet_test_tools/src/a.txt\",\"offset\":2,\"limit\":1}");
@@ -2373,7 +2395,7 @@ test "tools: read 行号前缀（绝对行号；offset/无尾换行/空文件边
         try testing.expectEqualStrings("2: beta\n\n[Showing lines 2-2 of 3. Use offset=3 to continue.]", r.content);
     }
 
-    // 空文件：空内容、无提示、不报错
+    // 空文件：显式提示（避免与"读取失败"混淆）、不报错
     {
         const f = try std.fs.path.join(testing.allocator, &.{ root, "empty.txt" });
         defer testing.allocator.free(f);
@@ -2382,7 +2404,22 @@ test "tools: read 行号前缀（绝对行号；offset/无尾换行/空文件边
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
         try testing.expect(!r.is_error);
-        try testing.expectEqualStrings("", r.content);
+        try testing.expectEqualStrings("(empty file: skynet_test_read_lines/empty.txt)", r.content);
+    }
+
+    // 二进制文件（含 NUL 字节）：不输出乱码，提示用 bash 兜底
+    {
+        const f = try std.fs.path.join(testing.allocator, &.{ root, "bin.dat" });
+        defer testing.allocator.free(f);
+        try writeFileBytes(io, f, "\x00\x01\x02ABC\xff\xfe\x00\x00");
+        const r = try execute(testing.allocator, io, cwd, "read", "{\"path\":\"skynet_test_read_lines/bin.dat\"}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "binary") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "10 bytes") != null);
+        // 不应包含原始乱码内容
+        try testing.expect(std.mem.indexOf(u8, r.content, "ABC") == null);
     }
 
     // 单行大文件（首行超 50KB）：编号仍存在，字节截断提示保留
