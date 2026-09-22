@@ -29,9 +29,9 @@ pub const tool_defs = [_]ToolDef{
     },
     .{
         .name = "edit",
-        .description = "Edit a single file using exact text replacement. old_string must match the file exactly (including whitespace) and must be unique unless replace_all is true. Use write to create new files or fully rewrite a file.",
+        .description = "Edit a single file using exact text replacement. Provide one or more edits in edits[]: each old_text must match the file exactly (including whitespace) and be unique in the ORIGINAL file; entries must not overlap. Prefer one call with several entries over several edit calls. Use write to create new files or fully rewrite a file.",
         .parameters =
-        \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"old_string":{"type":"string","description":"Exact text to replace. Must match the file exactly and be unique unless replace_all is true."},"new_string":{"type":"string","description":"Replacement text. Use an empty string to delete the matched text."},"replace_all":{"type":"boolean","description":"Replace every occurrence of old_string (default false)"}},"required":["path","old_string","new_string"]}
+        \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","description":"One or more targeted replacements. Each old_text is matched against the original file, not incrementally; entries must be unique and must not overlap. Keep old_text as small as possible while still unique.","items":{"type":"object","properties":{"old_text":{"type":"string","description":"Exact text for this replacement (must be unique in the original file)"},"new_text":{"type":"string","description":"Replacement text for this entry"}},"required":["old_text","new_text"]}}},"required":["path","edits"]}
         ,
     },
     .{
@@ -441,7 +441,7 @@ fn diagnoseEditMiss(allocator: Allocator, data: []const u8, old: []const u8) []c
             const line_no = std.mem.count(u8, data[0..at], "\n") + 1;
             return std.fmt.allocPrint(
                 allocator,
-                " Hint: the first line of old_string appears at line {d} - compare the surrounding text there.",
+                " Hint: the first line of old_text appears at line {d} - compare the surrounding text there.",
                 .{line_no},
             ) catch "";
         }
@@ -478,21 +478,60 @@ fn toolWrite(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u
 
 // ── edit ──
 
+/// 单条编辑项（edits[] 的元素）
+const EditItem = struct {
+    old_text: []const u8 = "",
+    new_text: []const u8 = "",
+};
+
+/// edit 工具参数。schema 只暴露 path + edits[]（仿 pi：统一一种写法，
+/// 单处也用数组——避免模型在"用哪个"上犹豫/选错）。
 const EditArgs = struct {
     path: []const u8 = "",
-    old_string: []const u8 = "",
-    new_string: []const u8 = "",
-    replace_all: bool = false,
+    edits: []const EditItem = &.{},
 };
+
+/// 容错：把非规范输入归一化为 EditArgs。
+/// 支持：① 标准 {"path","edits":[{old_text,new_text}]}；
+///       ② edits 传成单个对象而非数组（`{"edits":{...}}` → 单元素数组）。
+/// 不兼容其他 agent 的字段命名（如 pi 的驼峰 oldText/newText）——该设想及其
+/// 争议见 docs/development.md 2.6「未来可讨论的点：跨 agent 工具字段兼容」。
+fn prepareEditArgs(allocator: Allocator, args_json: []const u8) ?EditArgs {
+    // ① 标准形式
+    if (parseArgs(EditArgs, allocator, args_json)) |a| {
+        if (a.edits.len > 0) return a;
+        // edits 为空数组或缺失 → 继续尝试 ②
+        return prepareEditArgsFallback(allocator, args_json) orelse return a;
+    }
+    // ② edits 单对象
+    return prepareEditArgsFallback(allocator, args_json);
+}
+
+fn prepareEditArgsFallback(allocator: Allocator, args_json: []const u8) ?EditArgs {
+    const Loose = struct {
+        path: []const u8 = "",
+        /// edits 传成单个对象（而非数组）时的容错
+        edits: ?EditItem = null,
+    };
+    const loose = parseArgs(Loose, allocator, args_json) orelse return null;
+    if (loose.edits) |item| {
+        const list = allocator.alloc(EditItem, 1) catch return null;
+        list[0] = item;
+        return .{ .path = loose.path, .edits = list };
+    }
+    return null;
+}
 
 fn toolEdit(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8) error{OutOfMemory}!Result {
     var args_arena = std.heap.ArenaAllocator.init(allocator);
     defer args_arena.deinit();
-    const args = parseArgs(EditArgs, args_arena.allocator(), args_json) orelse
+    const args = prepareEditArgs(args_arena.allocator(), args_json) orelse
         return fail(allocator, "Invalid arguments JSON for edit", .{});
 
     if (args.path.len == 0) return fail(allocator, "Missing required parameter: path", .{});
-    if (args.old_string.len == 0) return fail(allocator, "old_string must not be empty. Use write to create files or rewrite them completely.", .{});
+    if (args.edits.len == 0) {
+        return fail(allocator, "Missing required parameter: edits[]. Each entry needs old_text (exact, unique in the file) and new_text. Use write to create files or rewrite them completely.", .{});
+    }
 
     const abs = try resolvePath(allocator, cwd, args.path);
     defer allocator.free(abs);
@@ -507,62 +546,104 @@ fn toolEdit(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8
     };
     defer allocator.free(data);
 
-    // 精确匹配；失败时尝试 CRLF 行尾适配
-    var matches = std.mem.count(u8, data, args.old_string);
-    var old = args.old_string;
-    var new = args.new_string;
-    var converted_old: ?[]u8 = null;
-    var converted_new: ?[]u8 = null;
-    defer if (converted_old) |c| allocator.free(c);
-    defer if (converted_new) |c| allocator.free(c);
-    if (matches == 0 and std.mem.indexOfScalar(u8, data, '\r') != null and
-        std.mem.indexOfScalar(u8, old, '\r') == null)
-    {
-        const dos_old = try crlf(allocator, old);
-        const dos_count = std.mem.count(u8, data, dos_old);
-        if (dos_count > 0) {
-            converted_old = dos_old;
-            converted_new = try crlf(allocator, new);
-            old = dos_old;
-            new = converted_new.?;
-            matches = dos_count;
-        } else {
-            allocator.free(dos_old);
+    return toolEditMulti(allocator, io, abs, args.path, data, args.edits);
+}
+
+/// 多处编辑（edits[]）：每个 old_text 匹配**原始文件**，互不重叠，一次写回。
+/// 语义（仿 pi）：全部匹配成功才应用（全有或全无）；任一不匹配/不唯一/重叠即报错。
+fn toolEditMulti(
+    allocator: Allocator,
+    io: Io,
+    abs: []const u8,
+    path: []const u8,
+    data: []const u8,
+    edits: []const EditItem,
+) error{OutOfMemory}!Result {
+    // 诊断文本等临时分配（随函数结束整体释放，避免泄漏）
+    var diag_arena = std.heap.ArenaAllocator.init(allocator);
+    defer diag_arena.deinit();
+
+    const Applied = struct { start: usize, old_len: usize, new_text: []const u8, idx: usize };
+    var applied = std.ArrayListUnmanaged(Applied){ .items = &.{}, .capacity = 0 };
+    defer applied.deinit(allocator);
+
+    // CRLF 文件 + LF old_text 的适配（与旧单编辑路径行为一致）：
+    // 若 data 含 CRLF 且某条 old_text 是 LF 形式，先转成 CRLF 再匹配
+    const data_is_crlf = std.mem.indexOf(u8, data, "\r\n") != null;
+    var converted = std.ArrayListUnmanaged([]u8){ .items = &.{}, .capacity = 0 };
+    defer {
+        for (converted.items) |c| allocator.free(c);
+        converted.deinit(allocator);
+    }
+
+    for (edits, 0..) |item, i| {
+        if (item.old_text.len == 0) {
+            return fail(allocator, "edits[{d}].old_text must not be empty.", .{i});
+        }
+        var old_text = item.old_text;
+        var new_text = item.new_text;
+        var occurrences = std.mem.count(u8, data, old_text);
+        if (occurrences == 0 and data_is_crlf and std.mem.indexOfScalar(u8, old_text, '\r') == null) {
+            const dos_old = crlf(allocator, old_text) catch null;
+            if (dos_old) |d| {
+                try converted.append(allocator, d);
+                const dos_new = crlf(allocator, new_text) catch null;
+                if (dos_new) |n| try converted.append(allocator, n);
+                const count = std.mem.count(u8, data, d);
+                if (count > 0) {
+                    old_text = d;
+                    new_text = if (dos_new) |n| n else new_text;
+                    occurrences = count;
+                }
+            }
+        }
+        if (occurrences == 0) {
+            // 诊断线索（arena 分配，随本次调用结束释放）
+            const hint = diagnoseEditMiss(diag_arena.allocator(), data, item.old_text);
+            return fail(allocator, "edits[{d}]: could not find the exact text in {s}. It must match exactly including whitespace and newlines.{s}", .{ i, path, hint });
+        }
+        if (occurrences > 1) {
+            return fail(allocator, "edits[{d}]: found {d} occurrences of the text in {s}. It must be unique — add surrounding context.", .{ i, occurrences, path });
+        }
+        const at = std.mem.indexOf(u8, data, old_text).?;
+        try applied.append(allocator, .{ .start = at, .old_len = old_text.len, .new_text = new_text, .idx = i });
+    }
+
+    // 重叠检查：按起点排序后，前一个的区间不得越过当前的起点
+    std.mem.sort(Applied, applied.items, {}, struct {
+        fn lt(_: void, a: Applied, b: Applied) bool {
+            return a.start < b.start;
+        }
+    }.lt);
+    for (applied.items, 0..) |a, i| {
+        if (i == 0) continue;
+        const prev = applied.items[i - 1];
+        if (prev.start + prev.old_len > a.start) {
+            return fail(allocator, "edits[{d}] and edits[{d}] overlap in {s}. Merge them into one edit or target disjoint regions.", .{ prev.idx, a.idx, path });
         }
     }
 
-    if (matches == 0) {
-        // 诊断线索（arena 分配，随本次调用结束释放）
-        const hint = diagnoseEditMiss(args_arena.allocator(), data, args.old_string);
-        return fail(allocator, "Could not find the exact text in {s}. The old_string must match exactly including all whitespace and newlines.{s}", .{ args.path, hint });
-    }
-    if (matches > 1 and !args.replace_all) {
-        return fail(allocator, "Found {d} occurrences of the text in {s}. The text must be unique. Please provide more context to make it unique, or set replace_all=true.", .{ matches, args.path });
-    }
-
+    // 应用：按位置顺序拼接（已排序，直接一次遍历）
     var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
     defer out.deinit(allocator);
-    var idx: usize = 0;
-    var replaced: usize = 0;
-    while (std.mem.indexOfPos(u8, data, idx, old)) |at| {
-        try out.appendSlice(allocator, data[idx..at]);
-        try out.appendSlice(allocator, new);
-        idx = at + old.len;
-        replaced += 1;
-        if (!args.replace_all) break;
+    var cursor: usize = 0;
+    for (applied.items) |a| {
+        try out.appendSlice(allocator, data[cursor..a.start]);
+        try out.appendSlice(allocator, a.new_text);
+        cursor = a.start + a.old_len;
     }
-    try out.appendSlice(allocator, data[idx..]);
+    try out.appendSlice(allocator, data[cursor..]);
 
     if (std.mem.eql(u8, out.items, data)) {
-        return fail(allocator, "No changes made to {s}: the replacement produced identical content.", .{args.path});
+        return fail(allocator, "No changes made to {s}: the edits produced identical content.", .{path});
     }
 
     writeFileBytes(io, abs, out.items) catch |err| {
-        return fail(allocator, "Could not write file {s}: {s}", .{ args.path, @errorName(err) });
+        return fail(allocator, "Could not write file {s}: {s}", .{ path, @errorName(err) });
     };
     const display = buildEditDiff(allocator, data, out.items) catch null;
     return .{
-        .content = try std.fmt.allocPrint(allocator, "Successfully replaced {d} block(s) in {s}.", .{ replaced, args.path }),
+        .content = try std.fmt.allocPrint(allocator, "Successfully applied {d} edit{s} in {s}.", .{ edits.len, if (edits.len == 1) "" else "s", path }),
         .is_error = false,
         .display = display,
     };
@@ -1736,7 +1817,7 @@ test "tools: read/write/edit/ls/find/grep 基础流程" {
 
     // edit：精确替换
     {
-        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_tools/src/a.txt\",\"old_string\":\"world\",\"new_string\":\"Zig\"}");
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_tools/src/a.txt\",\"edits\":[{\"old_text\":\"world\",\"new_text\":\"Zig\"}]}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
         try testing.expect(!r.is_error);
@@ -1745,30 +1826,31 @@ test "tools: read/write/edit/ls/find/grep 基础流程" {
         try testing.expect(std.mem.indexOf(u8, rd.content, "Zig") != null);
     }
 
-    // edit：不唯一
+    // edit：不唯一（edits[] 形式）
     {
-        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_tools/src/a.txt\",\"old_string\":\"o\",\"new_string\":\"0\"}");
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_tools/src/a.txt\",\"edits\":[{\"old_text\":\"o\",\"new_text\":\"0\"}]}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
         try testing.expect(r.is_error);
         try testing.expect(std.mem.indexOf(u8, r.content, "occurrences") != null);
     }
 
-    // edit：replace_all
+    // edit：单条成功（edits[] 一个元素）
     {
-        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_tools/src/a.txt\",\"old_string\":\"o\",\"new_string\":\"0\",\"replace_all\":true}");
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_tools/src/a.txt\",\"edits\":[{\"old_text\":\"foo bar\",\"new_text\":\"foo BAR\"}]}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
         try testing.expect(!r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "1 edit in") != null);
     }
 
     // edit：找不到
     {
-        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_tools/src/a.txt\",\"old_string\":\"不存在的内容\",\"new_string\":\"x\"}");
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_tools/src/a.txt\",\"edits\":[{\"old_text\":\"不存在的内容\",\"new_text\":\"x\"}]}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
         try testing.expect(r.is_error);
-        try testing.expect(std.mem.indexOf(u8, r.content, "Could not find") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "could not find") != null);
     }
 
     // ls：目录后缀与排序
@@ -1848,7 +1930,7 @@ test "tools: read/write/edit/ls/find/grep 基础流程" {
         const r = try execute(testing.allocator, io, cwd, "grep", "{\"pattern\":\"Zig\",\"path\":\"skynet_test_tools\",\"context\":1}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
-        try testing.expect(std.mem.indexOf(u8, r.content, "  Line 1- hell0") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "  Line 1- hello") != null);
         try testing.expect(std.mem.indexOf(u8, r.content, "  Line 2: Zig") != null);
     }
 
@@ -1891,7 +1973,7 @@ test "tools: edit 生成行号 diff 展示" {
     }
     {
         // 把 l5 换成两行（L5 / L5b）：删除 1 行、新增 2 行
-        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_diff/a.txt\",\"old_string\":\"l5\",\"new_string\":\"L5\\nL5b\"}");
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_diff/a.txt\",\"edits\":[{\"old_text\":\"l5\",\"new_text\":\"L5\\nL5b\"}]}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
         try testing.expect(!r.is_error);
@@ -1934,7 +2016,7 @@ test "tools: edit 匹配失败时给出诊断线索" {
     }
     {
         // 行尾空白差异：文件 "beta   \ngamma"，old "beta\ngamma" → 精确失败、归一化可匹配
-        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/a.txt\",\"old_string\":\"beta\\ngamma\",\"new_string\":\"B\\nG\"}");
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/a.txt\",\"edits\":[{\"old_text\":\"beta\\ngamma\",\"new_text\":\"B\\nG\"}]}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
         try testing.expect(r.is_error);
@@ -1942,7 +2024,7 @@ test "tools: edit 匹配失败时给出诊断线索" {
     }
     {
         // 近似位置：首行存在但整体不匹配
-        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/a.txt\",\"old_string\":\"gamma\\nDELTA_NOT_PRESENT\",\"new_string\":\"x\"}");
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/a.txt\",\"edits\":[{\"old_text\":\"gamma\\nDELTA_NOT_PRESENT\",\"new_text\":\"x\"}]}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
         try testing.expect(r.is_error);
@@ -1950,11 +2032,103 @@ test "tools: edit 匹配失败时给出诊断线索" {
     }
     {
         // 完全无关：无 Hint（且不应崩）
-        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/a.txt\",\"old_string\":\"ZZZ_NOT_IN_FILE_AT_ALL\",\"new_string\":\"x\"}");
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/a.txt\",\"edits\":[{\"old_text\":\"ZZZ_NOT_IN_FILE_AT_ALL\",\"new_text\":\"x\"}]}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
         try testing.expect(r.is_error);
         try testing.expect(std.mem.indexOf(u8, r.content, "Hint:") == null);
+    }
+}
+
+test "tools: edit edits[]——成功 / 重叠 / 不唯一 / 不匹配（全有或全无）/ 容错解析" {
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    defer threaded.deinit();
+
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+
+    const root_name = "skynet_test_edit_multi";
+    const root = try std.fs.path.join(testing.allocator, &.{ cwd, root_name });
+    defer testing.allocator.free(root);
+    removeTree(io, testing.allocator, root);
+    defer removeTree(io, testing.allocator, root);
+
+    const write = struct {
+        fn call(a: std.mem.Allocator, io_: Io, cwd_: []const u8, body: []const u8) !void {
+            const r = try execute(a, io_, cwd_, "write", body);
+            defer a.free(r.content);
+            defer if (r.display) |d| a.free(d);
+            try testing.expect(!r.is_error);
+        }
+    }.call;
+
+    const read = struct {
+        fn call(a: std.mem.Allocator, io_: Io, cwd_: []const u8) ![]u8 {
+            const r = try execute(a, io_, cwd_, "read", "{\"path\":\"skynet_test_edit_multi/f.txt\"}");
+            defer if (r.display) |d| a.free(d);
+            defer a.free(r.content);
+            return a.dupe(u8, r.content);
+        }
+    }.call;
+
+    // 成功：两处不相交替换，一次调用完成
+    {
+        try write(testing.allocator, io, cwd, "{\"path\":\"skynet_test_edit_multi/f.txt\",\"content\":\"alpha\\nbeta\\ngamma\\ndelta\\n\"}");
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_multi/f.txt\",\"edits\":[{\"old_text\":\"alpha\",\"new_text\":\"ALPHA\"},{\"old_text\":\"gamma\",\"new_text\":\"GAMMA\"}]}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "2 edits in") != null);
+        const content = try read(testing.allocator, io, cwd);
+        defer testing.allocator.free(content);
+        try testing.expect(std.mem.indexOf(u8, content, "ALPHA") != null);
+        try testing.expect(std.mem.indexOf(u8, content, "GAMMA") != null);
+        try testing.expect(std.mem.indexOf(u8, content, "beta") != null); // 未动的保留
+    }
+
+    // 重叠：报错并指出是哪两条（不写文件）
+    {
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_multi/f.txt\",\"edits\":[{\"old_text\":\"ALPHA\\nbeta\",\"new_text\":\"X\"},{\"old_text\":\"beta\\nGAMMA\",\"new_text\":\"Y\"}]}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "overlap") != null);
+        const content = try read(testing.allocator, io, cwd);
+        defer testing.allocator.free(content);
+        try testing.expect(std.mem.indexOf(u8, content, "ALPHA") != null); // 未被改动
+    }
+
+    // 不唯一：报错并给出出现次数
+    {
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_multi/f.txt\",\"edits\":[{\"old_text\":\"a\",\"new_text\":\"A\"}]}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "edits[0]") != null);
+    }
+
+    // 不匹配：报错（全有或全无——第一处成功、第二处失败 → 不写文件）
+    {
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_multi/f.txt\",\"edits\":[{\"old_text\":\"delta\",\"new_text\":\"DELTA\"},{\"old_text\":\"NOT_PRESENT\",\"new_text\":\"X\"}]}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "edits[1]") != null);
+        const content = try read(testing.allocator, io, cwd);
+        defer testing.allocator.free(content);
+        try testing.expect(std.mem.indexOf(u8, content, "DELTA") == null); // 第一处也未应用
+    }
+
+    // 容错：edits 传成单个对象（而非数组）也能解析
+    {
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_multi/f.txt\",\"edits\":{\"old_text\":\"delta\",\"new_text\":\"DELTA\"}}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+        const content = try read(testing.allocator, io, cwd);
+        defer testing.allocator.free(content);
+        try testing.expect(std.mem.indexOf(u8, content, "DELTA") != null);
     }
 }
 
