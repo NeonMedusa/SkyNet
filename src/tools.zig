@@ -1215,6 +1215,11 @@ const GrepCtx = struct {
     truncated: bool = false,
     /// 已达到 limit 且探测到还有更多匹配（用于提示准确性）
     more: bool = false,
+    /// 当前输出所属文件（按文件分组：切换文件时打印 `path:` 标题行 + 空行分隔）。
+    /// 拥有所有权（复制自 walk 的临时 rel——它每次迭代都会释放）
+    last_file: []u8 = &.{},
+    /// 已输出的匹配行数（用于顶部 "Found N matches" 统计）
+    matched_lines: usize = 0,
 
     fn stop(self: *@This()) bool {
         return self.truncated or self.more;
@@ -1281,9 +1286,22 @@ const GrepCtx = struct {
     }
 
     fn emit(self: *@This(), label: []const u8, line_no: usize, text: []const u8, is_match: bool) error{OutOfMemory}!void {
+        // 按文件分组（opencode 风格）：文件切换时输出标题行，文件之间空行分隔。
+        // 注意 label 来自 walk 的临时切片，需复制后持有（last_file 拥有所有权）。
+        if (!std.mem.eql(u8, self.last_file, label)) {
+            if (self.last_file.len > 0) try self.out.append(self.allocator, '\n');
+            const head = try std.fmt.allocPrint(self.allocator, "{s}:\n", .{label});
+            defer self.allocator.free(head);
+            try self.out.appendSlice(self.allocator, head);
+            if (self.last_file.len > 0) self.allocator.free(self.last_file);
+            self.last_file = try self.allocator.dupe(u8, label);
+        }
+        if (is_match) self.matched_lines += 1;
+
         const shown = truncateLine(text, max_line_len);
+        // 匹配行 `  Line N: text`；上下文行 `  Line N- text`（grep 惯例用 - 区分）
         const sep: u8 = if (is_match) ':' else '-';
-        const line = try std.fmt.allocPrint(self.allocator, "{s}{c}{d}{c} {s}\n", .{ label, sep, line_no, sep, shown });
+        const line = try std.fmt.allocPrint(self.allocator, "  Line {d}{c} {s}\n", .{ line_no, sep, shown });
         defer self.allocator.free(line);
         try self.out.appendSlice(self.allocator, line);
     }
@@ -1338,10 +1356,21 @@ fn toolGrep(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8
     } else {
         try walk(io, allocator, abs, "", 0, &ctx);
     }
+    defer if (ctx.last_file.len > 0) allocator.free(ctx.last_file);
 
     if (out.items.len == 0) {
         out.deinit(allocator);
         return ok(allocator, "No matches found", .{});
+    }
+
+    // 顶部统计（opencode 风格）：`Found N matches`，后接空行
+    {
+        const header = try std.fmt.allocPrint(allocator, "Found {d} match{s}\n\n", .{
+            ctx.matched_lines,
+            if (ctx.matched_lines == 1) "" else "es",
+        });
+        defer allocator.free(header);
+        try out.insertSlice(allocator, 0, header);
     }
 
     if (ctx.truncated) {
@@ -1819,8 +1848,8 @@ test "tools: read/write/edit/ls/find/grep 基础流程" {
         const r = try execute(testing.allocator, io, cwd, "grep", "{\"pattern\":\"Zig\",\"path\":\"skynet_test_tools\",\"context\":1}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
-        try testing.expect(std.mem.indexOf(u8, r.content, "-1- hell0") != null);
-        try testing.expect(std.mem.indexOf(u8, r.content, ":2: Zig") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "  Line 1- hell0") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "  Line 2: Zig") != null);
     }
 
     // grep：结果数恰好等于 limit 时不应误报
@@ -2286,11 +2315,14 @@ test "tools: grep 重叠上下文不重复输出，且不以换行结尾时不�
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
         const expected =
-            "a.txt-1- L1\n" ++
-            "a.txt:2: matchA\n" ++
-            "a.txt-3- L3\n" ++
-            "a.txt:4: matchB\n" ++
-            "a.txt-5- L5\n";
+            "Found 2 matches\n" ++
+            "\n" ++
+            "a.txt:\n" ++
+            "  Line 1- L1\n" ++
+            "  Line 2: matchA\n" ++
+            "  Line 3- L3\n" ++
+            "  Line 4: matchB\n" ++
+            "  Line 5- L5\n";
         try testing.expectEqualStrings(expected, r.content);
     }
 
@@ -2299,7 +2331,14 @@ test "tools: grep 重叠上下文不重复输出，且不以换行结尾时不�
         const r = try execute(testing.allocator, io, cwd, "grep", "{\"pattern\":\"match[AB]\",\"path\":\"skynet_test_grep_ctx/a.txt\"}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
-        try testing.expectEqualStrings("skynet_test_grep_ctx/a.txt:2: matchA\nskynet_test_grep_ctx/a.txt:4: matchB\n", r.content);
+        try testing.expectEqualStrings(
+            "Found 2 matches\n" ++
+                "\n" ++
+                "skynet_test_grep_ctx/a.txt:\n" ++
+                "  Line 2: matchA\n" ++
+                "  Line 4: matchB\n",
+            r.content,
+        );
     }
 }
 
@@ -2465,18 +2504,18 @@ test "tools: grep 锚点与空行（零宽匹配）" {
         const r = try execute(testing.allocator, io, cwd, "grep", "{\"pattern\":\"^$\",\"path\":\"skynet_test_grep_anchor/a.txt\"}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
-        try testing.expect(std.mem.indexOf(u8, r.content, ":2:") != null);
-        try testing.expect(std.mem.indexOf(u8, r.content, ":1:") == null);
-        try testing.expect(std.mem.indexOf(u8, r.content, ":3:") == null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "Line 2:") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "Line 1:") == null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "Line 3:") == null);
     }
     // ^ 应匹配每一行（3 行）
     {
         const r = try execute(testing.allocator, io, cwd, "grep", "{\"pattern\":\"^\",\"path\":\"skynet_test_grep_anchor/a.txt\"}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
-        try testing.expect(std.mem.indexOf(u8, r.content, ":1:") != null);
-        try testing.expect(std.mem.indexOf(u8, r.content, ":2:") != null);
-        try testing.expect(std.mem.indexOf(u8, r.content, ":3:") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "Line 1:") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "Line 2:") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "Line 3:") != null);
     }
 }
 
