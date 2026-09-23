@@ -296,6 +296,43 @@ Claude Code / Cursor / Aider 用 `old_string`/`old_str`，我们用蛇形 `old_t
 **结论**：暂不做；若将来出现真实需求（如用户抱怨"换了 agent 后旧习惯失效"）再评估。
 当前容错层只保留一种：`edits` 传成单个对象（纯格式差异，无命名歧义）。
 
+### 2.7 生成中手动压缩（排队）——已实现（2026-09-22）
+
+**背景**：此前 AI 生成中用户按 `/compact` 会被直接拒绝（长任务下用户被锁死）。
+现改为**排队到下一个工具轮间隙执行**，与自动压缩同位置同函数。
+
+**实现要点**：
+
+- 生成中按 `/compact`（或菜单确认）→ `compact_queued` 置位 + toast
+  `压缩已排队，将在下一个工具轮执行`；`/compact N` 的保留窗口覆盖一并记住
+  （`compact_queued_keep`）。
+- **去重与提示语义**：
+  - 已有排队请求 → 不重复入队（提示 `压缩已排队，将在下一个工具轮执行`），
+    但 `/compact N` 的**最新保留窗口生效**（后打的覆盖先前的）；
+  - 间隙里的一次性压缩**正在流式执行**时触发 → **不入队**（那次就是最新的），
+    提示 `压缩正在进行中`（此前会谎称"已排队"，实际请求会静默丢失）。
+- **执行位置**：`streamWorker` 主循环的工具轮边界（`injectPendingSends` 之后）——
+  `manual_queued` 时以 `force=true` 调 `compactJobHistory`（跳过阈值检查，用户显式
+  要求；但仍需有可压缩内容），且**跳过同一间隙的自动阈值检查**（避免连压两次）。
+- **兜底**：若本轮直到结束都没碰到间隙（单轮纯回答/被取消），
+  `flushPendingSends` 在空闲时补执行。
+- **无可压内容**：保留区无可摘要内容时给 toast `上次压缩后暂无新增内容，无需压缩`
+  （通过新的事件类型 `.toast` 从 worker 回传）。
+- **不单独加"最小上下文 token 阈值"**：`selectCompactionRange` 的 null 判断已是
+  "内容不够"的准确判据（且能贴合用户配置的保留窗口）；额外阈值会与保留窗口打架。
+  pi 同样只有 "session too small" 语义，无独立阈值。
+- **提示文案细化**（空闲时直接压的场景）："上次压缩后暂无新增内容，无需压缩"
+  （已有 checkpoint）vs "内容较少，无需压缩"（本来就少）。
+
+**参考：自动压缩的现有行为**（未变）：在工具轮间隙（`injectPendingSends` →
+`compactJobHistory` → 下一轮请求）触发；压缩后重建 `job.history`，**AI 继续干未完成的
+活**（不是等全部干完）。与 pi 一致（pi 文档：*checks after tools finish, before
+starting the next assistant response*）。
+
+**未采纳的备选**：对齐 pi 的"中止当前响应立刻压缩"（`AgentSession.compact()` 首行
+`await this.abort()`，被中止的响应以 `stopReason: aborted` 落库）——优点是立即生效；
+缺点是丢失 AI 正在做的活（长任务体验差）。需要时可 `Ctrl+Q` 中止后再 `/compact`。
+
 ---
 
 ## 3. 开发注意事项

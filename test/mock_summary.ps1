@@ -23,7 +23,10 @@ try {
         $reader.Close()
 
         # 摘要请求（无 tools）；普通请求也统一返回摘要，便于测试
+        # 先发思考增量（reasoning_content），再发正文（覆盖摘要思考块的流式显示与落库）
         $chunks = @()
+        $chunks += 'data: {"choices":[{"delta":{"reasoning_content":"MOCK_REASONING 先梳理"}}]}' + "`n`n"
+        $chunks += 'data: {"choices":[{"delta":{"reasoning_content":"需要保留哪些要点"}}]}' + "`n`n"
         $chunks += 'data: {"choices":[{"delta":{"content":"## Goal\nMOCK_SUMMARY 完成压缩测试\n\n## Progress\n- 旧对话已摘要\n\n## Next steps\n- 继续"}}]}' + "`n`n"
         $chunks += 'data: {"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":10}}' + "`n`n"
         $chunks += 'data: [DONE]' + "`n`n"

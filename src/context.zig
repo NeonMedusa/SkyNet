@@ -112,9 +112,43 @@ pub fn simulateFold(history_oldest_first: []const ai.Message) FoldSim {
 
 // ── 压缩 ──
 
+/// checkpoint 伪消息的固定包装（发送与解析共用，避免格式漂移）
+pub const checkpoint_tag = "<conversation-checkpoint>";
+pub const checkpoint_desc = "（更早的对话已压缩，以下为摘要；需要细节时读取相关文件或询问用户）";
+
 /// 是否为压缩 checkpoint 伪消息
 pub fn isCheckpointMessage(m: ai.Message) bool {
-    return std.mem.startsWith(u8, m.content, "<conversation-checkpoint>");
+    return std.mem.startsWith(u8, m.content, checkpoint_tag);
+}
+
+/// 构造 checkpoint 伪消息内容：固定包装 + 摘要正文
+pub fn wrapCheckpoint(allocator: Allocator, summary: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        checkpoint_tag ++ "\n{s}\n{s}\n</conversation-checkpoint>",
+        .{ checkpoint_desc, summary },
+    );
+}
+
+/// 取出 checkpoint 伪消息里的摘要正文（去掉固定包装）。
+/// 二次压缩时要把正文给模型继续合并——带上包装会让模型把标签抄进新摘要。
+/// 反复剥离：历史数据里可能残留模型抄入的嵌套包装（2026-09 修复前的产物）。
+pub fn checkpointBody(content: []const u8) []const u8 {
+    var body = content;
+    while (std.mem.startsWith(u8, body, checkpoint_tag ++ "\n")) {
+        body = body[checkpoint_tag.len + 1 ..];
+        if (std.mem.startsWith(u8, body, checkpoint_desc ++ "\n")) {
+            body = body[checkpoint_desc.len + 1 ..];
+        }
+    }
+    while (true) {
+        if (std.mem.endsWith(u8, body, "\n</conversation-checkpoint>")) {
+            body = body[0 .. body.len - "\n</conversation-checkpoint>".len];
+        } else if (std.mem.endsWith(u8, body, "</conversation-checkpoint>")) {
+            body = body[0 .. body.len - "</conversation-checkpoint>".len];
+        } else break;
+    }
+    return body;
 }
 
 pub const CompactionRange = struct {
@@ -201,7 +235,7 @@ pub fn buildCompactionPayload(
 
     if (prev_summary.len > 0) {
         try out.writer.writeAll("## Earlier summary (already compacted; merge with the new conversation below)\n");
-        try out.writer.writeAll(prev_summary);
+        try out.writer.writeAll(checkpointBody(prev_summary));
         try out.writer.writeAll("\n\n");
     }
 
@@ -402,6 +436,22 @@ test "压缩区间选择：保留区可从 assistant 开始（当前回合可被
     // 预算 3：收下 t2(2)，t1(2) 超预算 → keep_start=6（tool）→ 跳过剩余 tool → 退到 u1
     const r3 = selectCompactionRange(&tails, 3).?;
     try testing.expectEqual(@as(usize, 3), r3.retain_start);
+}
+
+test "checkpointBody：剥离固定包装（二次压缩合并时避免标签污染）" {
+    const wrapped = "<conversation-checkpoint>\n" ++ checkpoint_desc ++ "\n## Goal\n内容\n</conversation-checkpoint>";
+    try testing.expectEqualStrings("## Goal\n内容", checkpointBody(wrapped));
+    // 无包装原样返回；空摘要剥离后为空
+    try testing.expectEqualStrings("plain", checkpointBody("plain"));
+    try testing.expectEqualStrings("", checkpointBody("<conversation-checkpoint>\n" ++ checkpoint_desc ++ "\n\n</conversation-checkpoint>"));
+    // 嵌套包装（历史遗留：模型把包装抄进了摘要正文）→ 全部剥离
+    const nested = "<conversation-checkpoint>\n" ++ checkpoint_desc ++ "\n" ++
+        "<conversation-checkpoint>\n" ++ checkpoint_desc ++ "\n## Goal\n内容\n</conversation-checkpoint>\n</conversation-checkpoint>";
+    try testing.expectEqualStrings("## Goal\n内容", checkpointBody(nested));
+    // wrapCheckpoint 与 checkpointBody 互逆
+    const w = try wrapCheckpoint(testing.allocator, "## X\ny");
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("## X\ny", checkpointBody(w));
 }
 
 test "按字符截断：UTF-8 边界安全" {

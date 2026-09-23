@@ -406,6 +406,18 @@ pub const Db = struct {
         return rows[0];
     }
 
+    /// 列出会话的全部压缩 checkpoint（按 id 升序；结果归属调用者 allocator）。
+    /// 重载显示用：每条摘要行按各自的压缩元数据（tokens_before 等）渲染。
+    pub fn listCompactions(self: *Db, allocator: Allocator, session_id: i64) ![]const CompactionRow {
+        return db_query.queryAll1(
+            &self.sess,
+            allocator,
+            CompactionRow,
+            "SELECT id, session_id, created_at, summary, summary_message_id, tail_start_id, tokens_before, model FROM \"compaction\" WHERE session_id = ? ORDER BY id",
+            session_id,
+        );
+    }
+
     /// 会话列表（按最近活跃排序，含消息数）
     pub fn listSessions(self: *Db) ![]const SessionListRow {
         return try self.sess.raw(

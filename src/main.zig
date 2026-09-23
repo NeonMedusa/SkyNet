@@ -19,6 +19,8 @@ const toolsSchemaBytes = context_mod.toolsSchemaBytes;
 const messageRequestBytes = context_mod.messageRequestBytes;
 const historyRequestBytesSlice = context_mod.historyRequestBytesSlice;
 const isCheckpointMessage = context_mod.isCheckpointMessage;
+const checkpointBody = context_mod.checkpointBody;
+const wrapCheckpoint = context_mod.wrapCheckpoint;
 const CompactionRange = context_mod.CompactionRange;
 const selectCompactionRange = context_mod.selectCompactionRange;
 const compaction_system_prompt = context_mod.compaction_system_prompt;
@@ -409,9 +411,10 @@ fn inputBoxTitle(state: *AppState, buf: []u8) []const u8 {
     if (!busy) return " 输入 ";
     const now = std.Io.Timestamp.now(state.io, .awake).toMilliseconds();
     const frame = spinnerFrame(now);
-    const what: []const u8 = if (state.isCompacting()) "压缩中" else "生成中";
+    // 统一文案：手动压缩与工具轮间隙的自动压缩在用户看来都是"压缩中"
+    const what: []const u8 = if (state.isCompacting() or state.compact_live_running.load(.acquire)) "压缩中" else "生成中";
     // 回合起始缺失（如压缩）时不显示秒数
-    if (state.stream_start_ms >= 0) {
+    if (state.stream_start_ms >= 0 and !std.mem.eql(u8, what, "压缩中")) {
         const secs = @divFloor(now - state.stream_start_ms, 1000);
         return std.fmt.bufPrint(buf, " {s} {s} {d}s ", .{ frame, what, secs }) catch " 处理中 ";
     }
@@ -437,7 +440,11 @@ const tool_schemas = blk: {
     break :blk arr;
 };
 
-const StreamEventKind = enum { turn_end, tool_start, tool_end, user_sent, retry_start };
+const StreamEventKind = enum { turn_end, tool_start, tool_end, user_sent, retry_start, toast };
+
+/// 进行中/压缩的统一强调色（偏红的橙色）：输入框忙碌边框、压缩通知共用。
+/// 终端不支持 24-bit 色时由终端降级到近似色。
+const busy_accent = tui.style.Color.fromRGB(255, 100, 0);
 
 const StreamEvent = struct {
     kind: StreamEventKind,
@@ -565,6 +572,12 @@ const AppState = struct {
     /// 生成/压缩期间用户提交、等待发送的消息（主线程入队；worker 在工具轮次边界取走注入）
     pending_sends_mutex: Io.Mutex = .init,
     pending_sends: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 },
+    /// 生成中用户按 /compact：排队到下一个工具轮间隙执行（与自动压缩同位置同函数）。
+    /// worker 在每个轮次边界 swap(false) 取走；若本轮直到结束都没到间隙，
+    /// 由 flushPendingSends 在空闲时执行。重复触发只提示不重复入队。
+    compact_queued: std.atomic.Value(bool) = .init(false),
+    /// 排队压缩的保留窗口覆盖（/compact N；0 = 用配置值）
+    compact_queued_keep: std.atomic.Value(usize) = .init(0),
     /// 最近一次请求的 token 用量；无真实数据时为历史估算值（见 usage_estimated）
     last_usage: ai.Usage = .{},
     /// 本轮最后一个请求的用量（上下文占用显示：工具循环的多轮请求不累计）
@@ -601,6 +614,20 @@ const AppState = struct {
     compact_mutex: Io.Mutex = .init,
     compact_buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
     compact_consume_pos: usize = 0,
+    /// 摘要思考增量缓冲（与正文并行；同样由 compact_mutex 保护）
+    compact_reasoning_buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    compact_consume_reasoning_pos: usize = 0,
+    /// 工具循环中途压缩的流式显示：true = worker 正在流式产出摘要。
+    /// 与 compact_status（手动 /compact 的异步状态机）互斥（生成中禁止手动压缩）。
+    compact_live_running: std.atomic.Value(bool) = .init(false),
+    /// true = 摘要流已结束、等待主线程收尾（消费剩余增量 + 替换标题）
+    compact_live_pending: std.atomic.Value(bool) = .init(false),
+    /// 中途压缩收尾元数据（compact_mutex 保护）
+    compact_live_tokens_before: usize = 0,
+    compact_live_summarized: usize = 0,
+    compact_live_failed: bool = false,
+    /// true = 本轮被取消（Ctrl+Q）导致压缩中断：不展示失败提示，直接移除气泡
+    compact_live_aborted: bool = false,
     /// 压缩提示标题消息下标 / 正在流式的摘要正文消息下标
     compact_head_idx: ?usize = null,
     compact_msg_idx: ?usize = null,
@@ -1063,7 +1090,8 @@ const AppState = struct {
         if (window == 0) return;
         const est = self.estimateRequestTokens();
         if (est * 100 < window * self.auto_compact_pct) return;
-        _ = self.runCompaction(0);
+        const out = self.runCompaction(0);
+        if (out.compacted) self.setToast("上下文已自动压缩");
     }
 
     /// 同步执行一次上下文压缩（自动触发 / CLI 用；TUI 手动走异步 startCompaction）。
@@ -1472,18 +1500,20 @@ const AppState = struct {
     /// 把数据库中的消息灌入内存历史与界面显示（无 checkpoint 版本）。
     /// `prepend_system`：增量追加传 false（历史里已有 system，勿重复前置）
     fn applyLoadedMessages(self: *AppState, rows: []const db_mod.MessageRow, prepend_system: bool) void {
-        self.applyLoadedMessagesWithCheckpoint(rows, null, true, prepend_system);
+        self.applyLoadedMessagesWithCheckpoint(rows, null, &.{}, true, prepend_system);
     }
 
     /// 把数据库中的消息灌入内存历史与界面显示
     /// - system：政策A——提示词属于程序（随源码版本升级）；DB 不含 system 行，
     ///   重建时统一前置当前值一次（`prepend_system=true`）
     /// - 有 checkpoint：历史重建为 system + 摘要伪消息 + 保留区
+    /// - 摘要行（role='summary'）在显示中就地渲染（黄标题 + 思考块 + 正文）
     /// - assistant/tool：恢复工具调用字段与提示行
     fn applyLoadedMessagesWithCheckpoint(
         self: *AppState,
         rows: []const db_mod.MessageRow,
         checkpoint: ?db_mod.CompactionRow,
+        compactions: []const db_mod.CompactionRow,
         with_display: bool,
         prepend_system: bool,
     ) void {
@@ -1506,21 +1536,18 @@ const AppState = struct {
         // 摘要文本：优先取 role='summary' 的消息行；消息行落库失败时回退到 compaction.summary
         var summary_text: []const u8 = "";
         var summary_msg_id: i64 = 0;
-        var compacted_count: usize = 0;
         if (checkpoint) |cp| {
             summary_msg_id = cp.summary_message_id;
             if (summary_msg_id != 0) {
                 for (rows) |row| {
                     if (row.id == summary_msg_id) {
-                        summary_text = row.content;
+                        // 历史数据可能含旧 bug 遗留的嵌套包装（模型把标签抄进摘要）→ 剥离
+                        summary_text = checkpointBody(row.content);
                         break;
                     }
                 }
             }
-            if (summary_text.len == 0) summary_text = cp.summary;
-            for (rows) |row| {
-                if (row.id < cp.tail_start_id) compacted_count += 1;
-            }
+            if (summary_text.len == 0) summary_text = checkpointBody(cp.summary);
         }
 
         if (checkpoint != null) {
@@ -1530,16 +1557,41 @@ const AppState = struct {
 
         // 注意：历史只收保留区（id >= tail_start_id），但**显示始终保留全部消息**，
         // 这样用户仍能往上滚动查看被压缩的历史。
-        var marker_shown = checkpoint == null;
+        // 摘要行按各自的真实位置就地渲染（与生成时一致，重启后位置不变）。
         for (rows) |row| {
             if (row.id > self.last_seen_msg_id) self.last_seen_msg_id = row.id;
-            // 摘要消息行在显示上由边界气泡代替（避免出现在末尾）
-            if (summary_msg_id != 0 and row.id == summary_msg_id) continue;
-
             const in_tail = checkpoint == null or row.id >= checkpoint.?.tail_start_id;
-            if (!marker_shown and in_tail) {
-                if (with_display) self.appendCheckpointDisplay(summary_text, compacted_count, checkpoint.?);
-                marker_shown = true;
+
+            // 压缩摘要行（role='summary'）：显示为黄标题 + 思考块 + 正文；不进历史
+            if (std.mem.eql(u8, row.role, "summary")) {
+                if (with_display) {
+                    var notice_buf: [256]u8 = undefined;
+                    var tokens_before: i64 = 0;
+                    var summarized: usize = 0;
+                    for (compactions) |cp| {
+                        if (cp.summary_message_id == row.id) {
+                            tokens_before = cp.tokens_before;
+                            for (rows) |r| {
+                                if (r.id < cp.tail_start_id) summarized += 1;
+                            }
+                            break;
+                        }
+                    }
+                    const header = formatCompactionNotice(
+                        &notice_buf,
+                        summarized,
+                        row.content.len,
+                        @intCast(@max(tokens_before, 0)),
+                    );
+                    self.addMessage(header, .{ .fg = busy_accent });
+                    self.addLoadedAssistantMessage(
+                        checkpointBody(row.content),
+                        row.reasoning,
+                        row.reasoning_ms,
+                        row.id,
+                    );
+                }
+                continue;
             }
 
             if (std.mem.eql(u8, row.role, "tool")) {
@@ -1684,6 +1736,7 @@ const AppState = struct {
         db.touchSession(session_id) catch {};
         self.last_seen_msg_id = 0;
         const checkpoint = db.latestCompaction(session_id) catch null;
+        const compactions = db.listCompactions(scratch.allocator(), session_id) catch &.{};
         self.last_compaction_id = if (checkpoint) |c| c.id else 0;
         if (rows.len == 0 and checkpoint == null) {
             // 空会话：历史 = 当前提示词（与新建一致），并刷新估算显示
@@ -1691,7 +1744,7 @@ const AppState = struct {
             self.refreshEstimatedUsage();
             return;
         }
-        self.applyLoadedMessagesWithCheckpoint(rows, checkpoint, true, true);
+        self.applyLoadedMessagesWithCheckpoint(rows, checkpoint, compactions, true, true);
         Log.info(.startup, "加载会话 {d}: {d} 行, checkpoint={}", .{ session_id, rows.len, checkpoint != null });
     }
 
@@ -1703,41 +1756,18 @@ const AppState = struct {
         defer scratch.deinit();
         const rows = db.loadMessagesWith(scratch.allocator(), self.session_id) catch return;
         const checkpoint = db.latestCompaction(self.session_id) catch null;
+        const compactions = db.listCompactions(scratch.allocator(), self.session_id) catch &.{};
         self.clearHistory();
         self.last_seen_msg_id = 0;
         self.last_compaction_id = if (checkpoint) |c| c.id else 0;
-        self.applyLoadedMessagesWithCheckpoint(rows, checkpoint, false, true);
+        self.applyLoadedMessagesWithCheckpoint(rows, checkpoint, compactions, false, true);
     }
 
     /// 把压缩摘要作为历史中的 checkpoint 伪消息（user 角色，内容固定利于缓存稳定）
     fn appendCheckpointHistory(self: *AppState, summary: []const u8) void {
-        const wrapper = std.fmt.allocPrint(
-            self.allocator,
-            "<conversation-checkpoint>\n（更早的对话已压缩，以下为摘要；需要细节时读取相关文件或询问用户）\n{s}\n</conversation-checkpoint>",
-            .{summary},
-        ) catch return;
+        const wrapper = wrapCheckpoint(self.allocator, summary) catch return;
         defer self.allocator.free(wrapper);
         self.appendHistoryMessage(.{ .role = "user", .content = wrapper });
-    }
-
-    /// 界面上显示压缩边界气泡：黄色标题 + 摘要正文（可像普通对话一样回看；不进历史）
-    fn appendCheckpointDisplay(
-        self: *AppState,
-        summary: []const u8,
-        compacted_count: usize,
-        cp: db_mod.CompactionRow,
-    ) void {
-        var buf: [256]u8 = undefined;
-        const header = formatCompactionNotice(
-            &buf,
-            compacted_count,
-            summary.len,
-            @intCast(@max(cp.tokens_before, 0)),
-        );
-        self.addMessage(header, .{ .fg = .yellow });
-        if (summary.len > 0) {
-            self.addMessageImpl(summary, .{}, true, false);
-        }
     }
 
     /// 切换到指定会话（生成中禁止，避免历史/显示被并发修改）
@@ -1942,8 +1972,24 @@ const AppState = struct {
 
     /// 启动异步压缩：预选区间（纯计算）→ 快照历史 → worker 流式产出摘要
     fn startCompaction(self: *AppState, keep_override: usize) void {
+        // 生成中：排队到下一个工具轮间隙（与自动压缩同位置同函数执行）
         if (self.isStreaming()) {
-            self.addMessage("生成中，无法压缩上下文", .{ .fg = .red });
+            // 间隙里的一次性压缩正在流式执行：不入队（那次就是最新的），
+            // 如实告知而非谎称"已排队"（否则用户会以为请求排上了）
+            if (self.compact_live_running.load(.acquire) or self.isCompacting()) {
+                self.setToast("压缩正在进行中");
+                return;
+            }
+            // 已有排队请求：不重复入队（避免连压两次），但 /compact N 的
+            // 最新保留窗口生效（用户最近一次敲的指令优先）
+            if (self.compact_queued.load(.acquire)) {
+                if (keep_override > 0) self.compact_queued_keep.store(keep_override, .release);
+                self.setToast("压缩已排队，将在下一个工具轮执行");
+                return;
+            }
+            self.compact_queued_keep.store(keep_override, .release);
+            self.compact_queued.store(true, .release);
+            self.setToast("压缩已排队，将在下一个工具轮执行");
             return;
         }
         if (self.isCompacting()) {
@@ -1964,7 +2010,13 @@ const AppState = struct {
             return;
         }
         const keep = self.chooseCompactionKeep(keep_override) orelse {
-            self.addMessage("当前内容无需压缩", .{ .fg = .dark_gray });
+            // 区分两种"不需要压缩"：刚压过（已有 checkpoint） vs 内容本来就少
+            const has_checkpoint = self.last_compaction_id != 0;
+            if (has_checkpoint) {
+                self.addMessage("上次压缩后暂无新增内容，无需压缩", .{ .fg = .dark_gray });
+            } else {
+                self.addMessage("内容较少，无需压缩", .{ .fg = .dark_gray });
+            }
             return;
         };
         const plan = self.buildCompactionPlan(provider, model, keep) catch {
@@ -1973,12 +2025,7 @@ const AppState = struct {
         };
 
         self.compact_cancel.store(false, .release);
-        self.compact_mutex.lockUncancelable(self.io);
-        self.compact_buf.clearRetainingCapacity();
-        self.compact_consume_pos = 0;
-        self.compact_mutex.unlock(self.io);
-        self.compact_head_idx = null;
-        self.compact_msg_idx = null;
+        self.resetCompactStreamState();
         self.compact_plan = plan;
         self.compact_status.store(1, .release);
         self.compact_thread = std.Thread.spawn(.{}, compactionWorker, .{plan}) catch {
@@ -1990,10 +2037,61 @@ const AppState = struct {
         };
     }
 
-    /// 主循环泵：消费摘要增量 + 结束收尾
+    /// 重置压缩流式显示状态（新压缩开始前调用）
+    fn resetCompactStreamState(self: *AppState) void {
+        self.compact_mutex.lockUncancelable(self.io);
+        self.compact_buf.clearRetainingCapacity();
+        self.compact_consume_pos = 0;
+        self.compact_reasoning_buf.clearRetainingCapacity();
+        self.compact_consume_reasoning_pos = 0;
+        self.compact_live_failed = false;
+        self.compact_live_aborted = false;
+        self.compact_mutex.unlock(self.io);
+        self.compact_head_idx = null;
+        self.compact_msg_idx = null;
+    }
+
+    /// 把缓冲里尚未消费的摘要增量补进显示（收尾前调用；避免最后一段被截）
+    fn drainCompactBuffersInline(self: *AppState) void {
+        while (true) {
+            var delta: ?[]u8 = null;
+            var reasoning: ?[]u8 = null;
+            self.compact_mutex.lockUncancelable(self.io);
+            if (self.compact_buf.items.len > self.compact_consume_pos) {
+                const slice = self.compact_buf.items[self.compact_consume_pos..];
+                if (self.allocator.dupe(u8, slice)) |copy| {
+                    delta = copy;
+                    self.compact_consume_pos = self.compact_buf.items.len;
+                } else |_| {}
+            }
+            if (self.compact_reasoning_buf.items.len > self.compact_consume_reasoning_pos) {
+                const slice = self.compact_reasoning_buf.items[self.compact_consume_reasoning_pos..];
+                if (self.allocator.dupe(u8, slice)) |copy| {
+                    reasoning = copy;
+                    self.compact_consume_reasoning_pos = self.compact_reasoning_buf.items.len;
+                } else |_| {}
+            }
+            self.compact_mutex.unlock(self.io);
+            if (delta == null and reasoning == null) return;
+            if (reasoning) |r| {
+                self.appendCompactReasoning(r);
+                self.allocator.free(r);
+            }
+            if (delta) |d| {
+                self.appendCompactChunk(d);
+                self.allocator.free(d);
+            }
+        }
+    }
+
+    /// 主循环泵：消费摘要增量（手动 /compact 与工具循环中途压缩共用）+ 结束收尾
     fn pumpCompaction(self: *AppState) void {
-        if (self.compact_status.load(.acquire) == 0) return;
+        const async_status = self.compact_status.load(.acquire);
+        if (async_status == 0 and
+            !self.compact_live_running.load(.acquire) and
+            !self.compact_live_pending.load(.acquire)) return;
         var delta: ?[]u8 = null;
+        var reasoning: ?[]u8 = null;
         self.compact_mutex.lockUncancelable(self.io);
         if (self.compact_buf.items.len > self.compact_consume_pos) {
             const slice = self.compact_buf.items[self.compact_consume_pos..];
@@ -2002,7 +2100,18 @@ const AppState = struct {
                 self.compact_consume_pos = self.compact_buf.items.len;
             } else |_| {}
         }
+        if (self.compact_reasoning_buf.items.len > self.compact_consume_reasoning_pos) {
+            const slice = self.compact_reasoning_buf.items[self.compact_consume_reasoning_pos..];
+            if (self.allocator.dupe(u8, slice)) |copy| {
+                reasoning = copy;
+                self.compact_consume_reasoning_pos = self.compact_reasoning_buf.items.len;
+            } else |_| {}
+        }
         self.compact_mutex.unlock(self.io);
+        if (reasoning) |r| {
+            self.appendCompactReasoning(r);
+            self.allocator.free(r);
+        }
         if (delta) |d| {
             self.appendCompactChunk(d);
             self.allocator.free(d);
@@ -2012,21 +2121,142 @@ const AppState = struct {
             // 压缩期间排队的消息：压缩收尾后作为新回合发出
             self.flushPendingSends();
         }
+        // 工具循环中途压缩：worker 已结束 → 收尾显示（与手动压缩的收尾对齐）
+        if (self.compact_live_pending.load(.acquire)) self.finishMidCompactDisplay();
     }
 
-    /// 摘要增量追加（首块时先放黄色标题，再建正文消息）
-    fn appendCompactChunk(self: *AppState, chunk: []const u8) void {
-        if (self.compact_msg_idx == null) {
-            self.addMessage("▣ 正在压缩上下文…", .{ .fg = .yellow });
-            self.compact_head_idx = if (self.messages.items.len > 0) self.messages.items.len - 1 else null;
-            self.messages.append(self.allocator, .{ .content = "", .style = .{ .fg = .white } }) catch return;
-            self.compact_msg_idx = self.messages.items.len - 1;
+    /// 移除压缩显示气泡（标题 + 正文；本轮被取消时不留痕迹）
+    fn removeCompactDisplay(self: *AppState) void {
+        // 先移除正文（下标更大），再移除标题——否则移除后下标会偏移
+        if (self.compact_msg_idx) |idx| {
+            if (idx < self.messages.items.len) {
+                const msg = self.messages.orderedRemove(idx);
+                self.freeDisplayMessage(msg);
+            }
         }
-        const idx = self.compact_msg_idx.?;
+        if (self.compact_head_idx) |idx| {
+            if (idx < self.messages.items.len) {
+                const msg = self.messages.orderedRemove(idx);
+                self.freeDisplayMessage(msg);
+            }
+        }
+        self.compact_msg_idx = null;
+        self.compact_head_idx = null;
+    }
+
+    /// 中途压缩流结束：消费剩余增量、折叠思考、替换标题为结果、状态复位
+    fn finishMidCompactDisplay(self: *AppState) void {
+        // 先补上最后一段增量（worker 可能在末尾写入后立刻置 pending）
+        self.drainCompactBuffersInline();
+
+        var failed = false;
+        var aborted = false;
+        var tokens_before: usize = 0;
+        var summarized: usize = 0;
+        self.compact_mutex.lockUncancelable(self.io);
+        failed = self.compact_live_failed;
+        aborted = self.compact_live_aborted;
+        tokens_before = self.compact_live_tokens_before;
+        summarized = self.compact_live_summarized;
+        self.compact_buf.clearRetainingCapacity();
+        self.compact_consume_pos = 0;
+        self.compact_reasoning_buf.clearRetainingCapacity();
+        self.compact_consume_reasoning_pos = 0;
+        self.compact_live_failed = false;
+        self.compact_live_aborted = false;
+        self.compact_mutex.unlock(self.io);
+
+        if (aborted) {
+            // 用户取消了整轮生成：压缩气泡一并移除（不展示失败提示）
+            self.removeCompactDisplay();
+            self.compact_live_running.store(false, .release);
+            self.compact_live_pending.store(false, .release);
+            return;
+        }
+
+        if (self.compact_msg_idx) |idx| {
+            if (idx < self.messages.items.len) {
+                setThoughtExpanded(self, idx, false, false);
+                if (failed and
+                    self.messages.items[idx].content.len == 0 and
+                    self.messages.items[idx].reasoning == null)
+                {
+                    // 失败且无任何产出：移除空消息，只留一行失败提示
+                    const msg = self.messages.orderedRemove(idx);
+                    self.freeDisplayMessage(msg);
+                    self.compact_msg_idx = null;
+                }
+            }
+        }
+        if (self.compact_head_idx) |idx| {
+            if (failed) {
+                self.replaceDisplayMessage(idx, "▣ 上下文压缩失败（本轮继续）", .{ .fg = .red });
+            } else {
+                const len = if (self.compact_msg_idx) |mi|
+                    (if (mi < self.messages.items.len) self.messages.items[mi].content.len else 0)
+                else
+                    0;
+                var buf: [256]u8 = undefined;
+                const text = formatCompactionNotice(&buf, summarized, len, tokens_before);
+                self.replaceDisplayMessage(idx, text, .{ .fg = busy_accent });
+            }
+        } else if (failed) {
+            // 失败发生在任何输出之前（无气泡）：单独一行提示
+            self.addMessage("▣ 上下文压缩失败（本轮继续）", .{ .fg = .red });
+        }
+        self.compact_head_idx = null;
+        self.compact_msg_idx = null;
+        self.compact_live_running.store(false, .release);
+        self.compact_live_pending.store(false, .release);
+    }
+
+    /// 确保压缩标题与摘要正文消息已创建（首块增量到达时）
+    fn ensureCompactDisplayMessages(self: *AppState) void {
+        if (self.compact_msg_idx != null) return;
+        self.addMessage("▣ 正在压缩上下文…", .{ .fg = busy_accent });
+        self.compact_head_idx = if (self.messages.items.len > 0) self.messages.items.len - 1 else null;
+        self.messages.append(self.allocator, .{ .content = "", .style = .{ .fg = .white } }) catch return;
+        self.compact_msg_idx = self.messages.items.len - 1;
+    }
+
+    /// 摘要思考增量追加（与普通回复的思考块一致：流式展开、正文开始时折叠）
+    fn appendCompactReasoning(self: *AppState, chunk: []const u8) void {
+        self.ensureCompactDisplayMessages();
+        const idx = self.compact_msg_idx orelse return;
+        const msg = &self.messages.items[idx];
+
+        const first_reasoning = msg.reasoning == null;
+        const width = self.message_wrap_width;
+        const rows_before = if (width > 0) messageRowCount(msg.*, width) else 0;
+
+        const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        if (msg.reasoning == null) msg.reasoning_start_ms = now;
+        msg.reasoning_end_ms = now;
+
+        const old: []const u8 = if (msg.reasoning) |r| r else "";
+        const joined = self.allocator.alloc(u8, old.len + chunk.len) catch return;
+        @memcpy(joined[0..old.len], old);
+        @memcpy(joined[old.len..], chunk);
+        if (old.len > 0) self.allocator.free(old);
+        msg.reasoning = joined;
+
+        if (width > 0) {
+            const rows_after = messageRowCount(msg.*, width);
+            const added = rows_after -| rows_before;
+            if (self.scroll_offset > 0 and added > 0) self.scroll_offset +|= added;
+        }
+        if (first_reasoning) setThoughtExpanded(self, idx, true, false);
+    }
+
+    /// 摘要正文增量追加（首块时先放黄色标题，再建正文消息）
+    fn appendCompactChunk(self: *AppState, chunk: []const u8) void {
+        self.ensureCompactDisplayMessages();
+        const idx = self.compact_msg_idx orelse return;
         const msg = &self.messages.items[idx];
         const width = self.message_wrap_width;
         const rows_before = if (width > 0) messageRowCount(msg.*, width) else 0;
 
+        const first_content = msg.content.len == 0;
         const joined = self.allocator.alloc(u8, msg.content.len + chunk.len) catch return;
         @memcpy(joined[0..msg.content.len], msg.content);
         @memcpy(joined[msg.content.len..], chunk);
@@ -2039,6 +2269,8 @@ const AppState = struct {
             const added = rows_after -| rows_before;
             if (self.scroll_offset > 0 and added > 0) self.scroll_offset +|= added;
         }
+        // 正文开始：思考结束 → 折叠（与普通回复一致）
+        if (first_content and msg.reasoning != null) setThoughtExpanded(self, idx, false, false);
     }
 
     /// 替换一条显示消息的内容与样式（用于把"正在压缩…"标题换成结果）
@@ -2085,10 +2317,12 @@ const AppState = struct {
                 }
             }
         } else if (plan.compacted) {
+            // 摘要思考块折叠（与普通回复一致：正文/结果完成后自动折叠）
+            if (self.compact_msg_idx) |idx| setThoughtExpanded(self, idx, false, false);
             var buf: [256]u8 = undefined;
             const text = formatCompactionNotice(&buf, plan.summarized, plan.summary_len, plan.tokens_before);
             if (self.compact_head_idx) |idx| {
-                self.replaceDisplayMessage(idx, text, .{ .fg = .yellow });
+                self.replaceDisplayMessage(idx, text, .{ .fg = busy_accent });
             }
             self.last_usage = .{};
             self.context_usage = .{};
@@ -2106,6 +2340,8 @@ const AppState = struct {
         self.compact_mutex.lockUncancelable(self.io);
         self.compact_buf.clearRetainingCapacity();
         self.compact_consume_pos = 0;
+        self.compact_reasoning_buf.clearRetainingCapacity();
+        self.compact_consume_reasoning_pos = 0;
         self.compact_mutex.unlock(self.io);
         self.compact_status.store(0, .release);
         self.compact_head_idx = null;
@@ -2603,10 +2839,17 @@ const AppState = struct {
 
     /// 一轮结束（正常/取消/失败）或压缩收尾后：若仍有排队消息，取最早一条作为新回合发出。
     /// 其余留在队列中，由下一回合的 worker 在工具轮次边界注入。
+    /// 排队的压缩请求（生成中按的 /compact）若本轮直到结束都没碰到工具轮间隙
+    /// （如单轮纯回答、被取消），在这里补执行，避免请求丢失。
     fn flushPendingSends(self: *AppState) void {
         if (!self.running) return;
         if (self.isStreaming() or self.isCompacting()) return;
         if (self.currentProvider() == null) return; // 无可用提供商：保留队列，待配置就绪
+        if (self.compact_queued.swap(false, .acquire)) {
+            const keep_override = self.compact_queued_keep.swap(0, .acquire);
+            self.startCompaction(keep_override);
+            if (self.isCompacting()) return; // 压缩期间不再发下一条
+        }
         const text = self.takeFirstPendingSend() orelse return;
         defer self.allocator.free(text);
         self.askAI(text);
@@ -2657,6 +2900,8 @@ const AppState = struct {
         for (self.stream_events.items) |ev| {
             if (ev.name.len > 0) self.allocator.free(ev.name);
             if (ev.text.len > 0) self.allocator.free(ev.text);
+            if (ev.args.len > 0) self.allocator.free(ev.args);
+            if (ev.payload.len > 0) self.allocator.free(ev.payload);
         }
         self.stream_events.clearRetainingCapacity();
     }
@@ -2716,6 +2961,10 @@ const AppState = struct {
                         self.closeCurrentTurn();
                     },
                     .user_sent => self.setToast("排队消息已送达"),
+                    .toast => {
+                        // worker 侧请求的短提示（如排队压缩无内容可压）
+                        if (ev.text.len > 0) self.setToast(ev.text);
+                    },
                     .retry_start => {
                         // 丢弃失败尝试的部分显示（思考/正文），改为一行重试提示
                         self.removeStreamingMessage();
@@ -4171,7 +4420,7 @@ const CliProgress = struct {
 fn formatCompactionNotice(buf: []u8, compacted_count: usize, summary_len: usize, tokens_before: usize) []const u8 {
     var nb: [24]u8 = undefined;
     if (compacted_count > 0) {
-        return std.fmt.bufPrint(buf, "▣ 上下文已压缩（以上 {d} 条消息不再发送） · 摘要 {d} 字节 · 压缩前约 {s} tok", .{
+        return std.fmt.bufPrint(buf, "▣ 上下文已压缩（{d} 条消息已摘要） · 摘要 {d} 字节 · 压缩前约 {s} tok", .{
             compacted_count,
             summary_len,
             formatCount(&nb, @intCast(tokens_before)),
@@ -4201,16 +4450,46 @@ const CompactionOutcome = struct {
 
 const SummaryCollector = struct {
     allocator: Allocator,
+    io: Io = undefined,
     list: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    /// 摘要生成过程中的思考内容（落库供重载显示；不进模型历史）
+    reasoning: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    reasoning_start_ms: i64 = 0,
+    reasoning_end_ms: i64 = 0,
+    /// 非空时把增量同时回传主线程渲染（worker 路径；手动压缩与中途压缩共用）
+    stream_app: ?*AppState = null,
 
     fn deinit(self: *SummaryCollector) void {
         self.list.deinit(self.allocator);
+        self.reasoning.deinit(self.allocator);
+    }
+
+    /// 思考耗时（毫秒；定格用）
+    fn reasoningMs(self: *const SummaryCollector) i64 {
+        if (self.reasoning_end_ms > self.reasoning_start_ms) return self.reasoning_end_ms - self.reasoning_start_ms;
+        return 0;
     }
 
     fn cb(ctx: *anyopaque, kind: ai.DeltaKind, delta: []const u8) void {
-        if (kind != .content) return;
         const self: *SummaryCollector = @ptrCast(@alignCast(ctx));
-        self.list.appendSlice(self.allocator, delta) catch {};
+        switch (kind) {
+            .content => self.list.appendSlice(self.allocator, delta) catch {},
+            .reasoning => {
+                const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+                if (self.reasoning.items.len == 0) self.reasoning_start_ms = now;
+                self.reasoning_end_ms = now;
+                self.reasoning.appendSlice(self.allocator, delta) catch {};
+            },
+        }
+        // 异步/中途路径：同一块增量流式回传主线程（渲染与手动 /compact 一致）
+        if (self.stream_app) |app| {
+            app.compact_mutex.lockUncancelable(app.io);
+            defer app.compact_mutex.unlock(app.io);
+            switch (kind) {
+                .content => app.compact_buf.appendSlice(app.allocator, delta) catch {},
+                .reasoning => app.compact_reasoning_buf.appendSlice(app.allocator, delta) catch {},
+            }
+        }
     }
 };
 
@@ -4249,20 +4528,6 @@ const CompactionPlan = struct {
         allocator.destroy(self);
     }
 };
-
-const SummaryDeltaCtx = struct { plan: *CompactionPlan, collector: *SummaryCollector };
-
-/// 摘要流式回调：收集全文；异步模式下同时回传主线程渲染
-fn onSummaryDelta(ctx: *anyopaque, kind: ai.DeltaKind, delta: []const u8) void {
-    if (kind != .content) return;
-    const w: *SummaryDeltaCtx = @ptrCast(@alignCast(ctx));
-    w.collector.list.appendSlice(w.collector.allocator, delta) catch {};
-    if (!w.plan.async) return;
-    const app = w.plan.app;
-    app.compact_mutex.lockUncancelable(app.io);
-    defer app.compact_mutex.unlock(app.io);
-    app.compact_buf.appendSlice(app.allocator, delta) catch {};
-}
 
 /// 执行压缩计划：选区间 → 摘要请求 → 摘要消息入库 + checkpoint 落库
 fn compactionExecute(plan: *CompactionPlan) void {
@@ -4313,10 +4578,13 @@ fn compactionExecute(plan: *CompactionPlan) void {
         .{ .role = "system", .content = compaction_system_prompt },
         .{ .role = "user", .content = payload },
     };
-    var collector = SummaryCollector{ .allocator = app.allocator };
+    var collector = SummaryCollector{
+        .allocator = app.allocator,
+        .io = plan.io,
+        .stream_app = if (plan.async) app else null,
+    };
     defer collector.deinit();
-    var wrapper = SummaryDeltaCtx{ .plan = plan, .collector = &collector };
-    client.streamMessage(&msgs, &.{}, &app.compact_cancel, &wrapper, onSummaryDelta, null) catch |e| {
+    client.streamMessage(&msgs, &.{}, &app.compact_cancel, &collector, SummaryCollector.cb, null) catch |e| {
         plan.err = if (e == error.Canceled) "已取消" else @errorName(e);
         if (client.takeErrorBody()) |body| {
             defer app.allocator.free(body);
@@ -4345,12 +4613,15 @@ fn compactionExecute(plan: *CompactionPlan) void {
     }
 
     // 摘要作为一条 role='summary' 的消息入库；checkpoint 只引用它
+    // 思考一并落库供重载显示
     const summary_msg_id = db.insertMessage(.{
         .session_id = plan.session_id,
         .role = "summary",
         .content = collector.list.items,
         .model = plan.model,
         .provider = plan.provider_name,
+        .reasoning = collector.reasoning.items,
+        .reasoning_ms = collector.reasoningMs(),
     }) catch 0;
     const tokens_before = estimateTokens(historyRequestBytesSlice(plan.history) + toolsSchemaBytes());
     _ = db.insertCompaction(
@@ -4388,26 +4659,58 @@ fn estimateJobRequestTokens(job: *const StreamJob) usize {
 }
 
 /// 回合中途压缩：worker 已实时落库，整段 job.history（含当前回合）都可参与压缩。
+/// `force`（手动排队请求）：跳过阈值检查（用户显式要求压缩），
+/// 但仍需有可压缩内容；无可压内容时发一个 toast 提示。
+/// `keep_override` > 0（/compact N）：覆盖保留窗口。
 /// 返回 true 表示发生了压缩（job.compacted_midturn 置位）。
-fn compactJobHistory(job: *StreamJob, db: *db_mod.Db) bool {
-    if (job.auto_compact_pct == 0 or job.context_window == 0) return false;
+fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override: usize) bool {
     if (job.history.len < 2) return false;
     const est = estimateJobRequestTokens(job);
-    if (est * 100 < job.context_window * job.auto_compact_pct) return false;
-    Log.info(.compact, "触发中途压缩 est={d} window={d} pct={d}", .{ est, job.context_window, job.auto_compact_pct });
+    if (!force) {
+        if (job.auto_compact_pct == 0 or job.context_window == 0) return false;
+        if (est * 100 < job.context_window * job.auto_compact_pct) return false;
+    }
+    Log.info(.compact, "触发{s}压缩 est={d} window={d} pct={d}", .{
+        if (force) "手动排队" else "中途",
+        est,
+        job.context_window,
+        job.auto_compact_pct,
+    });
 
     const hist = job.history;
-    const keep_bytes = (if (job.keep_recent_tokens > 0) job.keep_recent_tokens else 20_000) * 4;
-    const range = selectCompactionRange(hist, keep_bytes) orelse return false;
-
     const arena = job.arena.allocator();
-    const prev_summary: []const u8 = if (range.summarize_start > 1 and
-        isCheckpointMessage(hist[range.summarize_start - 1]))
-        hist[range.summarize_start - 1].content
+    // 区间：默认按保留窗口选；手动排队时若选不中（内容较少，默认窗口吃掉全部），
+    // 按历史字节逐级缩小（与同步路径 chooseCompactionKeep 的自适应一致）
+    const keep_bytes_default = (if (keep_override > 0)
+        keep_override
+    else if (job.keep_recent_tokens > 0)
+        job.keep_recent_tokens
+    else
+        20_000) * 4;
+    var range = selectCompactionRange(hist, keep_bytes_default);
+    if (range == null and force) {
+        const hist_bytes = historyRequestBytesSlice(hist);
+        const fractions = [_]usize{ 2, 4, 8, 16, 32 };
+        for (fractions) |f| {
+            const k = hist_bytes / f / 4;
+            if (k == 0) break;
+            if (selectCompactionRange(hist, k * 4)) |r| {
+                range = r;
+                break;
+            }
+        }
+    }
+    const rng = range orelse {
+        if (force) pushStreamEvent(job.app, .toast, "", "上次压缩后暂无新增内容，无需压缩", "", "", false);
+        return false;
+    };
+    const prev_summary: []const u8 = if (rng.summarize_start > 1 and
+        isCheckpointMessage(hist[rng.summarize_start - 1]))
+        hist[rng.summarize_start - 1].content
     else
         "";
 
-    const payload = buildCompactionPayload(arena, hist, range, prev_summary) catch return false;
+    const payload = buildCompactionPayload(arena, hist, rng, prev_summary) catch return false;
 
     // 摘要请求：一次性路由 id + 不写缓存
     var seed: [16]u8 = undefined;
@@ -4429,10 +4732,27 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db) bool {
         .{ .role = "system", .content = compaction_system_prompt },
         .{ .role = "user", .content = payload },
     };
-    var collector = SummaryCollector{ .allocator = job.app.allocator };
+    var collector = SummaryCollector{
+        .allocator = job.app.allocator,
+        .io = job.io,
+        .stream_app = job.app, // 与手动 /compact 一致：思考 + 正文流式回传主线程
+    };
     defer collector.deinit();
-    var cancel = std.atomic.Value(bool).init(false);
-    client.streamMessage(&msgs, &.{}, &cancel, &collector, SummaryCollector.cb, null) catch {
+    // 取消信号：跟随本轮生成（Ctrl+Q 置位 stream_cancel）
+    const cancel = &job.app.stream_cancel;
+    // 流式显示开始：主线程 pumpCompaction 会消费增量并渲染（标题 + 思考块 + 正文）
+    job.app.resetCompactStreamState();
+    job.app.compact_live_running.store(true, .release);
+    // 任一步失败都要让主线程收尾显示（失败提示），避免“正在压缩…”永久停留
+    var live_finalized = false;
+    defer if (!live_finalized) {
+        job.app.compact_mutex.lockUncancelable(job.app.io);
+        job.app.compact_live_failed = true;
+        job.app.compact_live_aborted = cancel.load(.acquire);
+        job.app.compact_mutex.unlock(job.app.io);
+        job.app.compact_live_pending.store(true, .release);
+    };
+    client.streamMessage(&msgs, &.{}, cancel, &collector, SummaryCollector.cb, null) catch {
         // 失败时释放捕获的服务端错误体（该路径不展示详情，仅避免泄漏）
         if (client.takeErrorBody()) |body| job.app.allocator.free(body);
         return false;
@@ -4441,7 +4761,7 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db) bool {
 
     // 保留区首条已落库消息的行 id（实时落库后当前回合消息也有 id）
     var tail_start: i64 = 0;
-    for (hist[range.retain_start..]) |m| {
+    for (hist[rng.retain_start..]) |m| {
         if (m.db_id > 0) {
             tail_start = m.db_id;
             break;
@@ -4449,13 +4769,15 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db) bool {
     }
     if (tail_start == 0) return false;
 
-    // 摘要入库为 role='summary' 消息（worker 用自己的连接）
+    // 摘要入库为 role='summary' 消息（worker 用自己的连接）；思考一并落库供重载显示
     const summary_msg_id = db.insertMessage(.{
         .session_id = job.session_id_num,
         .role = "summary",
         .content = collector.list.items,
         .model = job.model,
         .provider = job.provider_name,
+        .reasoning = collector.reasoning.items,
+        .reasoning_ms = collector.reasoningMs(),
     }) catch 0;
     _ = db.insertCompaction(
         job.session_id_num,
@@ -4471,19 +4793,25 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db) bool {
     if (hist.len > 0 and std.mem.eql(u8, hist[0].role, "system")) {
         new_hist.append(arena, hist[0]) catch return false;
     }
-    const wrapper = std.fmt.allocPrint(
-        arena,
-        "<conversation-checkpoint>\n（更早的对话已压缩，以下为摘要；需要细节时读取相关文件或询问用户）\n{s}\n</conversation-checkpoint>",
-        .{collector.list.items},
-    ) catch return false;
+    const wrapper = wrapCheckpoint(arena, collector.list.items) catch return false;
     new_hist.append(arena, .{ .role = "user", .content = wrapper }) catch return false;
-    new_hist.appendSlice(arena, hist[range.retain_start..]) catch return false;
+    new_hist.appendSlice(arena, hist[rng.retain_start..]) catch return false;
     job.history = new_hist.toOwnedSlice(arena) catch return false;
 
     job.compacted_midturn = true;
     // 旧锚点对应压缩前的前缀：失效，避免后续轮次用错估算
     job.anchor_len = 0;
     job.anchor_tokens = 0;
+
+    // 流式显示收尾元数据（主线程 pumpCompaction 据此把标题替换为结果）
+    job.app.compact_mutex.lockUncancelable(job.app.io);
+    job.app.compact_live_tokens_before = est;
+    job.app.compact_live_summarized = rng.retain_start - rng.summarize_start;
+    job.app.compact_live_failed = false;
+    job.app.compact_live_aborted = false;
+    job.app.compact_mutex.unlock(job.app.io);
+    live_finalized = true;
+    job.app.compact_live_pending.store(true, .release);
     return true;
 }
 
@@ -4782,6 +5110,8 @@ fn cliCleanupState(state: *AppState, allocator: Allocator) void {
         state.finalizeCompaction();
     }
     state.compact_buf.deinit(allocator);
+
+    state.compact_reasoning_buf.deinit(allocator);
     state.freeModelSelectModels();
     state.input.deinit();
 }
@@ -5121,7 +5451,7 @@ test "压缩提示文案统一为 ▣ 样式" {
     var buf: [128]u8 = undefined;
     const s = formatCompactionNotice(&buf, 8, 1602, 3352);
     try std.testing.expect(std.mem.startsWith(u8, s, "▣ 上下文已压缩"));
-    try std.testing.expect(std.mem.indexOf(u8, s, "以上 8 条消息不再发送") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "8 条消息已摘要") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "1602 字节") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "3.3k tok") != null);
 }
@@ -5615,6 +5945,8 @@ pub fn main(init: std.process.Init) !u8 {
             state.finalizeCompaction();
         }
         state.compact_buf.deinit(state.allocator);
+
+        state.compact_reasoning_buf.deinit(state.allocator);
         state.freeModelSelectModels();
         state.input.deinit();
     }
@@ -6728,10 +7060,20 @@ fn streamWorker(job: *StreamJob) void {
         injectPendingSends(job, &worker_db);
 
         // 工具循环会迅速堆积上下文：发下一轮前检查并按需压缩
-        // （消息已实时落库，整段历史含当前回合都可参与）
-        if (job.auto_compact_pct > 0) {
+        // （消息已实时落库，整段历史含当前回合都可参与）。
+        // 手动排队压缩（/compact）与自动压缩共用同一位置同函数：
+        // 排队请求优先执行（用户显式意图先于阈值检查），且执行时跳过自动检查
+        // （避免同一间隙连续压两次）。
+        const manual_queued = app.compact_queued.swap(false, .acquire);
+        const manual_keep = if (manual_queued) app.compact_queued_keep.swap(0, .acquire) else 0;
+        if (manual_queued or job.auto_compact_pct > 0) {
             if (ensureWorkerDb(job, &worker_db)) |wdb| {
-                _ = compactJobHistory(job, wdb);
+                if (manual_queued) {
+                    // 手动排队：不受阈值限制（用户就是要压）；保留窗口用 /compact N 或配置值
+                    _ = compactJobHistory(job, wdb, true, manual_keep);
+                } else {
+                    _ = compactJobHistory(job, wdb, false, 0);
+                }
             }
         }
 
@@ -8556,11 +8898,19 @@ fn drawInput(state: *AppState, area: Rect, buf: *Buffer) void {
     // 标题反映进行中状态（旋转动画 + 秒数）；边框在忙碌时换色便于余光可辨
     var title_buf: [48]u8 = undefined;
     const title = inputBoxTitle(state, &title_buf);
-    const busy_border = state.isStreaming() or state.isCompacting();
+    // 标题反映进行中状态（旋转动画 + 秒数）；边框按状态换色便于余光可辨：
+    // 生成中 = 青色；压缩中（手动或工具轮间隙）= 橙色强调色；空闲 = 品红
+    const compacting_now = state.isCompacting() or state.compact_live_running.load(.acquire);
+    const border_color: tui.style.Color = if (compacting_now)
+        busy_accent
+    else if (state.isStreaming())
+        .cyan
+    else
+        .magenta;
     const blk = Block{
         .title = title,
         .borders = Borders.ALL,
-        .border_style = .{ .fg = if (busy_border) .cyan else .magenta },
+        .border_style = .{ .fg = border_color },
         .title_style = .{ .fg = .white, .modifier = .{ .bold = true } },
         .border_symbols = BorderSymbols.rounded(),
     };
@@ -10540,6 +10890,8 @@ test "集成：compaction（需本地 mock 服务器 127.0.0.1:18125）" {
         for (state.messages.items) |m| state.freeDisplayMessage(m);
         state.messages.deinit(alloc);
         state.compact_buf.deinit(alloc);
+
+        state.compact_reasoning_buf.deinit(alloc);
     }
 
     _ = state.config.appendProvider(alloc, .{
@@ -10650,6 +11002,12 @@ test "中途压缩：工具循环中压缩整段历史（含当前回合，需 m
     state.db = try db_mod.Db.openFile(alloc, io, db_path);
     defer if (state.db) |*d| d.deinit();
     defer state.config.deinit(alloc);
+    defer {
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.compact_buf.deinit(alloc);
+        state.compact_reasoning_buf.deinit(alloc);
+    }
     const sid = try state.db.?.createSession("");
     state.session_id = sid;
 
@@ -10732,9 +11090,33 @@ test "中途压缩：工具循环中压缩整段历史（含当前回合，需 m
     job.anchor_tokens = 999;
 
     // 触发中途压缩（keep_bytes=3000：收下 t2(2000)，a2 超预算 → 保留区以 assistant 开头）
-    const did = compactJobHistory(job, &state.db.?);
+    const did = compactJobHistory(job, &state.db.?, false, 0);
     try std.testing.expect(did);
     try std.testing.expect(job.compacted_midturn);
+
+    // 流式显示已收尾待处理（worker 已结束，主线程 pumpCompaction 会替换标题为结果）
+    try std.testing.expect(state.compact_live_pending.load(.acquire));
+    try std.testing.expect(state.compact_live_running.load(.acquire)); // 待主线程收尾后才复位
+    // 摘要正文已在流式缓冲里（与手动 /compact 一致）
+    try std.testing.expect(std.mem.indexOf(u8, state.compact_buf.items, "MOCK_SUMMARY") != null);
+    // 主线程收尾：把“正在压缩…”标题替换为结果，并复位状态
+    state.pumpCompaction();
+    try std.testing.expect(!state.compact_live_pending.load(.acquire));
+    try std.testing.expect(!state.compact_live_running.load(.acquire));
+    {
+        var head_idx: ?usize = null;
+        for (state.messages.items, 0..) |m, i| {
+            if (std.mem.indexOf(u8, m.content, "▣ 上下文已压缩") != null) head_idx = i;
+        }
+        try std.testing.expect(head_idx != null);
+        try std.testing.expect(head_idx.? + 1 < state.messages.items.len);
+        try std.testing.expect(std.mem.indexOf(u8, state.messages.items[head_idx.? + 1].content, "MOCK_SUMMARY") != null);
+        // 摘要思考块：流式收尾后自动折叠，内容已收集
+        const sm = state.messages.items[head_idx.? + 1];
+        try std.testing.expect(sm.reasoning != null);
+        try std.testing.expect(std.mem.indexOf(u8, sm.reasoning.?, "MOCK_REASONING") != null);
+        try std.testing.expect(!sm.reasoning_expanded);
+    }
 
     // history = system + checkpoint + [a2, t2]：当前回合前半段（u1/a1/t1）进摘要
     try std.testing.expectEqual(@as(usize, 4), job.history.len);
@@ -10772,14 +11154,38 @@ test "中途压缩：工具循环中压缩整段历史（含当前回合，需 m
         reloaded.messages.deinit(alloc);
     }
     const rows = try state.db.?.loadMessages(sid);
-    reloaded.applyLoadedMessagesWithCheckpoint(rows, cp, true, true);
+    reloaded.applyLoadedMessagesWithCheckpoint(rows, cp, &.{cp}, true, true);
     try std.testing.expectEqual(@as(usize, 4), reloaded.history.items.len);
     try std.testing.expectEqualStrings("assistant", reloaded.history.items[2].role);
     try std.testing.expectEqualStrings(a2, reloaded.history.items[2].content);
     try std.testing.expectEqualStrings(t2, reloaded.history.items[3].content);
 
+    // 重启后显示：摘要行就地渲染（黄标题 + 思考块 + 正文），位置即它自己的行位置
+    {
+        var head_idx: ?usize = null;
+        for (reloaded.messages.items, 0..) |m, i| {
+            if (std.mem.indexOf(u8, m.content, "▣ 上下文已压缩") != null) head_idx = i;
+        }
+        try std.testing.expect(head_idx != null);
+        const sm = reloaded.messages.items[head_idx.? + 1];
+        try std.testing.expect(std.mem.indexOf(u8, sm.content, "MOCK_SUMMARY") != null);
+        try std.testing.expect(sm.reasoning != null);
+        try std.testing.expect(std.mem.indexOf(u8, sm.reasoning.?, "MOCK_REASONING") != null);
+        // 注意：mock 两块思考在同一毫秒内到达 → reasoning_ms 可能为 0（与普通回复一致）
+        try std.testing.expect(!sm.reasoning_expanded);
+        // 摘要显示在它生成的位置（压缩发生时刻 = 保留区之后），与生成时的流式位置一致
+        var tail_first: ?usize = null;
+        for (reloaded.messages.items, 0..) |m, i| {
+            if (std.mem.indexOf(u8, m.content, a2) != null) tail_first = i;
+        }
+        try std.testing.expect(tail_first != null);
+        try std.testing.expect(head_idx.? > tail_first.?);
+    }
+
     // 再压一次：保留区（a2,t2）之后没有可压缩内容 → 不再触发
-    try std.testing.expect(!compactJobHistory(job, &state.db.?));
+    try std.testing.expect(!compactJobHistory(job, &state.db.?, false, 0));
+    state.clearStreamEventsLocked();
+    state.stream_events.deinit(alloc);
 }
 
 test "实时落库：persistTranscriptEntry 写入 DB 并回填 db_id（幂等）" {
@@ -10890,6 +11296,144 @@ test "实时落库：persistTranscriptEntry 写入 DB 并回填 db_id（幂等�
     if (slot) |*d| d.deinit();
 }
 
+test "排队压缩：生成中入队去重、间隙强制压、无内容可压时提示" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    std.Io.Dir.cwd().access(io, "test/mock_18125.running", .{}) catch return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const db_path = "skynet_test_queued_compact.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_queued_compact.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_queued_compact.db-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_queued_compact.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_queued_compact.db-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer if (state.db) |*d| d.deinit();
+    defer {
+        state.config.deinit(alloc);
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.compact_buf.deinit(alloc);
+        state.compact_reasoning_buf.deinit(alloc);
+    }
+
+    _ = state.config.appendProvider(alloc, .{
+        .name = "mock",
+        .endpoint = "http://127.0.0.1:18125/v1",
+    });
+    state.config.setCurrentProvider(alloc, "mock");
+    state.config.setCurrentModel(alloc, "mock-model");
+
+    const sid = try state.db.?.createSession("");
+    state.session_id = sid;
+
+    // 生成中（模拟 isStreaming = true）按 /compact：应入队并提示，不启动压缩
+    state.setStreamStatus(.running);
+    state.startCompaction(0);
+    try std.testing.expect(state.compact_queued.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), state.compact_status.load(.acquire));
+
+    // 连续第二次触发：不重复入队（提示仍是"已排队"，状态不变）
+    state.startCompaction(0);
+    try std.testing.expect(state.compact_queued.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), state.compact_status.load(.acquire));
+
+    // 已有排队请求时再按 /compact 30000：保留窗口按最新指令覆盖
+    try std.testing.expectEqual(@as(usize, 0), state.compact_queued_keep.load(.acquire));
+    state.startCompaction(30_000);
+    try std.testing.expectEqual(@as(usize, 30_000), state.compact_queued_keep.load(.acquire));
+    try std.testing.expect(state.compact_queued.load(.acquire));
+
+    // 间隙里的一次性压缩正在流式执行时按 /compact：不入队（不谎称"已排队"）
+    state.compact_queued.store(false, .release);
+    state.compact_live_running.store(true, .release);
+    state.startCompaction(0);
+    try std.testing.expect(!state.compact_queued.load(.acquire));
+    state.compact_live_running.store(false, .release);
+
+    // 重新排队（后续步骤验证间隙执行）
+    state.startCompaction(0);
+    try std.testing.expect(state.compact_queued.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), state.compact_queued_keep.load(.acquire));
+
+    // 工具轮间隙：worker swap 取走排队请求 → 强制压缩（不管阈值）
+    const job = try alloc.create(StreamJob);
+    defer {
+        job.arena.deinit();
+        alloc.destroy(job);
+    }
+    job.* = .{
+        .app = &state,
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .io = io,
+        .cwd = ".",
+        .model = "mock-model",
+        .endpoint = "http://127.0.0.1:18125/v1",
+        .api_key = "x",
+        .provider_name = "mock",
+        .db_path = db_path,
+        .session_id_num = sid,
+        .history = &.{},
+        .auto_compact_pct = 0, // 自动压缩关闭：证明是排队请求（force）在起作用
+        .context_window = 1_000_000,
+        .keep_recent_tokens = 100,
+    };
+    const arena = job.arena.allocator();
+    var hist = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
+    try hist.append(arena, .{ .role = "system", .content = try arena.dupe(u8, system_prompt) });
+    {
+        // 直接落库并构造带 db_id 的历史条目（模拟 worker 已实时落库）
+        const txt_u = try arena.dupe(u8, "AAAA" ** 2000);
+        const row_u = state.persistMessage(.{ .role = "user", .content = txt_u });
+        try hist.append(arena, .{ .role = "user", .content = txt_u, .db_id = row_u });
+        const txt_a = try arena.dupe(u8, "BBBB" ** 2000);
+        const row_a = state.persistMessage(.{ .role = "assistant", .content = txt_a });
+        try hist.append(arena, .{ .role = "assistant", .content = txt_a, .db_id = row_a });
+        const txt_u2 = try arena.dupe(u8, "CCCC" ** 500);
+        const row_u2 = state.persistMessage(.{ .role = "user", .content = txt_u2 });
+        try hist.append(arena, .{ .role = "user", .content = txt_u2, .db_id = row_u2 });
+    }
+    job.history = try hist.toOwnedSlice(arena);
+
+    // 模拟 worker 循环里的分支：swap 取走排队标记并强制压缩
+    const manual_queued = state.compact_queued.swap(false, .acquire);
+    try std.testing.expect(manual_queued);
+    try std.testing.expect(!state.compact_queued.load(.acquire));
+    try std.testing.expect(compactJobHistory(job, &state.db.?, manual_queued, 0));
+    try std.testing.expect(job.compacted_midturn);
+    // 被摘要的是保留区之前的消息（AAAA/BBBB 两条）；CCCC 按 keep 窗口保留
+    try std.testing.expectEqual(@as(usize, 2), job.app.compact_live_summarized);
+    state.pumpCompaction(); // 收尾显示
+
+    // 再排队一次：此时保留区内已无可摘要内容 → 不发请求，只出一个 toast 事件
+    try std.testing.expect(!compactJobHistory(job, &state.db.?, true, 0));
+    {
+        state.stream_mutex.lockUncancelable(io);
+        defer state.stream_mutex.unlock(io);
+        var found: ?usize = null;
+        for (state.stream_events.items, 0..) |ev, i| {
+            if (ev.kind == .toast) found = i;
+        }
+        try std.testing.expect(found != null);
+        try std.testing.expect(std.mem.indexOf(u8, state.stream_events.items[found.?].text, "无需压缩") != null);
+        state.clearStreamEventsLocked();
+    }
+    state.stream_events.deinit(alloc);
+}
+
 test "手动压缩：小会话自适应缩小保留窗口（需 mock 18125）" {
     var threaded: std.Io.Threaded = undefined;
     threaded = .init(std.testing.allocator, .{});
@@ -10921,6 +11465,8 @@ test "手动压缩：小会话自适应缩小保留窗口（需 mock 18125）" {
         for (state.messages.items) |m| state.freeDisplayMessage(m);
         state.messages.deinit(alloc);
         state.compact_buf.deinit(alloc);
+
+        state.compact_reasoning_buf.deinit(alloc);
     }
 
     _ = state.config.appendProvider(alloc, .{
@@ -10955,13 +11501,13 @@ test "手动压缩：小会话自适应缩小保留窗口（需 mock 18125）" {
     try std.testing.expectEqual(@as(u8, 0), state.compact_status.load(.acquire));
     try std.testing.expect((try state.db.?.latestCompaction(sid)) != null);
 
-    // 流式摘要：完成提示（含"以上 N 条"）+ 正文含 MOCK_SUMMARY
+    // 流式摘要：完成提示（含“N 条消息已摘要”）+ 正文含 MOCK_SUMMARY
     var head_idx: ?usize = null;
     for (state.messages.items, 0..) |m, i| {
         if (std.mem.indexOf(u8, m.content, "上下文已压缩") != null) head_idx = i;
     }
     try std.testing.expect(head_idx != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.messages.items[head_idx.?].content, "以上") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.messages.items[head_idx.?].content, "已摘要") != null);
     try std.testing.expect(head_idx.? + 1 < state.messages.items.len);
     try std.testing.expect(std.mem.indexOf(u8, state.messages.items[head_idx.? + 1].content, "MOCK_SUMMARY") != null);
 }
@@ -11250,7 +11796,7 @@ test "重启恢复：纯工具调用轮不产生空消息（工具间隔为一�
         .{ .id = 6, .role = "assistant", .content = "", .tool_calls = "[{\"id\":\"c3\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"zig build\\\"}\"}]" },
         .{ .id = 7, .role = "tool", .content = "ok\n", .tool_call_id = "c3", .tool_name = "bash" },
     };
-    state.applyLoadedMessagesWithCheckpoint(&rows, null, true, true);
+    state.applyLoadedMessagesWithCheckpoint(&rows, null, &.{}, true, true);
 
     // 恢复出的显示消息：user / 思考 / read行 / edit块 / bash块（无空消息）
     try std.testing.expectEqual(@as(usize, 5), state.messages.items.len);
@@ -12136,6 +12682,8 @@ test "上下文估算：加载会话后即有占用（无需先对话）" {
         for (state.messages.items) |m| state.freeDisplayMessage(m);
         state.messages.deinit(alloc);
         state.compact_buf.deinit(alloc);
+
+        state.compact_reasoning_buf.deinit(alloc);
     }
 
     // 新会话（加载路径）即有非零估算，且标记为估算、无缓存数据
@@ -12750,6 +13298,16 @@ test "进行中指示：输入框标题（空闲/生成/压缩 + 秒数）" {
     try std.testing.expect(std.mem.indexOf(u8, no_secs, "生成中") != null);
     try std.testing.expect(std.mem.indexOf(u8, no_secs, "s ") == null);
 
+    // 间隙里的一次性压缩（compact_live_running）：与手动压缩统一显示"压缩中"
+    state.compact_live_running.store(true, .release);
+    state.stream_start_ms = now - 5000;
+    const mid_title = inputBoxTitle(&state, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, mid_title, "压缩中") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mid_title, "生成中") == null);
+    try std.testing.expect(std.mem.indexOf(u8, mid_title, "5s") == null); // 压缩不显示秒数
+    state.compact_live_running.store(false, .release);
+    state.stream_start_ms = -1;
+
     // 压缩中：文案为"压缩中"
     state.setStreamStatus(.idle);
     state.compact_status.store(1, .release);
@@ -12804,7 +13362,7 @@ test "进行中指示：drawInput 渲染（标题含盲文帧、边框忙碌变�
 
     const area = Rect{ .x = 0, .y = 0, .width = 60, .height = 6 };
 
-    // 忙碌（生成中）：边框青色 + 标题区出现盲文帧
+    // 忙碌（生成中）：边框保持青色 + 标题区出现盲文帧
     state.setStreamStatus(.running);
     state.stream_start_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() - 3000;
     var buf_busy = try tui.render.Buffer.init(std.testing.allocator, 60, 6);
@@ -12817,6 +13375,14 @@ test "进行中指示：drawInput 渲染（标题含盲文帧、边框忙碌变�
         if (c >= 0x2800 and c <= 0x28FF) saw_braille = true;
     }
     try std.testing.expect(saw_braille);
+
+    // 压缩中（间隙里的一次性压缩）：边框换橙色强调色（与生成中区分）
+    state.compact_live_running.store(true, .release);
+    var buf_compacting = try tui.render.Buffer.init(std.testing.allocator, 60, 6);
+    defer buf_compacting.deinit();
+    drawInput(&state, area, &buf_compacting);
+    try std.testing.expect(buf_compacting.get(0, 0).?.fg.eql(busy_accent));
+    state.compact_live_running.store(false, .release);
 
     // 空闲：边框恢复品红、标题无盲文
     state.setStreamStatus(.idle);
