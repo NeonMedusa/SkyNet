@@ -78,38 +78,15 @@ IME 漂移/闪烁问题已在真实环境解决，说服力强；mock backend �
 注意：#3/#4 的 `restore.zig` 改动（复位序列）与 PR-2 同文件，若 PR-2 先合并，
 移植时基于合并后的 master 重建。
 
-## PR-1 语义备忘（utf8-tolerance）
+## 已合并 PR 的语义备忘（存档：要点）
 
-- 非法输入 → `U+FFFD`（1 列）；**每次前进 1 字节**，保证不吞掉紧随其后的合法字节；
-- fork 版 `stringWidth` 曾在解码失败时前进整个序列长度（`i += len`），PR 版统一为
-  1 字节；`skynet` rebase 时以 PR 版语义为准（对 SkyNet 无可见影响）；
-- 覆盖用例：游离非法字节、尾部截断、坏序列后跟合法字节（不吞）、超长编码；
-- 解码逻辑收敛到公共辅助 `decodeCharAt()`（此前三个函数各写一份，语义有细微出入）。
-
-## PR-2 语义备忘（windows-restore）
-
-- `arm` 在 Windows 上改为**显式接收原始控制台模式**（`WinMode`），与 POSIX 传入
-  `original_termios` 的形态对齐；`restore()` 先写离开序列（此时 VT 处理仍开启），
-  再交还 stdin/stdout 模式；
-- 新增 Windows-only 测试用 `INVALID_HANDLE_VALUE` 驱动状态机（不触碰真实控制台），
-  测试体用 `if (!is_posix)` comptime 分支包裹（否则 POSIX 编译会因句柄类型不匹配报错）；
-- 跨平台验证：本机 Windows `zig build test`（70/70）+ `zig build examples` + 对
-  `x86_64-linux-gnu` 的 `zig test -fno-emit-bin` 交叉编译检查（restore.zig 与 lib.zig）。
-
-## PR-3 语义备忘（wide-char-support，2026-09-22）
-
-合并为一个 PR、四个 commit（输入 + 三个组件的布局修复），上游接受（`e1c7c4a`）。
-要点：
-
-- **Windows 输入**：`codeUnitToUtf8`（上游版 `resolveSurrogate` 的 fork 增强版）——
-  **两版的关键差异**：上游版只处理代理对；fork 版额外修复 **Latin-1 补充字符
-  （U+0080–U+00FF，如 é/ü）**——旧逻辑把它们当"原始字节"透传，单字节不构成合法
-  UTF-8 序列，会静默丢字符甚至吞掉后续字符。**回贡时未包含这部分**（当时 PR 只移植了
-  代理对逻辑），rebase 后保留 fork 版并删除上游版；
-- **Widgets 布局**：TextInput/Tabs/Paragraph 此前按"码点计数"推进而非显示宽度，
-  宽字符（CJK/emoji）的第二列会被后继字符覆盖、整对清空 → 表现为"字符不显示"。
-  统一改用 `codepointWidth` 计列；
-- **测试**：`combineSurrogates` 边界 + 代理对状态机 + 三个组件的宽字符布局。
+PR-1/#38（utf8-tolerance）：非法输入 → U+FFFD（1 列），**每次前进 1 字节**（不吞后续合法
+字节）；解码收敛到 decodeCharAt()。PR-2/#39（windows-restore）：rm 显式接收原始控制台
+模式，
+estore() 先写离开序列再交还模式；Windows-only 测试用 INVALID_HANDLE_VALUE 驱动。
+PR-3/#42（wide-char-support）：Windows 输入 codeUnitToUtf8（代理对 + **Latin-1 补充字符
+U+0080–U+00FF** 修复，回贡时未含这部分）、组件按 codepointWidth 布局。更早的逐条细节
+见 git 历史。
 
 ## 流程教训：rebase 会静默剥离"fork 独有的增强"
 

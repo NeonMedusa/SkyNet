@@ -1,4 +1,4 @@
-<img width="1247" height="759" alt="57f8a45b01e6bc350b89e026b9ec3efb" src="https://github.com/user-attachments/assets/474562fd-102b-49c7-9622-812db7f099da" />
+<img width="1265" height="759" alt="图片" src="https://github.com/user-attachments/assets/54c6ca37-7cbc-46d9-b38b-28eb377adbc6" />
 
 # SkyNet
 

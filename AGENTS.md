@@ -3,7 +3,16 @@
 SkyNet 是一个 Zig 0.16 编写的 TUI AI 编码助手：流式对话、工具调用（read/write/edit/bash/grep/find/ls）、
 思考块、SQLite 持久化、上下文折叠与压缩（compaction）。数据默认在 `skynet.db`（SQLite WAL）。
 
-> 面向人类开发者的架构速览、路线图与踩坑记录见 [`docs/development.md`](docs/development.md)。
+> **开始改代码前先读 [`docs/architecture.md`](docs/architecture.md)**：面向 AI 的代码地图
+> （模块职责、`main.zig` 分区、关键数据流、改动连带影响），用**函数名**做锚点、不含行号。
+> 它能让新会话/压缩后的自己**不必通读 2 万行**就定位到该看的函数——先读它，再用 `grep "fn 名字"` 精读。
+>
+> **维护契约（重要）**：改完代码后，如果**入口函数、职责划分、调用关系或连带影响**发生变化，
+> **必须回头更新 `docs/architecture.md` 的对应条目**（同样更新 `docs/development.md` 里
+> 过时的描述）。过期的文档比没有文档更糟——AI 会按错的指引去改代码。
+
+> 面向人类开发者的架构速览、路线图与踩坑记录见 [`docs/development.md`](docs/development.md)；
+> 用户使用说明见 [`docs/user-guide.md`](docs/user-guide.md)。
 
 ## 构建与测试
 
@@ -88,6 +97,9 @@ role='summary' 的消息（摘要原文，FTS 可搜）
 
 ## 关键模块
 
+完整模块表、`main.zig` 分区地图、关键数据流与“改动连带影响”见
+[`docs/architecture.md`](docs/architecture.md)。速览：
+
 - `src/main.zig`：TUI 绘制/事件、CLI（ask/new/sessions/messages/stats/compact）、agent worker、压缩调度
 - `src/context.zig`：token 估算、工具输出折叠模拟、压缩区间选择与摘要输入构建（纯计算，可单测）
 - `src/cli_args.zig`：CLI 参数解析与输出辅助（无 AppState 依赖）
@@ -100,7 +112,7 @@ role='summary' 的消息（摘要原文，FTS 可搜）
 - **系统提示词政策（政策A，2026-09 定）**：提示词属于程序（`src/main.zig` 顶部 `system_prompt`，
   随版本升级，全局一套）。**DB 不含 system 行**（写入侧从不产生，读取侧无兼容分支——
   旧库数据 2026-09 已全部清除）；加载/重建时统一前置当前值一次（`prepend_system=true`），
-  增量路径传 false（勿重复前置）。政策与背景见 `docs/development.md` 2.5 节
+  增量路径传 false（勿重复前置）。政策与背景见 `docs/development.md` 2.4 节
 - **日志**：每次启动写 `logs/<epoch>.<ms>.txt`（保留最近 20 份）。默认 info 级；
   `$env:SKYNET_LOG='debug'|'warn'|'error'|'off'` 覆盖。含请求/响应/工具/重试/压缩/落库失败
   全链路元数据（不含消息正文与密钥）。**排查线上问题（断连、卡顿、丢消息）时先看最新日志**；
