@@ -495,7 +495,7 @@ const EditArgs = struct {
 /// 支持：① 标准 {"path","edits":[{old_text,new_text}]}；
 ///       ② edits 传成单个对象而非数组（`{"edits":{...}}` → 单元素数组）。
 /// 不兼容其他 agent 的字段命名（如 pi 的驼峰 oldText/newText）——该设想及其
-/// 争议见 docs/development.md 2.6「未来可讨论的点：跨 agent 工具字段兼容」。
+/// 争议见 docs/development.md 2.5「未来可讨论的点：跨 agent 工具字段兼容」。
 fn prepareEditArgs(allocator: Allocator, args_json: []const u8) ?EditArgs {
     // ① 标准形式
     if (parseArgs(EditArgs, allocator, args_json)) |a| {
