@@ -442,9 +442,9 @@ const tool_schemas = blk: {
 
 const StreamEventKind = enum { turn_end, tool_start, tool_end, user_sent, retry_start, toast };
 
-/// 进行中/压缩的统一强调色（偏红的橙色）：输入框忙碌边框、压缩通知共用。
+/// 进行中/压缩的统一强调色（标准橙色 orange）：输入框忙碌边框、压缩通知共用。
 /// 终端不支持 24-bit 色时由终端降级到近似色。
-const busy_accent = tui.style.Color.fromRGB(255, 100, 0);
+const busy_accent = tui.style.Color.fromRGB(255, 165, 0);
 
 const StreamEvent = struct {
     kind: StreamEventKind,
@@ -2356,7 +2356,9 @@ const AppState = struct {
         } else if (std.mem.eql(u8, name, "sessions")) {
             self.openSessionSelect(.help_select);
         } else if (std.mem.eql(u8, name, "compact")) {
-            // 确认框：由用户确认后再执行（输入 /compact 仍直接执行）
+            // 确认框：由用户确认后再执行（输入 /compact 仍直接执行）；
+            // 记录父菜单：Esc 返回上一级（与删除会话确认框一致）
+            self.menu_parent = .help_select;
             self.confirm_stage = 1;
             self.confirm_yes = false;
             self.mode = .compact_confirm;
@@ -3919,9 +3921,9 @@ const AppState = struct {
             },
             .enter => {
                 if (!self.confirm_yes) {
-                    // 选择"否" → 取消
+                    // 选择"否" → 返回上一级（菜单进的返帮助菜单，否则回主界面）
                     self.confirm_stage = 0;
-                    self.mode = .normal;
+                    self.closeMenu();
                     return;
                 }
                 if (self.confirm_stage == 1) {
@@ -3930,13 +3932,15 @@ const AppState = struct {
                     self.confirm_yes = false;
                 } else {
                     self.confirm_stage = 0;
+                    self.menu_parent = null;
                     self.mode = .normal;
                     self.runCompactCommand(0);
                 }
             },
             .esc, .delete => {
+                // Esc 返回上一级（与删除会话确认框一致），而非关掉整个菜单
                 self.confirm_stage = 0;
-                self.mode = .normal;
+                self.closeMenu();
             },
             else => {},
         }
@@ -8735,7 +8739,7 @@ fn drawCompactConfirmDialog(state: *AppState, area: Rect, buf: *Buffer) void {
     const blk = Block{
         .title = " 确认压缩上下文 ",
         .borders = Borders.ALL,
-        .border_style = .{ .fg = .yellow },
+        .border_style = .{ .fg = busy_accent },
         .title_style = .{ .fg = .white, .modifier = .{ .bold = true } },
         .border_symbols = BorderSymbols.rounded(),
     };
@@ -12625,15 +12629,24 @@ test "压缩确认框：菜单进入两关确认" {
         state.messages.deinit(std.testing.allocator);
     }
 
-    // 菜单选 compact → 打开确认框（默认停在"否"）
+    // 菜单选 compact → 打开确认框（默认停在"否"）；记录父菜单（Esc 返回帮助菜单）
     state.executeHelpCommand("compact");
     try std.testing.expectEqual(Mode.compact_confirm, state.mode);
+    try std.testing.expectEqual(Mode.help_select, state.menu_parent.?);
     try std.testing.expectEqual(@as(u8, 1), state.confirm_stage);
     try std.testing.expect(!state.confirm_yes);
 
-    // 第一关选"否" → 返回主界面，不执行
+    // 第一关选"否" → 返回上一级（帮助菜单），不执行
     state.handleCompactConfirmKey(.{ .code = .enter });
-    try std.testing.expectEqual(Mode.normal, state.mode);
+    try std.testing.expectEqual(Mode.help_select, state.mode);
+    try std.testing.expectEqual(@as(u8, 0), state.confirm_stage);
+    try std.testing.expect(state.menu_parent == null);
+
+    // Esc 同样返回上一级（与删除会话确认框一致）
+    state.executeHelpCommand("compact");
+    try std.testing.expectEqual(Mode.compact_confirm, state.mode);
+    state.handleCompactConfirmKey(.{ .code = .esc });
+    try std.testing.expectEqual(Mode.help_select, state.mode);
     try std.testing.expectEqual(@as(u8, 0), state.confirm_stage);
 
     // 再进确认框：两关都选"是" → 执行压缩（无 provider 时安全报错）
