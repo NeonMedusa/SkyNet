@@ -51,13 +51,18 @@ Terminal.flush → 仅输出变化单元格（SGR 合并）→ 同步输出块�
 
 ### 1.4 持久化
 
-- `message` 表存**全部原文**（含 reasoning、tool_full）；工具输出折叠只改发给模型的
-  history（stub），DB 原文保留，重启后 UI 完整。
+- `message` 表存**全部原文**（含 reasoning）；工具输出折叠**仅面向 AI**——
+  DB 的 `content` 始终是全文（供导出/UI），`folded` 列记录该行已折，发给模型前换成
+  stub（见 `applyLoadedMessagesWithCheckpoint` 与 `maybeFoldOldToolOutputs`）。
 - `compaction` 表存 checkpoint（`summary_message_id` + `tail_start_id`）；恢复时按
-  checkpoint 重建历史。schema 版本不符时**拒绝打开**（不迁移、不重建、不写入——全部迁移
-  代码 2026-09 已清空；数据库升级迁移模块将来专门设计）。TUI 另有启动闸门：旧库经用户
-  确认后重命名为备份（`skynet.old.db`，含侧车、冲突编号、失败回滚）并新建空库继续；
-  库比程序新则提示升级后退出——**任何路径都不自动迁移、不删除、不写入旧库**。
+  checkpoint 重建历史。
+- **schema 迁移**（`schema_version = 8`）：旧库打开时**自动迁移**——
+  `db.migrateIfNeeded` 先整库备份（`<db>.v{old}.bak.db` + 侧车，copyFile 只读源）
+  再逐级升级（`migrations` 表里每步一个函数，**每步与 user_version 同事务**）；
+  迁移后 VACUUM 回收空闲页。版本过旧（`< migration_min_version`，当前 7）
+  或库比程序新则拒绝打开，由启动闸门处理：可迁移 → 提示确认后自动迁移；
+  过旧 → 重命名为备份（`skynet.old.db`）后新建空库；过新 → 提示升级后退出。
+  v7→v8 具体动作：加 `folded` 列 + 把存量 stub 的 content 还原为全文 + **DROP `tool_full`**。
 
 ---
 
@@ -324,7 +329,7 @@ Claude Code / Cursor / Aider 用 `old_string`/`old_str`，我们用蛇形 `old_t
 |---|---|
 | worker 线程 + 事件队列 | UI 不阻塞于网络/工具；队列保序（正文先于工具） |
 | 实时落库 + finalize 快路径 | 崩溃安全；finalize 只补未落库条目（`worker_persisted_max` 同步游标） |
-| 折叠只改 history | DB 原文保留（`tool_full`）→ 重启 UI 完整；请求前缀变小 |
+| 折叠只改 history | DB 的 `content` 始终是全文（`folded` 列标记已折）→ 重启 UI/导出完整；请求前缀变小 |
 | usage 锚点（真实 + 增量） | bytes/4 对中文低估约 35%；压缩/清史/重建立即失效防误配 |
 | 双缓冲 + 同步输出 + 帧尾光标 | 每帧一次渲染（防闪烁）；IME 定位与帧同字节流（防跳变） |
 | 显示/历史两套数据 | 渲染态（思考块/工具块/展开）与 API 格式解耦 |

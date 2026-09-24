@@ -29,14 +29,14 @@ pub const MessageRow = struct {
     tool_name: []const u8 = "",
     /// 工具块正文（edit 的行号 diff 等；shell 类工具为空，正文即 content）
     tool_display: []const u8 = "",
-    /// 折叠前的工具输出全文（content 被折叠成 stub 时非空；供 UI 展示）
-    tool_full: []const u8 = "",
     /// 工具是否执行失败（0/1）
     is_error: i64 = 0,
     /// token 用量（assistant 消息；压缩基线与统计用）
     input_tokens: i64 = 0,
     cached_tokens: i64 = 0,
     output_tokens: i64 = 0,
+    /// 该工具结果已对 AI 折叠（1 = 发给模型时用 stub；content 仍是全文）
+    folded: i64 = 0,
 };
 
 /// insertMessage 参数（字段较多，用具名结构）
@@ -54,14 +54,14 @@ pub const NewMessage = struct {
     tool_name: []const u8 = "",
     /// 工具块渲染正文（edit diff 等）
     tool_display: []const u8 = "",
-    /// 折叠前的工具输出全文（可为空）
-    tool_full: []const u8 = "",
     /// 工具是否执行失败（0/1）
     is_error: i64 = 0,
     /// token 用量（assistant 消息；压缩基线与统计用）
     input_tokens: i64 = 0,
     cached_tokens: i64 = 0,
     output_tokens: i64 = 0,
+    /// 该工具结果已对 AI 折叠（1 = 发给模型时用 stub；content 仍是全文）
+    folded: i64 = 0,
 };
 
 pub const SessionInfo = struct {
@@ -219,11 +219,11 @@ pub const Db = struct {
         \\  tool_call_id TEXT NOT NULL DEFAULT '',
         \\  tool_name TEXT NOT NULL DEFAULT '',
         \\  tool_display TEXT NOT NULL DEFAULT '',
-        \\  tool_full TEXT NOT NULL DEFAULT '',
         \\  is_error INTEGER NOT NULL DEFAULT 0,
         \\  input_tokens INTEGER NOT NULL DEFAULT 0,
         \\  cached_tokens INTEGER NOT NULL DEFAULT 0,
-        \\  output_tokens INTEGER NOT NULL DEFAULT 0
+        \\  output_tokens INTEGER NOT NULL DEFAULT 0,
+        \\  folded INTEGER NOT NULL DEFAULT 0
         \\);
         \\CREATE TABLE IF NOT EXISTS "compaction" (
         \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,23 +250,39 @@ pub const Db = struct {
         \\END;
     ;
 
-    /// 库结构版本：打开时校验，不一致**拒绝打开**（不迁移、不重建、不写入）。
-    /// 全部历史迁移代码已于 2026-09 清空（尚无外部用户，一次性迁移无保留价值）；
-    /// 数据库升级迁移模块将来专门设计，届时从 openFile 的版本校验处接入。
-    /// TUI 启动闸门据此提示用户：旧库可经确认重命名为备份后新建空库（见 main.zig）。
-    pub const schema_version: i64 = 7;
+    /// 库结构版本：打开时校验。旧库（v < 当前）由 migrateIfNeeded 逐级升级；
+    /// 过旧无迁移路径（v < migration_min_version）或库比程序新 → 拒绝打开，
+    /// 由 TUI 启动闸门提示用户（见 main.zig）。
+    ///
+    /// 版本历史：
+    /// - v8：`message.folded`——工具输出折叠仅面向 AI（content 始终存全文）
+    pub const schema_version: i64 = 8;
+
+    /// 有迁移路径的最低旧版本：低于它一律拒绝（闸门提示备份后新建）。
+    /// 目前只有 v7→v8 一步；将来每加一步迁移函数就把这里前移。
+    pub const migration_min_version: i64 = 7;
 
     /// 打开数据库。注意：不提供"默认路径"的便利函数——那会让调用方（曾导致
     /// TUI 忽略 `-db` 的 bug）忘记传路径。所有调用方都显式给出 filename。
+    ///
+    /// 版本处理（见 migrateIfNeeded）：
+    /// - 全新库（current == 0）：直接建最新 schema；
+    /// - 旧库且有迁移路径（migration_min_version ≤ current < schema_version）：
+    ///   **先备份**，再逐级升级；
+    /// - 过旧（current < migration_min_version）或库比程序新：拒绝打开
+    ///   （`error.SchemaVersionMismatch`），由启动闸门提示用户。
     pub fn openFile(allocator: Allocator, io: Io, filename: [:0]const u8) !Db {
         // 版本校验安排在打开 SQLite 之前（纯读文件头）：被拒绝的库连 WAL 恢复都不触发，
         // 真正做到"一个字节都不被改动"。current == 0 = 全新库（无 schema）。
-        // 说明：本项目暂无迁移逻辑（2026-09 清空全部历史迁移代码）；数据库升级迁移
-        // 模块将来专门设计，届时从这里接入。
         var current: i64 = 0;
         if (probeVersionMismatch(allocator, io, filename)) |mm| current = mm.db_version;
-        if (current != 0 and current != schema_version) {
-            Log.err(.db, "schema 版本不符（库 {d} ≠ 程序 {d}）: 拒绝打开 {s}（不迁移、不删除）", .{ current, schema_version, filename });
+        if (current != 0 and (current < migration_min_version or current > schema_version)) {
+            Log.err(.db, "schema 版本不符（库 {d} ∉ [{d}, {d}]）: 拒绝打开 {s}（不迁移、不删除）", .{
+                current,
+                migration_min_version,
+                schema_version,
+                filename,
+            });
             return error.SchemaVersionMismatch;
         }
 
@@ -281,12 +297,182 @@ pub const Db = struct {
 
         try sess.conn.execAll("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
 
-        try sess.conn.execAll(schema);
+        // 旧库升级：先备份，再逐级迁移（任一步失败则回滚事务并报错，备份保留）
+        if (current != 0 and current < schema_version) {
+            g_migrating = true;
+            defer g_migrating = false;
+            migrateIfNeeded(allocator, io, &sess, filename, current) catch |e| {
+                Log.err(.db, "数据库迁移失败（v{d} → v{d}）: {s}（备份保留：{s}）", .{
+                    current,
+                    schema_version,
+                    filename,
+                    lastMigrateBackup(),
+                });
+                return e;
+            };
+        } else {
+            try sess.conn.execAll(schema);
+        }
         try sess.conn.execAll(std.fmt.comptimePrint("PRAGMA user_version = {d};", .{schema_version}));
 
         Log.info(.db, "数据库就绪 {s} schema={d}（原 {d}）", .{ filename, schema_version, current });
 
         return .{ .sess = sess, .io = io, .allocator = allocator, .path = path_copy };
+    }
+
+    /// 单步迁移函数签名：把库从 v{n-1} 升到 v{n}（在事务中执行）。
+    const MigrationFn = *const fn (sess: *fr.Session) anyerror!void;
+
+    /// 迁移表：下标 i 的函数把 v(i + migration_min_version) 升到下一版。
+    /// 新增版本时：① schema_version +1；② 在此追加一个函数；
+    /// ③ migration_min_version 保持不变（除非故意放弃对最旧版本的支持）。
+    const migrations = [_]struct { from: i64, run: MigrationFn }{
+        .{ .from = 7, .run = migrateV7ToV8 },
+    };
+
+    /// 备份 + 逐级迁移（v{current} → v{schema_version}）。
+    ///
+    /// 顺序：① 先做**整库备份**（`<base>.v{old}.bak.db` + 侧车文件，用 copyFile——
+    /// 只读源文件、不修改原库）；② 每步迁移在**独立事务**中执行并立即提交，
+    /// 全部成功后才写入新 user_version。任一步失败：已提交的步骤不回滚（SQLite DDL
+    /// 事务限制），但备份始终保留——用户可手动回退，日志里有完整记录。
+    fn migrateIfNeeded(
+        allocator: Allocator,
+        io: Io,
+        sess: *fr.Session,
+        filename: [:0]const u8,
+        current: i64,
+    ) !void {
+        const backup = try backupBeforeMigrate(allocator, io, filename, current);
+        defer allocator.free(backup);
+        Log.info(.db, "迁移前已备份 {s}", .{backup});
+        recordLastBackup(backup); // 供 UI 在失败时提示用户从哪里恢复
+
+        var v = current;
+        while (v < schema_version) {
+            var step: ?MigrationFn = null;
+            for (migrations) |m| {
+                if (m.from == v) {
+                    step = m.run;
+                    break;
+                }
+            }
+            const run = step orelse return error.NoMigrationPath;
+            // 每步一个事务：schema 改动与 user_version 一起提交（原子）。
+            // 这样多步迁移中途失败时，库停在「一致的中间版本」——
+            // 既不会出现「schema 已升、版本号未升」导致的重复迁移卡死，
+            // 也能在下次启动时从断点继续。
+            try sess.conn.execAll("BEGIN IMMEDIATE;");
+            run(sess) catch |e| {
+                sess.conn.execAll("ROLLBACK;") catch {};
+                return e;
+            };
+            var uv_buf: [64]u8 = undefined;
+            const uv_sql = std.fmt.bufPrint(&uv_buf, "PRAGMA user_version = {d};", .{v + 1}) catch {
+                sess.conn.execAll("ROLLBACK;") catch {};
+                return error.OutOfMemory;
+            };
+            sess.conn.execAll(uv_sql) catch |e| {
+                sess.conn.execAll("ROLLBACK;") catch {};
+                return e;
+            };
+            try sess.conn.execAll("COMMIT;");
+            Log.info(.db, "迁移步骤 v{d} → v{d} 完成", .{ v, v + 1 });
+            v += 1;
+        }
+
+        // 迁移后补齐缺失的索引/触发器（用 IF NOT EXISTS 的 schema 语句，幂等）
+        try sess.conn.execAll(schema);
+
+        // 回收迁移（尤其是 DROP COLUMN）留下的空闲页；VACUUM 不能在事务内执行，
+        // 因此放在所有步骤提交之后。代价：一次全库重写（一次性成本，可接受）。
+        sess.conn.execAll("VACUUM;") catch |e| {
+            // VACUUM 失败不影响迁移正确性（只是文件偏大）
+            Log.warn(.db, "迁移后 VACUUM 失败（不影响数据）: {s}", .{@errorName(e)});
+        };
+    }
+
+    /// 最近一次迁移备份的路径（供启动失败时向用户展示"从哪恢复"）。
+    var g_last_backup: struct { buf: [512]u8 = undefined, len: usize = 0 } = .{};
+
+    fn recordLastBackup(path: []const u8) void {
+        const n = @min(path.len, g_last_backup.buf.len);
+        @memcpy(g_last_backup.buf[0..n], path[0..n]);
+        g_last_backup.len = n;
+    }
+
+    /// 迁移失败时用于提示的备份路径（无则空串）
+    pub fn lastMigrateBackup() []const u8 {
+        return g_last_backup.buf[0..g_last_backup.len];
+    }
+
+    /// 迁移类错误（含备份保留语义）：供 UI 区分"迁移失败"与"其他打开失败"。
+    /// 说明：迁移内部的任意 SQL 错误也会原样返回（isMigrationError 判断的是一组
+    /// 可识别的迁移错误 + 标志位，而不是穷举 SQL 错误）。
+    var g_migrating: bool = false;
+
+    pub fn isMigrationError(e: anyerror) bool {
+        return switch (e) {
+            error.NoMigrationPath, error.BackupFailed, error.TooManyBackups, error.RenameFailed => true,
+            else => g_migrating, // 迁移过程中抛出的其他错误（如 SQL 错误）
+        };
+    }
+
+    /// 迁移前整库备份：`<base>.v{old}.bak.db`（冲突时加序号）；
+    /// 侧车（-wal/-shm）一并复制（WAL 里可能有未 checkpoint 的数据）。
+    /// 只复制、不移动——原库原地不动，失败也不影响它。
+    fn backupBeforeMigrate(
+        allocator: Allocator,
+        io: Io,
+        filename: [:0]const u8,
+        old_version: i64,
+    ) ![]u8 {
+        const dir = Io.Dir.cwd();
+        // 备份放在数据库所在目录（filename 可能带目录，如 `-db data/skynet.db`）；
+        // 用完整路径拼接，避免备份意外落到 cwd。
+        var target: []u8 = undefined;
+        var n: usize = 0;
+        while (n < 100) : (n += 1) {
+            const candidate = if (n == 0)
+                try std.fmt.allocPrint(allocator, "{s}.v{d}.bak.db", .{ filename, old_version })
+            else
+                try std.fmt.allocPrint(allocator, "{s}.v{d}.bak.{d}.db", .{ filename, old_version, n + 1 });
+            const taken = blk: {
+                dir.access(io, candidate, .{}) catch break :blk false;
+                break :blk true;
+            };
+            if (!taken) {
+                target = candidate;
+                break;
+            }
+            allocator.free(candidate);
+        } else return error.TooManyBackups;
+        errdefer allocator.free(target);
+
+        dir.copyFile(filename, dir, target, io, .{}) catch return error.BackupFailed;
+        const suffixes = [_][]const u8{ "-wal", "-shm" };
+        for (suffixes) |suf| {
+            var src_buf: [4096]u8 = undefined;
+            const src = std.fmt.bufPrint(&src_buf, "{s}{s}", .{ filename, suf }) catch continue;
+            dir.access(io, src, .{}) catch continue;
+            var dst_buf: [4096]u8 = undefined;
+            const dst = std.fmt.bufPrint(&dst_buf, "{s}{s}", .{ target, suf }) catch continue;
+            dir.copyFile(src, dir, dst, io, .{}) catch {};
+        }
+        return target;
+    }
+
+    /// v7 → v8：加 `message.folded`（工具输出折叠仅面向 AI），并**彻底移除** `tool_full` 列。
+    /// 存量已折叠行（content=stub、tool_full=全文）：先把全文还原回 content、置 folded=1，
+    /// 再 DROP 列——不留任何冗余副本（DB 里工具输出只存一份）。
+    fn migrateV7ToV8(sess: *fr.Session) !void {
+        try sess.conn.execAll("ALTER TABLE \"message\" ADD COLUMN folded INTEGER NOT NULL DEFAULT 0;");
+        try sess.conn.execAll(
+            "UPDATE \"message\" SET content = tool_full, folded = 1 WHERE tool_full <> '' AND role = 'tool';",
+        );
+        // SQLite 3.35+ 支持 DROP COLUMN（本仓库捆绑 3.53）。
+        // 注意：DROP COLUMN 留下的空闲页由 migrateIfNeeded 在事务外 VACUUM 回收。
+        try sess.conn.execAll("ALTER TABLE \"message\" DROP COLUMN tool_full;");
     }
 
     pub fn deinit(self: *Db) void {
@@ -357,7 +543,7 @@ pub const Db = struct {
 
     /// 加载某会话中 id 大于 after_id 的消息（按 id 升序，用于增量刷新）
     /// 消息行的完整列清单（多处查询共用，避免改动时遗漏）
-    const message_cols = "id, session_id, role, content, model, provider, created_at, reasoning, reasoning_ms, tool_calls, tool_call_id, tool_name, tool_display, tool_full, is_error, input_tokens, cached_tokens, output_tokens";
+    const message_cols = "id, session_id, role, content, model, provider, created_at, reasoning, reasoning_ms, tool_calls, tool_call_id, tool_name, tool_display, is_error, input_tokens, cached_tokens, output_tokens, folded";
 
     pub fn loadMessagesAfter(self: *Db, session_id: i64, after_id: i64) ![]const MessageRow {
         return try self.sess.raw(
@@ -438,7 +624,7 @@ pub const Db = struct {
     pub fn insertMessage(self: *Db, msg: NewMessage) !i64 {
         const ts = self.now();
         try self.sess.exec(
-            "INSERT INTO \"message\" (session_id, role, content, model, provider, created_at, reasoning, reasoning_ms, tool_calls, tool_call_id, tool_name, tool_display, tool_full, is_error, input_tokens, cached_tokens, output_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO \"message\" (session_id, role, content, model, provider, created_at, reasoning, reasoning_ms, tool_calls, tool_call_id, tool_name, tool_display, is_error, input_tokens, cached_tokens, output_tokens, folded) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             .{
                 msg.session_id,
                 msg.role,
@@ -452,11 +638,11 @@ pub const Db = struct {
                 msg.tool_call_id,
                 msg.tool_name,
                 msg.tool_display,
-                msg.tool_full,
                 msg.is_error,
                 msg.input_tokens,
                 msg.cached_tokens,
                 msg.output_tokens,
+                msg.folded,
             },
         );
         const id = try self.sess.conn.lastInsertRowId();
@@ -464,12 +650,12 @@ pub const Db = struct {
         return id;
     }
 
-    /// 折叠一条工具结果：content 替换为 stub，全文存入 tool_full。
-    /// 已折叠过（tool_full 非空）时不覆盖。
-    pub fn foldToolMessage(self: *Db, id: i64, folded_content: []const u8, full_content: []const u8) !void {
+    /// 折叠一条工具结果（**仅面向 AI**）：置 folded = 1，content 保持全文不动。
+    /// 已折叠过（folded 非空）时不覆盖。发给模型时由调用方生成 stub。
+    pub fn foldToolMessage(self: *Db, id: i64) !void {
         try self.sess.exec(
-            "UPDATE \"message\" SET content = ?, tool_full = ? WHERE id = ? AND tool_full = ''",
-            .{ folded_content, full_content, id },
+            "UPDATE \"message\" SET folded = 1 WHERE id = ? AND folded = 0",
+            .{id},
         );
     }
 
@@ -804,6 +990,188 @@ test "db: 版本不一致时拒绝打开（不迁移、不重建；数据原样�
         const ver = try sess.raw("SELECT user_version FROM pragma_user_version", .{}).fetchAll(Ver);
         try testing.expectEqual(@as(i64, 1), ver[0].user_version);
     }
+}
+
+test "db: v7 → v8 迁移（加 folded 列 + 还原 stub 为全文 + 备份）" {
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    defer threaded.deinit();
+
+    const dir = Io.Dir.cwd();
+    const path: [:0]const u8 = "skynet_test_migrate_v8.db";
+    const cleanup = [_][]const u8{
+        "skynet_test_migrate_v8.db",
+        "skynet_test_migrate_v8.db-wal",
+        "skynet_test_migrate_v8.db-shm",
+        "skynet_test_migrate_v8.db.v7.bak.db",
+        "skynet_test_migrate_v8.db.v7.bak.db-wal",
+        "skynet_test_migrate_v8.db.v7.bak.db-shm",
+    };
+    for (cleanup) |f| dir.deleteFile(io, f) catch {};
+    defer for (cleanup) |f| dir.deleteFile(io, f) catch {};
+
+    // 手工构造 v7 库：无 folded 列；一条已折叠行（content=stub、tool_full=全文）
+    {
+        var sess = try fr.Session.open(fr.SQLite3, testing.allocator, io, .{
+            .filename = path,
+            .busy_timeout = 5000,
+            .foreign_keys = .on,
+        });
+        defer sess.deinit();
+        try sess.conn.execAll(
+            \\CREATE TABLE "session" (
+            \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\  title TEXT NOT NULL DEFAULT '',
+            \\  created_at INTEGER NOT NULL,
+            \\  last_active_at INTEGER NOT NULL
+            \\);
+            \\CREATE TABLE "message" (
+            \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\  session_id INTEGER NOT NULL,
+            \\  role TEXT NOT NULL,
+            \\  content TEXT NOT NULL,
+            \\  model TEXT NOT NULL DEFAULT '',
+            \\  provider TEXT NOT NULL DEFAULT '',
+            \\  created_at INTEGER NOT NULL,
+            \\  reasoning TEXT NOT NULL DEFAULT '',
+            \\  reasoning_ms INTEGER NOT NULL DEFAULT 0,
+            \\  tool_calls TEXT NOT NULL DEFAULT '',
+            \\  tool_call_id TEXT NOT NULL DEFAULT '',
+            \\  tool_name TEXT NOT NULL DEFAULT '',
+            \\  tool_display TEXT NOT NULL DEFAULT '',
+            \\  tool_full TEXT NOT NULL DEFAULT '',
+            \\  is_error INTEGER NOT NULL DEFAULT 0,
+            \\  input_tokens INTEGER NOT NULL DEFAULT 0,
+            \\  cached_tokens INTEGER NOT NULL DEFAULT 0,
+            \\  output_tokens INTEGER NOT NULL DEFAULT 0
+            \\);
+            \\PRAGMA user_version = 7;
+        );
+        try sess.exec("INSERT INTO \"session\" (title, created_at, last_active_at) VALUES ('旧会话', 1, 1)", .{});
+        // 已折叠行（旧语义：content = stub，tool_full = 全文）
+        try sess.exec("INSERT INTO \"message\" (session_id, role, content, tool_call_id, tool_name, tool_full, created_at) VALUES (1, 'tool', '[工具输出已折叠：bash 输出 7 字符。如需内容请重新调用该工具]', 'c1', 'bash', '真正全文内容', 1)", .{});
+        // 未折叠行
+        try sess.exec("INSERT INTO \"message\" (session_id, role, content, tool_call_id, tool_name, created_at) VALUES (1, 'tool', '未折叠全文', 'c2', 'read', 1)", .{});
+    }
+
+    // 打开：自动迁移（备份 + 加列 + 还原全文）
+    {
+        var db = try Db.openFile(testing.allocator, io, path);
+        defer db.deinit();
+        // 版本号与 schema 同事务写入：迁移后应为 8
+        {
+            const Ver = struct { user_version: i64 = 0 };
+            const ver = try db.sess.raw("SELECT user_version FROM pragma_user_version", .{}).fetchAll(Ver);
+            try testing.expectEqual(@as(i64, 8), ver[0].user_version);
+        }
+        // tool_full 列已被彻底移除（不留冗余副本）
+        {
+            const Col = struct { name: []const u8 = "" };
+            const cols = try db.sess.raw("SELECT name FROM pragma_table_info('message')", .{}).fetchAll(Col);
+            var has_tool_full = false;
+            var has_folded = false;
+            for (cols) |c| {
+                if (std.mem.eql(u8, c.name, "tool_full")) has_tool_full = true;
+                if (std.mem.eql(u8, c.name, "folded")) has_folded = true;
+            }
+            try testing.expect(!has_tool_full);
+            try testing.expect(has_folded);
+        }
+        const rows = try db.loadMessages(1);
+        try testing.expectEqual(@as(usize, 2), rows.len);
+        // 已折叠行：content 还原为全文，folded = 1
+        try testing.expectEqualStrings("真正全文内容", rows[0].content);
+        try testing.expectEqual(@as(i64, 1), rows[0].folded);
+        // 未折叠行：folded = 0
+        try testing.expectEqualStrings("未折叠全文", rows[1].content);
+        try testing.expectEqual(@as(i64, 0), rows[1].folded);
+    }
+
+    // 备份文件存在且内容为迁移前状态（含旧 stub）
+    {
+        var sess = try fr.Session.open(fr.SQLite3, testing.allocator, io, .{
+            .filename = "skynet_test_migrate_v8.db.v7.bak.db",
+            .busy_timeout = 5000,
+            .foreign_keys = .on,
+        });
+        defer sess.deinit();
+        const Msg = struct { content: []const u8 = "" };
+        const msgs = try sess.raw("SELECT content FROM \"message\" WHERE id = 1", .{}).fetchAll(Msg);
+        try testing.expectEqualStrings("[工具输出已折叠：bash 输出 7 字符。如需内容请重新调用该工具]", msgs[0].content);
+        const Ver = struct { user_version: i64 = 0 };
+        const ver = try sess.raw("SELECT user_version FROM pragma_user_version", .{}).fetchAll(Ver);
+        try testing.expectEqual(@as(i64, 7), ver[0].user_version); // 备份保持旧版本
+    }
+}
+
+test "db: 迁移步骤失败时不写版本号（原子性；可重试）" {
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    defer threaded.deinit();
+
+    const dir = Io.Dir.cwd();
+    const path: [:0]const u8 = "skynet_test_migrate_atomic.db";
+    const cleanup = [_][]const u8{
+        "skynet_test_migrate_atomic.db",
+        "skynet_test_migrate_atomic.db-wal",
+        "skynet_test_migrate_atomic.db-shm",
+        "skynet_test_migrate_atomic.db.v7.bak.db",
+        "skynet_test_migrate_atomic.db.v7.bak.db-wal",
+        "skynet_test_migrate_atomic.db.v7.bak.db-shm",
+    };
+    for (cleanup) |f| dir.deleteFile(io, f) catch {};
+    defer for (cleanup) |f| dir.deleteFile(io, f) catch {};
+
+    // 构造 v7 库，但**故意让迁移步骤失败**：预先创建 folded 列，
+    // 使 migrateV7ToV8 的 ALTER TABLE 报 "duplicate column name"。
+    {
+        var sess = try fr.Session.open(fr.SQLite3, testing.allocator, io, .{
+            .filename = path,
+            .busy_timeout = 5000,
+            .foreign_keys = .on,
+        });
+        defer sess.deinit();
+        try sess.conn.execAll(
+            \\CREATE TABLE "session" (
+            \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\  title TEXT NOT NULL DEFAULT '',
+            \\  created_at INTEGER NOT NULL,
+            \\  last_active_at INTEGER NOT NULL
+            \\);
+            \\CREATE TABLE "message" (
+            \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\  session_id INTEGER NOT NULL,
+            \\  role TEXT NOT NULL,
+            \\  content TEXT NOT NULL,
+            \\  created_at INTEGER NOT NULL,
+            \\  folded INTEGER NOT NULL DEFAULT 0
+            \\);
+            \\PRAGMA user_version = 7;
+        );
+        try sess.exec("INSERT INTO \"session\" (title, created_at, last_active_at) VALUES ('旧会话', 1, 1)", .{});
+    }
+
+    // 打开应失败（迁移步骤报错），且**版本号保持 7**（未假装成功）
+    try testing.expectError(error.DbError, Db.openFile(testing.allocator, io, path));
+
+    {
+        var sess = try fr.Session.open(fr.SQLite3, testing.allocator, io, .{
+            .filename = path,
+            .busy_timeout = 5000,
+            .foreign_keys = .on,
+        });
+        defer sess.deinit();
+        const Ver = struct { user_version: i64 = 0 };
+        const ver = try sess.raw("SELECT user_version FROM pragma_user_version", .{}).fetchAll(Ver);
+        try testing.expectEqual(@as(i64, 7), ver[0].user_version); // 未被写成 8
+        const Msg = struct { n: i64 = 0 };
+        const n = try sess.raw("SELECT COUNT(*) AS n FROM \"session\"", .{}).fetchAll(Msg);
+        try testing.expectEqual(@as(i64, 1), n[0].n); // 数据未丢
+    }
+    // 备份存在（失败后仍可手动恢复）
+    dir.access(io, "skynet_test_migrate_atomic.db.v7.bak.db", .{}) catch {
+        return error.TestUnexpectedResult;
+    };
 }
 
 test "db: 旧库重命名（侧车搬迁、冲突编号、失败不变更）与只读版本探测" {

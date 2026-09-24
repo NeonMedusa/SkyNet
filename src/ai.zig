@@ -58,6 +58,8 @@ pub const Message = struct {
     tool_calls: ?[]const ToolCall = null,
     /// 落库行 id（0 = 未落库；仅本地使用，不参与请求序列化）
     db_id: i64 = 0,
+    /// 已对 AI 折叠（仅本地使用；content 仍是全文，发请求前换 stub）
+    folded: bool = false,
 };
 
 /// 工具定义（parameters 为 JSON Schema 文本）

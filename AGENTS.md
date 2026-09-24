@@ -80,16 +80,26 @@ zig-out/bin/SkyNet.exe compact -session 3 -db skynet.db --json # 手动压缩（
 
 ## 数据库 / schema 约定
 
-- `schema_version` 在 `src/db.zig`（当前 **v7**）；**版本不符即拒绝打开**（不迁移、不重建、
-  不写入——校验用纯读文件头完成（`probeVersionMismatch`），先于任何 SQLite 打开，被拒绝的库
-  连 WAL 都不触发）——**迁移代码已全部清空**（2026-09 决定：尚无外部用户，一次性迁移无保留
-  价值）；数据库升级迁移模块将来专门设计，届时从 openFile 版本校验处接入
-- 拒绝打开后 TUI 有**启动闸门**（`main.zig` runVersionGate）：旧库（库 < 程序）弹窗询问
-  "重命名为 `skynet.old.db`（数据原样保留）并新建空库" / "退出"；库比程序新则提示升级（含
-  项目地址）后退出。重命名只搬文件（含 -wal/-shm/-journal 侧车 + 冲突编号 + 失败回滚），
-  **绝不写入/删除旧库内容**；非交互终端降级为文本提示后退出。CLI `-db` 不走闸门（fail-fast）
-- **禁止**在 `openFile` 里新增任何隐式迁移/删除逻辑：数据永不自动销毁，迁移必须走专门模块
-- `message` 存全部原文；发给模型的 `content` 在大工具输出折叠后是 stub，全文在 `tool_full`
+- `schema_version` 在 `src/db.zig`（当前 **v8**）；版本处理：
+  - **有迁移路径**（`migration_min_version` ≤ 库版本 < 当前）→ `openFile` 里
+    **自动迁移**：`migrateIfNeeded` 先整库备份（`<db>.v{old}.bak.db` + 侧车，
+    copyFile 只读源）再逐级升级（`migrations` 表：每步一个函数，独立事务提交）；
+  - **过旧**（库 < `migration_min_version`，当前 7）或**库比程序新** → 拒绝打开
+    （校验用纯读文件头完成（`probeVersionMismatch`），先于任何 SQLite 打开）。
+- **加 schema 版本的步骤**：① `schema_version` +1；② 在 `migrations` 表里追加一步
+  迁移函数；③ 若放弃对最旧版本的支持则同步上调 `migration_min_version`；
+  ④ 加迁移测试（参考 `db: v7 → v8 迁移`）。
+- 拒绝打开后 TUI 有**启动闸门**（`main.zig` runVersionGate）：
+  可迁移 → 提示将自动备份+迁移，确认后继续；过旧 → 询问"重命名为 `skynet.old.db`
+  （数据原样保留）并新建空库" / "退出"；库比程序新 → 提示升级后退出。重命名只搬文件
+  （含 -wal/-shm/-journal 侧车 + 冲突编号 + 失败回滚），**绝不写入/删除旧库内容**；
+  非交互终端降级为文本提示后退出。CLI `-db` 不走闸门（fail-fast）。
+- **禁止**在 `openFile` 里新增任何隐式删除逻辑：数据永不自动销毁；迁移必须走
+  `migrateIfNeeded`（自动备份 + 可回退），不得静默改写旧库。
+- `message` 存全部原文（含 `content` = 工具输出全文）；**折叠仅面向 AI**：
+  `folded` 列记录已折，发给模型前换成 stub（`maybeFoldOldToolOutputs` /
+  `applyLoadedMessagesWithCheckpoint`）。**导出/UI 始终用 `content` 全文**。
+  （v8 迁移已 DROP 旧的 `tool_full` 列：内容只存一份。）
 - 压缩 checkpoint 在 compaction 表：summary_message_id + tail_start_id（id >= tail_start_id 的消息才发给模型）；summary_message_id 指向一条 
 role='summary' 的消息（摘要原文，FTS 可搜）
 - TUI 的 /compact 是**异步**的：摘要流式渲染，Ctrl+Q 可取消；CLI compact 仍同步（脚本友好）

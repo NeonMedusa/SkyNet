@@ -899,7 +899,7 @@ const AppState = struct {
         // 按角色重建内容（与 addLoaded* 路径一致的形态）
         if (msg.tool_block) |kind| {
             const name = row.tool_name;
-            const display_text: []const u8 = if (row.tool_full.len > 0) row.tool_full else row.content;
+            const display_text: []const u8 = row.content;
             const raw: []const u8 = if (row.is_error != 0)
                 display_text
             else if (row.tool_display.len > 0)
@@ -920,7 +920,7 @@ const AppState = struct {
             // 调用行文本存在 tool_header（卸载前保存），结果摘要从 DB 行重算，
             // 拼回与实时路径一致的形态
             const result = tools_mod.Result{
-                .content = @constCast(if (row.tool_full.len > 0) row.tool_full else row.content),
+                .content = @constCast(row.content),
                 .is_error = row.is_error != 0,
             };
             const summary = summarizeToolResult(scratch.allocator(), result) catch "";
@@ -1596,11 +1596,24 @@ const AppState = struct {
 
             if (std.mem.eql(u8, row.role, "tool")) {
                 if (in_tail) {
+                    // 折叠仅面向 AI：已标记折叠的行重建为 stub（与实时折叠路径同形），
+                    // 未折叠的用全文。content 在 DB 里始终是全文（导出/UI 用）。
+                    // stub 用栈缓冲构造，appendHistoryMessage 内部会深拷贝，无需额外分配
+                    var stub_buf: [192]u8 = undefined;
+                    const hist_content = if (row.folded != 0) blk: {
+                        const tool_label = if (row.tool_name.len > 0) row.tool_name else "tool";
+                        break :blk std.fmt.bufPrint(&stub_buf, "{s}：{s} 输出 {d} 字符。如需内容请重新调用该工具]", .{
+                            context_mod.fold_marker,
+                            tool_label,
+                            row.content.len,
+                        }) catch row.content;
+                    } else row.content;
                     self.appendHistoryMessage(.{
                         .role = "tool",
-                        .content = row.content,
+                        .content = hist_content,
                         .tool_call_id = row.tool_call_id,
                         .db_id = row.id,
+                        .folded = row.folded != 0,
                     });
                 }
                 // 找到对应的调用（优先用落库的工具名，参数从调用索引取）
@@ -3225,7 +3238,6 @@ const AppState = struct {
                     .tool_call_id = m.tool_call_id orelse "",
                     .tool_name = t_name,
                     .tool_display = t_display,
-                    .tool_full = "",
                     .is_error = t_error,
                     .input_tokens = @intCast(entry.usage.input_tokens),
                     .cached_tokens = @intCast(entry.usage.cached_tokens),
@@ -3335,7 +3347,7 @@ const AppState = struct {
         self.setStreamStatus(.idle);
 
         // 回合无恙：检查是否需要批量折叠较早的工具输出（只动发给模型的 history，
-        // 全文写入 DB 的 tool_full，UI/重启后仍可见全文）
+        // DB 的 content 始终是全文，UI/导出不受影响）
         if (err == null) {
             _ = self.maybeFoldOldToolOutputs();
         }
@@ -3367,10 +3379,10 @@ const AppState = struct {
         }
     }
 
-    /// 折叠较早的工具输出：只改发给模型的 history（content→stub），
-    /// 全文写回 DB 的 tool_full 列，UI/重启后仍可看到全文。
-    /// 返回折叠条数（0 = 未触发）。判定规则见 FoldScanner（回合保护/窗口/stub 边界），
-    /// 与 /context 的模拟共用同一实现，避免展示与实际不一致。
+    /// 折叠较早的工具输出（**仅面向 AI**）：只改发给模型的 history（content→stub），
+    /// DB 的 `content` 始终是全文（`folded` 列记录已折，重启后按此重建 stub）；
+    /// UI/导出始终用全文。返回折叠条数（0 = 未触发）。判定规则见 FoldScanner
+    /// （回合保护/窗口/stub 边界），与 /context 的模拟共用同一实现，避免展示与实际不一致。
     fn maybeFoldOldToolOutputs(self: *AppState) usize {
         const db = if (self.db) |*d| d else return 0;
         if (self.history.items.len == 0) return 0;
@@ -3391,7 +3403,7 @@ const AppState = struct {
         while (i > 0) {
             i -= 1;
             const m = self.history.items[i];
-            if (scan.feed(m.role, m.content, m.db_id != 0) == .stop) break;
+            if (scan.feed(m.role, m.content, m.db_id != 0, m.folded) == .stop) break;
         }
         if (!scan.result().triggered) return 0;
 
@@ -3403,7 +3415,7 @@ const AppState = struct {
         while (i > 0) {
             i -= 1;
             const m = &self.history.items[i];
-            switch (scan2.feed(m.role, m.content, m.db_id != 0)) {
+            switch (scan2.feed(m.role, m.content, m.db_id != 0, m.folded)) {
                 .stop => break,
                 .skip => {},
                 .candidate => {
@@ -3413,13 +3425,15 @@ const AppState = struct {
                         }
                         break :blk "tool";
                     };
+                    // 落库：只置 folded 标记（content 保持全文，供导出/UI）
+                    db.foldToolMessage(m.db_id) catch continue;
+                    // history 换成 stub（仅本进程发给模型的副本）
                     var stub_buf: [192]u8 = undefined;
                     const stub = std.fmt.bufPrint(&stub_buf, "{s}：{s} 输出 {d} 字符。如需内容请重新调用该工具]", .{
                         fold_marker,
                         tool_name,
                         m.content.len,
                     }) catch continue;
-                    db.foldToolMessage(m.db_id, stub, m.content) catch continue;
                     const new_content = self.allocator.dupe(u8, stub) catch continue;
                     saved += m.content.len;
                     self.allocator.free(@constCast(m.content));
@@ -4171,12 +4185,23 @@ fn cliOpenDb(allocator: Allocator, io: Io, opt: CliOptions) ?db_mod.Db {
     return db_mod.Db.openFile(allocator, io, path) catch |e| {
         if (e == error.SchemaVersionMismatch) {
             if (db_mod.probeVersionMismatch(allocator, io, path)) |mm| {
-                var buf: [256]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "数据库 schema 版本不符（库 v{d} ≠ 程序 v{d}）：已拒绝打开（不迁移、不删除；详见日志）\n", .{ mm.db_version, mm.program_version }) catch "数据库 schema 版本与程序不符：已拒绝打开（不迁移、不删除；详见日志）\n";
+                var buf: [320]u8 = undefined;
+                const msg = if (mm.db_version >= db_mod.Db.migration_min_version)
+                    std.fmt.bufPrint(&buf, "数据库 schema 版本可迁移（库 v{d} < 程序 v{d}）：请在交互终端中启动 TUI 以确认迁移（会先整库备份）\n", .{ mm.db_version, mm.program_version }) catch ""
+                else
+                    std.fmt.bufPrint(&buf, "数据库 schema 版本过旧（库 v{d}，最低支持 v{d}）：已拒绝打开（不迁移、不删除；详见日志）\n", .{ mm.db_version, db_mod.Db.migration_min_version }) catch "";
                 cliWriteStderr(io, msg);
             } else {
                 cliWriteStderr(io, "数据库 schema 版本与程序不符：已拒绝打开（不迁移、不删除；详见日志）\n");
             }
+        } else if (db_mod.Db.isMigrationError(e)) {
+            var buf: [512]u8 = undefined;
+            const backup = db_mod.Db.lastMigrateBackup();
+            const msg = if (backup.len > 0)
+                std.fmt.bufPrint(&buf, "数据库迁移失败（详见日志）；迁移前备份保留在 {s}，可手动恢复\n", .{backup}) catch "数据库迁移失败（详见日志）\n"
+            else
+                "数据库迁移失败（详见日志）\n";
+            cliWriteStderr(io, msg);
         }
         return null;
     };
@@ -4910,7 +4935,7 @@ fn cmdStats(allocator: Allocator, io: Io, opt: CliOptions) u8 {
     while (fi > 0) {
         fi -= 1;
         const r = active[fi];
-        if (fold_scan.feed(r.role, r.content, true) == .stop) break;
+        if (fold_scan.feed(r.role, r.content, true, r.folded != 0) == .stop) break;
     }
     const sim = fold_scan.result();
     for (active) |r| {
@@ -5716,7 +5741,32 @@ fn runVersionGate(allocator: Allocator, io: Io, backend: *tui.backend.NativeBack
     if (mm.db_version == mm.program_version) return .normal; // 版本一致：打开失败另有原因，维持原流程
 
     if (mm.dbIsOlder()) {
-        // 升级场景：询问"重命名并继续" / "退出"
+        // 可迁移（migration_min_version ≤ 库版本 < 当前）：提示将自动迁移 + 备份，确认后继续。
+        // 实际迁移在 openFile 里执行（备份名 `<base>.v{old}.bak.db`）。
+        if (mm.db_version >= db_mod.Db.migration_min_version) {
+            var lines3: [5][]const u8 = undefined;
+            lines3[0] = std.fmt.allocPrint(allocator, "当前数据库为旧版结构（schema v{d}，当前 v{d}）。请选择是否自动迁移：", .{ mm.db_version, mm.program_version }) catch "";
+            lines3[1] = std.fmt.allocPrint(allocator, "先整库备份（{s}.v{d}.bak.db），再逐级升级表结构；", .{ std.fs.path.basename(path), mm.db_version }) catch "";
+            lines3[2] = "备份文件会保留，可自行找回或删除。";
+            lines3[3] = "";
+            lines3[4] = "";
+            defer {
+                allocator.free(lines3[0]);
+                allocator.free(lines3[1]);
+            }
+            const buttons3 = [_]GateButton{
+                .{ .label = "[ 否：退出程序 ]", .choice = .quit },
+                .{ .label = "[ 是：备份并迁移 ]", .choice = .proceed },
+            };
+            const choice3 = runStartupGate(allocator, backend, false, " 检测到旧版本数据库 · 可自动迁移 ", &lines3, &buttons3) catch {
+                cliWriteStdout(io, "检测到旧版本数据库（可自动迁移）：请在交互终端中启动以便确认。\n");
+                return .quit_terminal_unavailable;
+            };
+            if (choice3 != .proceed) return .quit_cancelled;
+            return .normal; // 放行：openFile 会完成备份 + 迁移
+        }
+
+        // 过旧（< migration_min_version）：无迁移路径，询问"重命名并继续" / "退出"
         const backup_name = db_mod.pickLegacyBackupName(allocator, io, path) catch null;
         defer if (backup_name) |b| allocator.free(b);
         const backup: []const u8 = if (backup_name) |b| b else "skynet.old.db";
@@ -5907,6 +5957,15 @@ pub fn main(init: std.process.Init) !u8 {
     if (db_open_err) |e| {
         if (e == error.SchemaVersionMismatch) {
             state.addMessage("警告: 数据库 schema 版本与程序不符，已拒绝打开（不迁移、不删除；详见日志）。本次对话不会持久化", .{ .fg = .red });
+        } else if (db_mod.Db.isMigrationError(e)) {
+            // 迁移失败：告知备份位置（可手动恢复）与排查途径
+            var mb: [768]u8 = undefined;
+            const backup = db_mod.Db.lastMigrateBackup();
+            const m = if (backup.len > 0)
+                std.fmt.bufPrint(&mb, "错误: 数据库迁移失败，已中止（详见日志）。迁移前的备份保留在 {s}，可手动恢复；本次对话不会持久化。", .{backup}) catch "错误: 数据库迁移失败（详见日志）。本次对话不会持久化。"
+            else
+                "错误: 数据库迁移失败，已中止（详见日志）。本次对话不会持久化。";
+            state.addMessage(m, .{ .fg = .red });
         } else {
             state.addMessage("警告: 数据库打开失败，本次对话不会持久化", .{ .fg = .red });
         }
@@ -6223,9 +6282,9 @@ fn addLoadedToolCallNote(self: *AppState, arena: Allocator, name: []const u8, ar
 }
 
 /// 恢复一条工具结果：块类工具（bash/edit）重建工具块，其余回填统计或补错误行。
-/// 若该结果已被折叠（content=stub、tool_full=全文），展示仍用全文。
+/// 展示始终用 content（全文）。
 fn addLoadedToolDisplay(self: *AppState, arena: Allocator, name: []const u8, args: []const u8, line_idx: ?usize, row: db_mod.MessageRow) void {
-    const display_text: []const u8 = if (row.tool_full.len > 0) row.tool_full else row.content;
+    const display_text: []const u8 = row.content;
     if (name.len > 0) {
         if (toolBlockKind(name)) |kind| {
             const header = toolHeaderText(arena, name, args) orelse name;
@@ -6958,7 +7017,6 @@ fn persistTranscriptEntry(job: *StreamJob, db: *db_mod.Db, entry_idx: usize, his
         .tool_call_id = m.tool_call_id orelse "",
         .tool_name = t_name,
         .tool_display = t_display,
-        .tool_full = "",
         .is_error = t_error,
         .input_tokens = @intCast(entry.usage.input_tokens),
         .cached_tokens = @intCast(entry.usage.cached_tokens),
@@ -10680,17 +10738,17 @@ test "旧工具输出折叠：批量触发、全文保留、重启后请求体�
     // 再跑一次不重复折叠（已无可折叠候选）
     try std.testing.expectEqual(@as(usize, 0), live.maybeFoldOldToolOutputs());
 
-    // DB：全文进 tool_full，content 是 stub
+    // DB：content 始终是全文（折叠仅面向 AI），folded 标记记录已折
     const rows = try live.db.?.loadMessages(sid);
-    var full_rows: usize = 0;
+    var folded_rows: usize = 0;
     for (rows) |r| {
-        if (std.mem.eql(u8, r.role, "tool") and r.tool_full.len > 0) {
-            full_rows += 1;
-            try std.testing.expectEqual(@as(usize, 100_000), r.tool_full.len);
-            try std.testing.expect(std.mem.startsWith(u8, r.content, fold_marker));
+        if (std.mem.eql(u8, r.role, "tool") and r.folded != 0) {
+            folded_rows += 1;
+            try std.testing.expectEqual(@as(usize, 100_000), r.content.len);
+            try std.testing.expect(std.mem.startsWith(u8, r.content, fold_marker) == false);
         }
     }
-    try std.testing.expectEqual(@as(usize, 1), full_rows);
+    try std.testing.expectEqual(@as(usize, 1), folded_rows);
 
     // 重启：从 DB 重建的历史与实时历史生成的请求体逐字节一致（折叠后前缀仍稳定）
     var reloaded = AppState{};
@@ -10718,7 +10776,7 @@ test "旧工具输出折叠：批量触发、全文保留、重启后请求体�
     try std.testing.expect(std.mem.indexOf(u8, body_live, fold_marker) != null);
     try std.testing.expect(body_live.len < 250_000);
 
-    // 重启后的 UI：bash 块用 tool_full 重建（不是 stub）
+    // 重启后的 UI：bash 块用全文重建（不是 stub）
     var found_bash_block = false;
     for (reloaded.messages.items) |m| {
         if (m.tool_block == .shell) {
@@ -12739,7 +12797,7 @@ test "会话路由标识：按会话 id 确定性派生" {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 独立验证（不属于原实现作者）：针对 tool_full / 折叠策略的对抗性测试
+// 独立验证（不属于原实现作者）：针对 folded 标记 / 折叠策略的对抗性测试
 // ══════════════════════════════════════════════════════════════════════
 
 /// 按实时路径模拟“用户回合 + 助手发起单个工具调用 + 返回结果”的回合：
@@ -12862,20 +12920,20 @@ test "独立验证：折叠阈值边界与保护窗口（批量）" {
         }
         try std.testing.expectEqual(n, idx);
 
-        // 折叠过的行：DB.content = stub，DB.tool_full = 全文
+        // 折叠过的行：DB.content 仍是全文，folded = 1（折叠仅面向 AI）
         const rows = try st.db.?.loadMessages(sid);
         var db_folded: usize = 0;
         for (rows) |r| {
-            if (std.mem.eql(u8, r.role, "tool") and r.tool_full.len > 0) {
+            if (std.mem.eql(u8, r.role, "tool") and r.folded != 0) {
                 db_folded += 1;
-                try std.testing.expect(std.mem.startsWith(u8, r.content, fold_marker));
+                try std.testing.expect(std.mem.startsWith(u8, r.content, fold_marker) == false);
             }
         }
         try std.testing.expectEqual(sc.want_folded, db_folded);
     }
 }
 
-test "独立验证：tool_full 不被二次折叠覆盖，db_id 不进请求体" {
+test "独立验证：folded 标记幂等，content 始终全文，db_id 不进请求体" {
     var threaded: std.Io.Threaded = undefined;
     threaded = .init(std.testing.allocator, .{});
     const io = threaded.io();
@@ -12887,14 +12945,15 @@ test "独立验证：tool_full 不被二次折叠覆盖，db_id 不进请求体"
     const sid = try db.createSession("");
 
     const full = "原始工具全文\n第二行内容";
-    const id = try db.insertMessage(.{ .session_id = sid, .role = "tool", .content = full, .tool_call_id = "c1", .tool_name = "read" });
-    try db.foldToolMessage(id, "STUB-A", full);
-    // 再次折叠（不同内容）不得覆盖首次结果（WHERE tool_full = '' 守卫）
-    try db.foldToolMessage(id, "STUB-B", "被改写");
+    const id = try db.insertMessage(.{ .session_id = sid, .role = "tool", .content = full, .tool_call_id = "c1", .tool_name = "bash" });
+    try db.foldToolMessage(id);
+    // 再次折叠：幂等（WHERE folded = 0 守卫），不产生副作用
+    try db.foldToolMessage(id);
     const rows = try db.loadMessages(sid);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
-    try std.testing.expectEqualStrings("STUB-A", rows[0].content);
-    try std.testing.expectEqualStrings(full, rows[0].tool_full);
+    // 折叠仅面向 AI：content 仍是全文，只有 folded 标记变化
+    try std.testing.expectEqualStrings(full, rows[0].content);
+    try std.testing.expectEqual(@as(i64, 1), rows[0].folded);
 
     // db_id 仅为本地字段，不参与序列化
     const msgs = [_]ai.Message{.{ .role = "tool", .content = "x", .tool_call_id = "c1", .db_id = 987654321 }};
@@ -13015,7 +13074,7 @@ test "独立验证：重启后块工具用全文重建、大小统计按原文�
     try std.testing.expectEqualStrings(live_body, reload_body);
     try std.testing.expect(std.mem.indexOf(u8, live_body, fold_marker) != null);
 
-    // UI：块工具（bash）用 tool_full 全文重建，非块工具（read）大小统计按原文
+    // UI：块工具（bash）用全文重建，非块工具（read）大小统计按原文
     var bash_full_seen = false;
     var read_size_seen = false;
     for (reloaded.messages.items) |m| {

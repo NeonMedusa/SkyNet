@@ -57,7 +57,7 @@ pub const FoldSim = struct {
 /// 折叠扫描器：从新到旧逐条喂入，统一 /context 模拟与真实折叠的判定规则。
 /// 规则：
 /// 1. 最近 fold_protect_turns 个用户回合内的工具输出不折（位置保护）
-/// 2. 遇到已折叠 stub 即停（更早的内容早已处理过，无需继续扫描）
+/// 2. 遇到已折叠的（folded 标记）即停（更早的内容早已处理过，无需继续扫描）
 /// 3. 单条小于 fold_min_output_bytes 不折
 /// 4. 最近 fold_protect_bytes 字节（从新到旧累计）受保护，更早的才算候选
 pub const FoldScanner = struct {
@@ -69,7 +69,9 @@ pub const FoldScanner = struct {
     pub const Action = enum { skip, stop, candidate };
 
     /// persistable：工具结果是否已落库（未落库的不能折叠，否则重启后请求前缀不一致）
-    pub fn feed(self: *FoldScanner, role: []const u8, content: []const u8, persistable: bool) Action {
+    /// already_folded：DB 中该行已标记折叠（`message.folded`）——不依赖 content 判断
+    /// （折叠仅面向 AI，content 始终是全文）
+    pub fn feed(self: *FoldScanner, role: []const u8, content: []const u8, persistable: bool, already_folded: bool) Action {
         if (std.mem.eql(u8, role, "user")) {
             self.user_turns += 1;
             return .skip;
@@ -77,7 +79,7 @@ pub const FoldScanner = struct {
         if (!std.mem.eql(u8, role, "tool")) return .skip;
         if (content.len == 0) return .skip;
         if (self.user_turns < fold_protect_turns) return .skip;
-        if (std.mem.startsWith(u8, content, fold_marker)) return .stop;
+        if (already_folded) return .stop;
         if (content.len < fold_min_output_bytes) return .skip;
         if (!persistable) return .skip;
         if (self.protected_bytes < fold_protect_bytes) {
@@ -105,7 +107,7 @@ pub fn simulateFold(history_oldest_first: []const ai.Message) FoldSim {
     while (i > 0) {
         i -= 1;
         const m = history_oldest_first[i];
-        if (scanner.feed(m.role, m.content, m.db_id != 0) == .stop) break;
+        if (scanner.feed(m.role, m.content, m.db_id != 0, m.folded) == .stop) break;
     }
     return scanner.result();
 }
@@ -311,10 +313,10 @@ test "token 估算与折叠模拟" {
     try testing.expectEqual(@as(usize, 100_000), sim_big.foldable_bytes);
     try testing.expect(sim_big.triggered);
 
-    // 已折叠 stub 是扫描边界：更早的大输出不再计入（旧地址早已处理过）
+    // 已折叠（folded 标记）是扫描边界：更早的大输出不再计入（旧地址早已处理过）
     var stubs = [_]ai.Message{
         .{ .role = "tool", .content = "old" ** 100_000, .db_id = 9 },
-        .{ .role = "tool", .content = fold_marker ++ "x]", .db_id = 8 },
+        .{ .role = "tool", .content = "stub 文本", .db_id = 8, .folded = true },
         .{ .role = "user", .content = "u1" },
         .{ .role = "tool", .content = "a" ** 100_000, .db_id = 1 },
         .{ .role = "tool", .content = "b" ** 100_000, .db_id = 2 },

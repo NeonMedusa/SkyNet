@@ -18,7 +18,7 @@
 | 改 TUI 渲染/布局 | `src/main.zig`：`drawFrame`（总入口）、`drawMessages`、`drawInput` |
 | 改对话回合/工具循环 | `src/main.zig`：`streamWorker`（worker 主循环）、`pumpStream`（主线程消费） |
 | 改上下文压缩 | `src/main.zig`：`compactJobHistory`（中途）、`compactionExecute`（手动/CLI）；`src/context.zig` 纯计算 |
-| 改持久化/DB | `src/db.zig`（读写）、`src/db_query.zig`（查询脚手架） |
+| 改持久化/DB | `src/db.zig`（读写 + schema 迁移 `migrateIfNeeded`）、`src/db_query.zig`（查询脚手架） |
 | 改系统提示词/工具 schema 组装 | `src/main.zig`：`system_prompt`、`tool_schemas` |
 | 改 Markdown 渲染 | `src/markdown.zig`：`parse` → `md_mod.Line` 列表 → `drawRow` |
 | 改配置/提供商 | `src/config.zig`（config.json）、`src/main.zig` 的菜单渲染（`drawModelSelect` 等） |
@@ -75,8 +75,10 @@
 - **窗口化（长会话渲染性能）**：`updateMessageWindow`、`unloadMessage`、`reloadMessage`、
   `messageRowCountCached`（**改 `Message` 可变字段要同步缓存键**，见 AGENTS.md 契约）
 
-### 2.5 折叠（工具输出控制）
-`maybeFoldOldToolOutputs`；纯逻辑在 `context.zig` 的 `FoldScanner`；`tool_full` 列存原文。
+### 2.5 折叠（工具输出控制，仅面向 AI）
+`maybeFoldOldToolOutputs`；纯逻辑在 `context.zig` 的 `FoldScanner`。
+**DB 的 `content` 始终是全文**（导出/UI 用），`folded` 列记录已折；发给模型前换成
+stub（实时折叠在 `maybeFoldOldToolOutputs`，重启重建在 `applyLoadedMessagesWithCheckpoint`）。
 
 ### 2.6 渲染
 - **总入口**：`drawFrame`（每帧：消息区 → 输入框 → 状态栏 → 浮层 → toast）
@@ -142,6 +144,7 @@ loadSessionContent
 | 新增工具 | `tools.zig` 的 `tool_defs` + `toolBlockKind`（是否块渲染）+ 提示词里的工具说明 |
 | 改工具结果格式 | `summarizeToolResult`（统计行）、`addLoadedToolDisplay`（重启恢复）要同步 |
 | 改落库字段 | `db.zig` 的列定义 + `db_query` 映射 + `applyLoadedMessages*` + 窗口化重载 |
+| 改 schema（加列/表） | `schema_version` +1、在 `migrations` 表里加一步迁移函数、同步 `migration_min_version`（若放弃最旧版本支持）；旧库迁移走 `migrateIfNeeded`（自动备份 + 逐级升级） |
 | 新增模块 | 在 `main.zig` 末尾聚合块 `_ = @import("xxx.zig")` 登记 |
 | 改压缩显示/文案 | `formatCompactionNotice`（多处共用：手动收尾/间隙收尾/重启加载） |
 | 改 fork/子进程 | `clipboard.zig`、`tools.zig` 的 bash 临时目录与清理 |
