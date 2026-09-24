@@ -244,6 +244,9 @@ pi 已实现该场景（`session-cwd.ts`）——会话 cwd 不存在时：交�
 | `todo` 工具（跨压缩保留的任务清单） | opencode 有实现 | 需持久化（DB 表 + UI 展示），成本较高，宜单独设计 |
 | `webfetch` / `websearch` | 两家都有 | 当前靠 `bash` 调 firecrawl（环境特有），通用性差 |
 
+> **工具使用体验问题**（bug / 提示信息 / 诊断不完善 / 绕行记录）另见
+> [`docs/tool-issues.md`](tool-issues.md)——由 AI 在使用中随手记录，人类按需评估改进。
+
 **未来可讨论的点：跨 agent 工具字段兼容**
 
 背景：各 AI 编码 agent 的 edit 工具字段命名不同——pi 用驼峰 `oldText`/`newText`，
