@@ -29,9 +29,9 @@ pub const tool_defs = [_]ToolDef{
     },
     .{
         .name = "edit",
-        .description = "Edit a single file using exact text replacement. Provide one or more edits in edits[]: each old_text must match the file exactly (including whitespace) and be unique in the ORIGINAL file; entries must not overlap. Prefer one call with several entries over several edit calls. Use write to create new files or fully rewrite a file.",
+        .description = "Edit a single file using text replacement. Provide one or more edits in edits[]: each old_text must be unique in the ORIGINAL file and entries must not overlap. old_text is matched against the original file, not incrementally. Minor formatting differences (trailing/extra whitespace, indentation, backslash escaping) are tolerated automatically; the response notes when that happened. Still give enough context to be unambiguous, and extend old_text to the whole token/line you mean to change (a partial-token match that would split an identifier is refused). Prefer one call with several entries over several edit calls. Use write to create new files or fully rewrite a file.",
         .parameters =
-        \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","description":"One or more targeted replacements. Each old_text is matched against the original file, not incrementally; entries must be unique and must not overlap. Keep old_text as small as possible while still unique.","items":{"type":"object","properties":{"old_text":{"type":"string","description":"Exact text for this replacement (must be unique in the original file)"},"new_text":{"type":"string","description":"Replacement text for this entry"}},"required":["old_text","new_text"]}}},"required":["path","edits"]}
+        \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","description":"One or more targeted replacements. Each old_text is matched against the original file, not incrementally; entries must be unique and must not overlap. Keep old_text as small as possible while still unique, but cover the whole token/line you intend to change.","items":{"type":"object","properties":{"old_text":{"type":"string","description":"Text to replace (must be unique in the original file; minor whitespace/escaping differences are tolerated)"},"new_text":{"type":"string","description":"Replacement text for this entry"}},"required":["old_text","new_text"]}}},"required":["path","edits"]}
         ,
     },
     .{
@@ -412,12 +412,218 @@ fn normalizeForDiag(allocator: Allocator, text: []const u8) ?[]u8 {
     };
 }
 
-/// 匹配失败时给出诊断线索：尝试"忽略行尾空白"的归一化匹配，若能匹配则提示
-/// 差异可能是行尾空白；否则给出 old_string 首行在文件中的近似位置。
-/// 返回要追加到错误信息后的字符串（含前导空格）；无法诊断时返回空串。
-/// 内部分配失败时返回空串（诊断是尽力而为，不能影响主流程）。
+/// 诊断显示用的截断（按 UTF-8 边界，超长加 "..."）。失败返回空串。
+fn truncForDiag(allocator: Allocator, line: []const u8, max: usize) []const u8 {
+    if (line.len <= max) return allocator.dupe(u8, line) catch "";
+    var cut = max;
+    while (cut > 0 and (line[cut] & 0xC0) == 0x80) cut -= 1; // 不切断 UTF-8 序列
+    return std.fmt.allocPrint(allocator, "{s}...", .{line[0..cut]}) catch "";
+}
+
+/// 两行是否只有行首/行尾空白不同
+fn onlyWhitespaceDiff(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, std.mem.trim(u8, a, " \t\r"), std.mem.trim(u8, b, " \t\r"));
+}
+
+/// 把每个反斜杠连续段折叠成单个反斜杠（用于检测"转义层数"差异）
+fn collapseBackslashRuns(allocator: Allocator, line: []const u8) ?[]u8 {
+    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    defer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] == '\\') {
+            out.append(allocator, '\\') catch return null;
+            while (i < line.len and line[i] == '\\') i += 1;
+        } else {
+            out.append(allocator, line[i]) catch return null;
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator) catch null;
+}
+
+/// 最长公共前缀长度（诊断用）
+fn commonPrefixLen(a: []const u8, b: []const u8) usize {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < n and a[i] == b[i]) i += 1;
+    return i;
+}
+
+/// 组装"期望 vs 实际"提示（含空白/反斜杠差异加注）
+fn formatLineMismatch(
+    allocator: Allocator,
+    old_line: []const u8,
+    file_line: []const u8,
+    file_line_no: usize,
+    eof: bool,
+) []const u8 {
+    const o_show = truncForDiag(allocator, old_line, 60);
+    const d_show = truncForDiag(allocator, file_line, 60);
+    var note: []const u8 = "";
+    if (eof) {
+        note = " (file ends before this line)";
+    } else if (onlyWhitespaceDiff(old_line, file_line)) {
+        note = " (differs only in leading/trailing whitespace)";
+    } else if (collapseBackslashRuns(allocator, old_line)) |co| {
+        defer allocator.free(co);
+        if (collapseBackslashRuns(allocator, file_line)) |cd| {
+            defer allocator.free(cd);
+            if (std.mem.eql(u8, co, cd)) {
+                note = std.fmt.allocPrint(
+                    allocator,
+                    " (backslash count differs: {d} vs {d} - watch JSON / multiline-string escaping)",
+                    .{ std.mem.count(u8, old_line, "\\"), std.mem.count(u8, file_line, "\\") },
+                ) catch "";
+            }
+        }
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        " Hint: line {d} of the file does not match:\n" ++
+            "   old_text: \"{s}\"\n" ++
+            "   file:     \"{s}\"{s}",
+        .{ file_line_no, o_show, d_show, note },
+    ) catch "";
+}
+
+/// 从指定字节偏移取文件行的行号（1 起）
+fn lineNoAt(data: []const u8, at: usize) usize {
+    return std.mem.count(u8, data[0..@min(at, data.len)], "\n") + 1;
+}
+
+/// 两行的相似度（公共前缀 + 公共后缀，扣除重叠部分）——用于单行近似行定位
+fn lineSimilarity(a: []const u8, b: []const u8) usize {
+    const prefix = commonPrefixLen(a, b);
+    if (prefix >= a.len or prefix >= b.len) return prefix;
+    const ar = a[prefix..];
+    const br = b[prefix..];
+    const n = @min(ar.len, br.len);
+    var suffix: usize = 0;
+    while (suffix < n and ar[ar.len - 1 - suffix] == br[br.len - 1 - suffix]) suffix += 1;
+    return prefix + suffix;
+}
+
+/// 统计从锚点之后、old 与 data 逐行完全相同的行数（用于多锚点择优）
+fn countFollowingLineMatches(data: []const u8, old: []const u8, at: usize, old_first_nl: usize) usize {
+    var oi: usize = old_first_nl + 1;
+    var di: usize = blk: {
+        const eol = std.mem.indexOfScalarPos(u8, data, at, '\n') orelse break :blk data.len;
+        break :blk eol + 1;
+    };
+    var matched: usize = 0;
+    while (oi < old.len and di < data.len) {
+        const o_end = std.mem.indexOfScalarPos(u8, old, oi, '\n') orelse old.len;
+        const d_end = std.mem.indexOfScalarPos(u8, data, di, '\n') orelse data.len;
+        const o_line = std.mem.trimEnd(u8, old[oi..o_end], "\r");
+        const d_line = std.mem.trimEnd(u8, data[di..d_end], "\r");
+        if (!std.mem.eql(u8, o_line, d_line)) break;
+        matched += 1;
+        if (o_end >= old.len or d_end >= data.len) break;
+        oi = o_end + 1;
+        di = d_end + 1;
+    }
+    return matched;
+}
+
+/// 匹配失败时的行级诊断，两种模式：
+/// A) 多行 old_text：以首行为锚点，从锚点后逐行比对，定位**第一个不一致的行**；
+/// B) 单行 old_text：在文件各行的**最长公共前缀**里找最相近的一行（≥ 8 字节或
+///    超过 old 的一半），展示"期望 vs 实际"——覆盖"转义层数/内部字符写错"这类
+///    精确匹配失败（这是最常见的失败形态：反斜杠数量记错）。
+/// 两类典型差异会加注：仅空白差异 → whitespace；仅反斜杠段数不同 → backslash count。
+/// 锚点/近似行都找不到时返回空串（调用方回落到更粗的诊断）。
+fn diagnoseLineMismatch(allocator: Allocator, data: []const u8, old: []const u8) []const u8 {
+    const old_first_nl = std.mem.indexOfScalar(u8, old, '\n');
+    const old_first_raw = if (old_first_nl) |n| old[0..n] else old;
+    const old_first = std.mem.trimEnd(u8, old_first_raw, " \t\r");
+    if (old_first.len < 4 or old_first.len > 400) return "";
+
+    if (old_first_nl == null) {
+        // B) 单行：找"最相近"的文件行（前缀 + 后缀匹配长度最大），覆盖
+        //    "转义层数/内部字符写错"这类精确匹配失败。
+        //    判据：相似度（前缀+后缀）至少覆盖 old 的一半，且至少 4 字节。
+        var best_at: ?usize = null;
+        var best_score: usize = 0;
+        var li: usize = 0;
+        while (li < data.len) {
+            const le = std.mem.indexOfScalarPos(u8, data, li, '\n') orelse data.len;
+            const line = std.mem.trimEnd(u8, data[li..le], "\r");
+            const score = lineSimilarity(old_first, line);
+            if (score > best_score) {
+                best_score = score;
+                best_at = li;
+            }
+            if (le >= data.len) break;
+            li = le + 1;
+        }
+        if (best_at) |at| {
+            const le = std.mem.indexOfScalarPos(u8, data, at, '\n') orelse data.len;
+            const line = std.mem.trimEnd(u8, data[at..le], "\r");
+            const min_score = @max(@as(usize, 4), old_first.len / 2);
+            // 完全相等说明匹配得上的行存在（问题在别处），不在此诊断
+            if (best_score >= min_score and !std.mem.eql(u8, old_first, line)) {
+                return formatLineMismatch(allocator, old_first, line, lineNoAt(data, at), false);
+            }
+        }
+        return "";
+    }
+
+    // A) 多行：首行为锚点。同一首行可能在文件中出现多次 → 逐个试，
+    //    选“后续行匹配数最多”的那次（更可能是用户想改的那处）。
+    var best_at: ?usize = null;
+    var best_matched: usize = 0;
+    var search_from: usize = 0;
+    while (std.mem.indexOf(u8, data[search_from..], old_first)) |rel| {
+        const at = search_from + rel;
+        const matched = countFollowingLineMatches(data, old, at, old_first_nl.?);
+        if (best_at == null or matched > best_matched) {
+            best_at = at;
+            best_matched = matched;
+        }
+        if (matched == std.mem.count(u8, old, "\n")) break; // 全匹配：不可能更好
+        search_from = at + 1;
+        if (search_from >= data.len) break;
+    }
+    const at = best_at orelse return "";
+    const anchor_line_no = lineNoAt(data, at);
+
+    var oi: usize = old_first_nl.? + 1;
+    var di: usize = blk: {
+        const eol = std.mem.indexOfScalarPos(u8, data, at, '\n') orelse break :blk data.len;
+        break :blk eol + 1;
+    };
+    var old_line_no: usize = 1;
+    var file_line_no: usize = anchor_line_no;
+    var hint: []const u8 = "";
+    while (oi < old.len) {
+        old_line_no += 1;
+        file_line_no += 1;
+        const o_end = std.mem.indexOfScalarPos(u8, old, oi, '\n') orelse old.len;
+        const eof = di >= data.len;
+        const d_end = if (!eof)
+            (std.mem.indexOfScalarPos(u8, data, di, '\n') orelse data.len)
+        else
+            data.len;
+        const o_line = std.mem.trimEnd(u8, old[oi..o_end], "\r");
+        const d_line = if (!eof) std.mem.trimEnd(u8, data[di..d_end], "\r") else "";
+        if (!std.mem.eql(u8, o_line, d_line)) {
+            hint = std.fmt.allocPrint(
+                allocator,
+                "{s}\n   (multi-line old_text: line {d} of it)",
+                .{ formatLineMismatch(allocator, o_line, d_line, file_line_no, eof), old_line_no },
+            ) catch "";
+            return hint;
+        }
+        if (o_end >= old.len) break;
+        oi = o_end + 1;
+        di = if (eof) data.len + 1 else d_end + 1;
+    }
+    return "";
+}
+
 fn diagnoseEditMiss(allocator: Allocator, data: []const u8, old: []const u8) []const u8 {
-    // 1) 归一化（去行尾空白）后能否匹配？→ 提示行尾空白差异
+    // 1) 归一化（去行尾空白）后能否匹配？→ 提示行尾空白差异（最直白，优先）
     if (normalizeForDiag(allocator, data)) |nd| {
         defer allocator.free(nd);
         if (normalizeForDiag(allocator, old)) |no| {
@@ -432,7 +638,11 @@ fn diagnoseEditMiss(allocator: Allocator, data: []const u8, old: []const u8) []c
         }
     }
 
-    // 2) old_string 首行（trim 后）在文件中的位置 → 提示近似位置
+    // 2) 多行：逐行比对，定位第一个不一致的行（比"首行位置"具体得多）
+    const line_hint = diagnoseLineMismatch(allocator, data, old);
+    if (line_hint.len > 0) return line_hint;
+
+    // 3) old_string 首行（trim 后）在文件中的位置 → 提示近似位置
     const first_nl = std.mem.indexOfScalar(u8, old, '\n');
     const first_raw = if (first_nl) |n| old[0..n] else old;
     const first = std.mem.trim(u8, first_raw, " \t\r");
@@ -549,6 +759,208 @@ fn toolEdit(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8
     return toolEditMulti(allocator, io, abs, args.path, data, args.edits);
 }
 
+/// 容错匹配结果：命中的原始区间 + 生效的放宽级别
+const LooseMatch = struct {
+    start: usize,
+    len: usize,
+    /// 0=精确 1=行尾空白 2=空白归一 3=缩进弹性 4=转义归一
+    level: u8,
+};
+
+/// 放宽级别名（成功消息短标记用；0=精确不显示）
+fn looseLevelName(level: u8) []const u8 {
+    return switch (level) {
+        1 => "trailing-whitespace",
+        2 => "whitespace-insensitive",
+        3 => "indentation-flexible",
+        4 => "escape-normalized",
+        else => "",
+    };
+}
+
+/// 归一化级别（各变换都**保持 '\n' 不变**，只改行内/连续字符）
+const LooseKind = enum { tail_ws, inner_ws, escape, indent };
+
+/// 归一化并记录偏移映射：norm[i] 的源字节在原始文本中的偏移（map 长 = norm.len + 1）。
+/// 被丢弃的字节（如行尾空白）不占输出；被折叠的连续段共享首字节偏移。
+/// 返回 null = 分配失败。
+const NormMapped = struct { norm: []u8, map: []usize };
+fn normalizeWithMap(allocator: Allocator, text: []const u8, kind: LooseKind) ?NormMapped {
+    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    defer out.deinit(allocator);
+    var map = std.ArrayListUnmanaged(usize){ .items = &.{}, .capacity = 0 };
+    defer map.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        switch (kind) {
+            .tail_ws => {
+                if (c == '\n') {
+                    // 行尾：跳过本行末尾的空白
+                    while (out.items.len > 0 and (out.items[out.items.len - 1] == ' ' or out.items[out.items.len - 1] == '\t' or out.items[out.items.len - 1] == '\r')) {
+                        _ = out.pop();
+                        _ = map.pop();
+                    }
+                    out.append(allocator, '\n') catch return null;
+                    map.append(allocator, i) catch return null;
+                    i += 1;
+                } else {
+                    out.append(allocator, c) catch return null;
+                    map.append(allocator, i) catch return null;
+                    i += 1;
+                }
+            },
+            .inner_ws => {
+                if (c == ' ' or c == '\t') {
+                    out.append(allocator, ' ') catch return null;
+                    map.append(allocator, i) catch return null;
+                    while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+                } else {
+                    out.append(allocator, c) catch return null;
+                    map.append(allocator, i) catch return null;
+                    i += 1;
+                }
+            },
+            .escape => {
+                if (c == '\\') {
+                    out.append(allocator, '\\') catch return null;
+                    map.append(allocator, i) catch return null;
+                    while (i < text.len and text[i] == '\\') i += 1;
+                } else {
+                    out.append(allocator, c) catch return null;
+                    map.append(allocator, i) catch return null;
+                    i += 1;
+                }
+            },
+            .indent => {
+                // 文本开头（i == 0）与每个 '\n' 之后都是"行首"：跳过行首空白
+                if (i == 0 or text[i - 1] == '\n') {
+                    while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+                }
+                if (i >= text.len) break;
+                out.append(allocator, text[i]) catch return null;
+                map.append(allocator, i) catch return null;
+                i += 1;
+            },
+        }
+    }
+    map.append(allocator, text.len) catch return null; // 末尾哨兵
+    return .{
+        .norm = out.toOwnedSlice(allocator) catch return null,
+        .map = map.toOwnedSlice(allocator) catch return null,
+    };
+}
+
+/// 行锚定校验：匹配区间 [s0, s1) 的两侧到行边界之间**只能有空白**。
+/// 放宽匹配的危险形态是"行中间的部分子串命中"——例如文件行 `\\ TABLE x (`
+/// （两个反斜杠）与 old `\ TABLE x (`（一个反斜杠）能匹配后半段，
+/// 但替换区间从第二个反斜杠开始，残留的第一个反斜杠会与新文本拼接成垃圾。
+/// 正常意图（整行/行首对齐的内容）两侧到行边界都是空白或直接是边界。
+fn lineAnchored(data: []const u8, s0: usize, s1: usize) bool {
+    // 起点向左到行首：途中字节必须全是空白
+    var i: usize = s0;
+    while (i > 0 and data[i - 1] != '\n') {
+        i -= 1;
+        if (data[i] != ' ' and data[i] != '\t' and data[i] != '\r') return false;
+    }
+    // 终点向右到行尾：途中字节必须全是空白
+    var j: usize = s1;
+    while (j < data.len and data[j] != '\n') {
+        if (data[j] != ' ' and data[j] != '\t' and data[j] != '\r') return false;
+        j += 1;
+    }
+    return true;
+}
+
+/// 单级宽松匹配：归一化双方 → 唯一命中 → 用偏移映射反推原始区间。
+/// 返回 null = 本级别不适用（不命中/多处命中/映射退化）。
+fn matchAtLevel(allocator: Allocator, data: []const u8, old: []const u8, kind: LooseKind) ?struct { start: usize, len: usize } {
+    const nd = normalizeWithMap(allocator, data, kind) orelse return null;
+    defer allocator.free(nd.norm);
+    defer allocator.free(nd.map);
+    const no = normalizeWithMap(allocator, old, kind) orelse return null;
+    defer allocator.free(no.norm);
+    defer allocator.free(no.map);
+    if (no.norm.len == 0) return null;
+
+    const at = std.mem.indexOf(u8, nd.norm, no.norm) orelse {
+        return null;
+    };
+    if (std.mem.indexOfPos(u8, nd.norm, at + 1, no.norm) != null) {
+        return null;
+    }
+
+    const s0 = nd.map[at];
+    const s1 = nd.map[at + no.norm.len];
+    if (s1 <= s0) {
+        return null;
+    }
+    // 校验：映射出的原始区间重新归一化后应等于 no.norm（防映射退化/跨界）
+    const check = normalizeWithMap(allocator, data[s0..s1], kind) orelse return null;
+    defer allocator.free(check.norm);
+    defer allocator.free(check.map);
+    if (!std.mem.eql(u8, check.norm, no.norm)) {
+        return null;
+    }
+    // 行锚定：拒绝"行中间的部分子串命中"（见 lineAnchored 注释）
+    if (!lineAnchored(data, s0, s1)) return null;
+    return .{ .start = s0, .len = s1 - s0 };
+}
+
+/// 在 data 中查找 old 的宽松匹配：精确优先，失败则逐级放宽（每级要求唯一命中）。
+/// 返回 null 表示所有级别都失败（调用方走诊断报错）。
+fn looseFind(allocator: Allocator, data: []const u8, old: []const u8) ?LooseMatch {
+    // 精确
+    if (std.mem.indexOf(u8, data, old)) |at| {
+        if (std.mem.indexOfPos(u8, data, at + 1, old) == null) {
+            return .{ .start = at, .len = old.len, .level = 0 };
+        }
+        return null; // 精确但多处：交给调用方报"不唯一"（语义更清晰）
+    }
+    // 顺序从严到宽（对齐 opencode）：行尾空白 → 内部空白 → 行首缩进 → 反斜杠转义。
+    // escape 最激进（把 \\ 与 \ 视为等价），放最后。
+    const kinds = [_]LooseKind{ .tail_ws, .inner_ws, .indent, .escape };
+    const levels = [_]u8{ 1, 2, 3, 4 };
+    for (kinds, levels) |k, lv| {
+        if (matchAtLevel(allocator, data, old, k)) |m| {
+            return .{ .start = m.start, .len = m.len, .level = lv };
+        }
+    }
+    return null;
+}
+
+/// 是否为标识符字符（用于"替换边界切开标识符"警告）
+fn isIdentChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// 替换边界是否切开标识符：匹配区间紧邻的字符与替换文本拼接后"粘连"。
+/// 例：文件 "id INTEGER"，old "id INT"（子串命中），new "id BIG" →
+/// 尾部残留 "EGER" 会与新文本末字符粘成新标识符 → 警告。
+fn boundarySplitsIdentifier(data: []const u8, start: usize, old_len: usize, new_text: []const u8) bool {
+    const end = start + old_len;
+    if (old_len == 0) return false;
+    // 尾部粘连
+    const old_tail_ident = isIdentChar(data[end - 1]);
+    const after_ident = end < data.len and isIdentChar(data[end]);
+    const new_tail_ident = new_text.len > 0 and isIdentChar(new_text[new_text.len - 1]);
+    if (old_tail_ident and after_ident and new_tail_ident) return true;
+    // 头部粘连
+    const before_ident = start > 0 and isIdentChar(data[start - 1]);
+    const old_head_ident = isIdentChar(data[start]);
+    const new_head_ident = new_text.len > 0 and isIdentChar(new_text[0]);
+    if (before_ident and old_head_ident and new_head_ident) return true;
+    return false;
+}
+
+/// 过大匹配拒绝（opencode isDisproportionateMatch 的简化版）：
+/// 匹配区间远大于 old_text 时拒绝，避免"锚到一大段无关内容"。
+fn isDisproportionate(search_len: usize, old_len: usize) bool {
+    if (old_len == 0) return false;
+    return search_len >= old_len * 4 and search_len >= old_len + 500;
+}
+
 /// 多处编辑（edits[]）：每个 old_text 匹配**原始文件**，互不重叠，一次写回。
 /// 语义（仿 pi）：全部匹配成功才应用（全有或全无）；任一不匹配/不唯一/重叠即报错。
 fn toolEditMulti(
@@ -576,6 +988,10 @@ fn toolEditMulti(
         converted.deinit(allocator);
     }
 
+    // 放宽级别使用记录（成功消息里给一行短标记；0 = 精确，不显示）
+    var loose_levels = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    defer loose_levels.deinit(allocator);
+
     for (edits, 0..) |item, i| {
         if (item.old_text.len == 0) {
             return fail(allocator, "edits[{d}].old_text must not be empty.", .{i});
@@ -597,16 +1013,38 @@ fn toolEditMulti(
                 }
             }
         }
-        if (occurrences == 0) {
-            // 诊断线索（arena 分配，随本次调用结束释放）
-            const hint = diagnoseEditMiss(diag_arena.allocator(), data, item.old_text);
-            return fail(allocator, "edits[{d}]: could not find the exact text in {s}. It must match exactly including whitespace and newlines.{s}", .{ i, path, hint });
+
+        if (occurrences == 1) {
+            // 精确命中（唯一）：仍要过"边界切开标识符"检查——
+            // 子串语义下 "value INT" 能命中 "value INTEGER"，会把残留粘成新标识符。
+            const at = std.mem.indexOf(u8, data, old_text).?;
+            if (boundarySplitsIdentifier(data, at, old_text.len, new_text)) {
+                return fail(allocator, "edits[{d}]: refusing replacement: the boundary splits an identifier in {s} (the text right after the match would merge with new_text). Extend old_text to cover the whole token/line you meant to change.", .{ i, path });
+            }
+            try applied.append(allocator, .{ .start = at, .old_len = old_text.len, .new_text = new_text, .idx = i });
+            try loose_levels.append(allocator, 0);
+            continue;
         }
         if (occurrences > 1) {
             return fail(allocator, "edits[{d}]: found {d} occurrences of the text in {s}. It must be unique — add surrounding context.", .{ i, occurrences, path });
         }
-        const at = std.mem.indexOf(u8, data, old_text).?;
-        try applied.append(allocator, .{ .start = at, .old_len = old_text.len, .new_text = new_text, .idx = i });
+
+        // 精确失败 → 分级放宽（每级要求唯一命中）
+        if (looseFind(diag_arena.allocator(), data, item.old_text)) |m| {
+            if (isDisproportionate(m.len, item.old_text.len)) {
+                return fail(allocator, "edits[{d}]: refusing replacement: the matched span ({d} bytes) is much larger than old_text ({d} bytes). Re-read the file and give the exact text you intend to replace.", .{ i, m.len, item.old_text.len });
+            }
+            if (boundarySplitsIdentifier(data, m.start, m.len, new_text)) {
+                return fail(allocator, "edits[{d}]: refusing replacement: the boundary splits an identifier in {s} (the text right after the match would merge with new_text). Check that old_text covers the whole token/line you meant to change.", .{ i, path });
+            }
+            try applied.append(allocator, .{ .start = m.start, .old_len = m.len, .new_text = new_text, .idx = i });
+            try loose_levels.append(allocator, m.level);
+            continue;
+        }
+
+        // 全部失败：诊断线索（arena 分配，随本次调用结束释放）
+        const hint = diagnoseEditMiss(diag_arena.allocator(), data, item.old_text);
+        return fail(allocator, "edits[{d}]: could not find the exact text in {s}. It must match exactly including whitespace and newlines.{s}", .{ i, path, hint });
     }
 
     // 重叠检查：按起点排序后，前一个的区间不得越过当前的起点
@@ -642,8 +1080,37 @@ fn toolEditMulti(
         return fail(allocator, "Could not write file {s}: {s}", .{ path, @errorName(err) });
     };
     const display = buildEditDiff(allocator, data, out.items) catch null;
+    // 放宽标记：仅当有编辑走了非精确匹配时附一行短标记（正常路径零额外输出）。
+    // 同一级别多次出现时合并为 "name×N"，避免重复占 token。
+    var loose_note = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    defer loose_note.deinit(allocator);
+    {
+        // 统计各放宽级别出现次数（下标 = 级别；0 精确不记）
+        var counts = [_]usize{0} ** 5;
+        for (loose_levels.items) |lv| {
+            if (lv > 0 and lv < counts.len) counts[lv] += 1;
+        }
+        for (counts, 0..) |n, lv| {
+            if (n == 0) continue;
+            const name = looseLevelName(@intCast(lv));
+            if (name.len == 0) continue;
+            if (loose_note.items.len == 0) {
+                try loose_note.appendSlice(allocator, " (matched loosely: ");
+            } else {
+                try loose_note.appendSlice(allocator, ", ");
+            }
+            if (n > 1) {
+                const part = try std.fmt.allocPrint(allocator, "{s}x{d}", .{ name, n });
+                defer allocator.free(part);
+                try loose_note.appendSlice(allocator, part);
+            } else {
+                try loose_note.appendSlice(allocator, name);
+            }
+        }
+        if (loose_note.items.len > 0) try loose_note.appendSlice(allocator, ")");
+    }
     return .{
-        .content = try std.fmt.allocPrint(allocator, "Successfully applied {d} edit{s} in {s}.", .{ edits.len, if (edits.len == 1) "" else "s", path }),
+        .content = try std.fmt.allocPrint(allocator, "Successfully applied {d} edit{s} in {s}.{s}", .{ edits.len, if (edits.len == 1) "" else "s", path, loose_note.items }),
         .is_error = false,
         .display = display,
     };
@@ -1994,7 +2461,7 @@ test "tools: edit 生成行号 diff 展示" {
     }
 }
 
-test "tools: edit 匹配失败时给出诊断线索" {
+test "tools: edit 宽松匹配（放宽链）与失败诊断" {
     var threaded: std.Io.Threaded = undefined;
     const io = testIo(&threaded);
     defer threaded.deinit();
@@ -2014,25 +2481,122 @@ test "tools: edit 匹配失败时给出诊断线索" {
         defer if (r.display) |d| testing.allocator.free(d);
         try testing.expect(!r.is_error);
     }
+
+    // ── 放宽链：这些以前全部失败，现在应自动匹配成功并带短标记 ──
+
     {
-        // 行尾空白差异：文件 "beta   \ngamma"，old "beta\ngamma" → 精确失败、归一化可匹配
+        // 行尾空白差异（级别 1 trailing-whitespace）：文件 "beta   "，old "beta"
         const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/a.txt\",\"edits\":[{\"old_text\":\"beta\\ngamma\",\"new_text\":\"B\\nG\"}]}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
-        try testing.expect(r.is_error);
-        try testing.expect(std.mem.indexOf(u8, r.content, "trailing whitespace") != null);
+        try testing.expect(!r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "trailing-whitespace") != null);
     }
     {
-        // 近似位置：首行存在但整体不匹配
-        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/a.txt\",\"edits\":[{\"old_text\":\"gamma\\nDELTA_NOT_PRESENT\",\"new_text\":\"x\"}]}");
+        // 行首缩进差异（级别 4 indentation-flexible）：独立文件，文件行 "gamma"，old 行 "  gamma"
+        {
+            const w = try execute(testing.allocator, io, cwd, "write", "{\"path\":\"skynet_test_edit_diag/e.txt\",\"content\":\"alpha\\ngamma\\n\"}");
+            defer testing.allocator.free(w.content);
+            defer if (w.display) |d| testing.allocator.free(d);
+            try testing.expect(!w.is_error);
+        }
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/e.txt\",\"edits\":[{\"old_text\":\"  gamma\",\"new_text\":\"GAMMA\"}]}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "indentation-flexible") != null);
+    }
+    {
+        // 转义层数差异（级别 3 escape-normalized）：文件 2 个反斜杠，old 写 1 个
+        {
+            const w = try execute(testing.allocator, io, cwd, "write", "{\"path\":\"skynet_test_edit_diag/b.txt\",\"content\":\"row1\\\\\\\\row2\"}");
+            defer testing.allocator.free(w.content);
+            defer if (w.display) |d| testing.allocator.free(d);
+            try testing.expect(!w.is_error);
+        }
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/b.txt\",\"edits\":[{\"old_text\":\"row1\\\\row2\",\"new_text\":\"row1\\\\ROW2\"}]}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "escape-normalized") != null);
+    }
+    {
+        // 内部多空格（级别 2 whitespace-insensitive）：文件 "a  b"，old "a b"
+        {
+            const w = try execute(testing.allocator, io, cwd, "write", "{\"path\":\"skynet_test_edit_diag/c.txt\",\"content\":\"x  y\"}");
+            defer testing.allocator.free(w.content);
+            defer if (w.display) |d| testing.allocator.free(d);
+        }
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/c.txt\",\"edits\":[{\"old_text\":\"x y\",\"new_text\":\"X Y\"}]}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "whitespace-insensitive") != null);
+    }
+
+    {
+        // 同一调用里两条编辑都走同一放宽级别 → 标记合并为 "namex2"（不重复占 token）
+        {
+            const w = try execute(testing.allocator, io, cwd, "write", "{\"path\":\"skynet_test_edit_diag/g.txt\",\"content\":\"p  q\\nr  s\\n\"}");
+            defer testing.allocator.free(w.content);
+            defer if (w.display) |d| testing.allocator.free(d);
+            try testing.expect(!w.is_error);
+        }
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/g.txt\",\"edits\":[{\"old_text\":\"p q\",\"new_text\":\"P Q\"},{\"old_text\":\"r s\",\"new_text\":\"R S\"}]}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(!r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "whitespace-insensitivex2") != null);
+    }
+
+    // ── lineAnchored 纯函数单测（放宽匹配的行对齐保护） ──
+    {
+        const d1 = "    keep   indented();\n";
+        // 命中 "indented();"（起点前有 "keep   " 非空白）→ 拒绝
+        const s0 = std.mem.indexOf(u8, d1, "indented();").?;
+        try testing.expect(!lineAnchored(d1, s0, s0 + "indented();".len));
+        // 命中整行（两侧到边界只有空白）→ 通过
+        try testing.expect(lineAnchored(d1, 0, d1.len - 1));
+        // 命中行首缩进后的内容（起点前只有空白）→ 通过（"child();" 是 8 字符：8..16）
+        try testing.expect(lineAnchored("        child();\n", 8, 16));
+        // 行尾残留非空白 → 拒绝
+        try testing.expect(!lineAnchored("abc TABLE x (", 0, 3));
+        // 行中间到行尾（终点后无内容）→ 起点前非空白 → 拒绝
+        try testing.expect(!lineAnchored("keep   indented();", 7, 18));
+    }
+
+    // ── 边界保护：标识符被切开 → 拒绝（不静默改坏） ──
+    {
+        {
+            const w = try execute(testing.allocator, io, cwd, "write", "{\"path\":\"skynet_test_edit_diag/d.txt\",\"content\":\"value INTEGER\"}");
+            defer testing.allocator.free(w.content);
+            defer if (w.display) |d| testing.allocator.free(d);
+        }
+        // old "value INT"（子串命中，尾部残留 "EGER" 会与新文本粘连）
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/d.txt\",\"edits\":[{\"old_text\":\"value INT\",\"new_text\":\"value BIG\"}]}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
         try testing.expect(r.is_error);
-        try testing.expect(std.mem.indexOf(u8, r.content, "appears at line 3") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "splits an identifier") != null);
+    }
+
+    // ── 真失败：所有级别都不适用时，仍给逐行诊断 ──
+    {
+        // 首行存在（alpha）但后续行差异大且无法靠放宽链对齐 → 诊断（独立文件）
+        {
+            const w = try execute(testing.allocator, io, cwd, "write", "{\"path\":\"skynet_test_edit_diag/f.txt\",\"content\":\"alpha\\nbeta\\ngamma\\n\"}");
+            defer testing.allocator.free(w.content);
+            defer if (w.display) |d| testing.allocator.free(d);
+        }
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/f.txt\",\"edits\":[{\"old_text\":\"alpha\\nZZZ_NOT_THERE\\nQQQ\",\"new_text\":\"x\"}]}");
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(r.is_error);
+        try testing.expect(std.mem.indexOf(u8, r.content, "does not match") != null);
     }
     {
-        // 完全无关：无 Hint（且不应崩）
-        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/a.txt\",\"edits\":[{\"old_text\":\"ZZZ_NOT_IN_FILE_AT_ALL\",\"new_text\":\"x\"}]}");
+        // 完全无关：无 Hint，不崩
+        const r = try execute(testing.allocator, io, cwd, "edit", "{\"path\":\"skynet_test_edit_diag/f.txt\",\"edits\":[{\"old_text\":\"ZZZ_NOT_IN_FILE_AT_ALL\",\"new_text\":\"x\"}]}");
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
         try testing.expect(r.is_error);
