@@ -38,8 +38,7 @@ const system_prompt =
     "Guidelines:\n" ++
     "- Use the read tool to examine files instead of cat or sed.\n" ++
     "- Use write only for new files or complete rewrites; use edit for targeted changes.\n" ++
-    "- old_string in edit must match the file exactly and be unique unless replace_all is true.\n" ++
-    "- Use grep/find/ls to explore the codebase before making changes.\n" ++
+    "- Use grep to search file contents, find to locate files by name, and ls to list directories.\n" ++
     "- Prefer non-interactive shell commands; avoid commands that wait for input.\n" ++
     "- Be concise in your responses; show file paths clearly when working with files.";
 

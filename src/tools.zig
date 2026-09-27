@@ -43,7 +43,7 @@ pub const tool_defs = [_]ToolDef{
     },
     .{
         .name = "grep",
-        .description = "Search file contents for a pattern (regular expression by default; literal string when literal=true). Returns matching lines as path:line: text. Output is capped at limit matches (default 100) and 50KB.",
+        .description = "Search file contents for a pattern (regular expression by default; literal string when literal=true). Output is capped at limit matches (default 100) and 50KB.",
         .parameters =
         \\{"type":"object","properties":{"pattern":{"type":"string","description":"Search pattern (regular expression)"},"path":{"type":"string","description":"File or directory to search (default: current directory)"},"glob":{"type":"string","description":"Filter files by glob pattern, e.g. '*.zig' or 'src/**/*.zig'"},"context":{"type":"integer","description":"Number of context lines before/after each match (default 0)"},"limit":{"type":"integer","description":"Maximum number of matches (default 100)"},"ignore_case":{"type":"boolean","description":"Case-insensitive matching (default false)"},"literal":{"type":"boolean","description":"Treat pattern as a literal string instead of a regular expression"}},"required":["pattern"]}
         ,
@@ -77,7 +77,10 @@ const cap_lines = 2000;
 const cap_bytes = 50 * 1024;
 const max_read_bytes = 16 * 1024 * 1024;
 const max_grep_file_bytes = 2 * 1024 * 1024;
-const max_line_len = 500;
+/// grep 输出的单行长度上限（AI 视角：够"判断这行是不是我要找的"即可；
+/// 需要完整行时用 read——工具分工：grep 定位、read 阅读）。
+/// 与 summarizeToolArgs 的截断值保持一致。
+const max_line_len = 120;
 
 fn ok(allocator: Allocator, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!Result {
     return .{ .content = try std.fmt.allocPrint(allocator, fmt, args), .is_error = false };
@@ -642,7 +645,7 @@ fn diagnoseEditMiss(allocator: Allocator, data: []const u8, old: []const u8) []c
     const line_hint = diagnoseLineMismatch(allocator, data, old);
     if (line_hint.len > 0) return line_hint;
 
-    // 3) old_string 首行（trim 后）在文件中的位置 → 提示近似位置
+    // 3) old_text 首行（trim 后）在文件中的位置 → 提示近似位置
     const first_nl = std.mem.indexOfScalar(u8, old, '\n');
     const first_raw = if (first_nl) |n| old[0..n] else old;
     const first = std.mem.trim(u8, first_raw, " \t\r");
@@ -1849,7 +1852,11 @@ const GrepCtx = struct {
         const shown = truncateLine(text, max_line_len);
         // 匹配行 `  Line N: text`；上下文行 `  Line N- text`（grep 惯例用 - 区分）
         const sep: u8 = if (is_match) ':' else '-';
-        const line = try std.fmt.allocPrint(self.allocator, "  Line {d}{c} {s}\n", .{ line_no, sep, shown });
+        // 截断时附提示（阈值动态显示；不写 limit——读几行由调用方判断）
+        const line = if (shown.len < text.len)
+            try std.fmt.allocPrint(self.allocator, "  Line {d}{c} {s}… [truncated at {d} chars; use read to see it in full]\n", .{ line_no, sep, shown, max_line_len })
+        else
+            try std.fmt.allocPrint(self.allocator, "  Line {d}{c} {s}\n", .{ line_no, sep, shown });
         defer self.allocator.free(line);
         try self.out.appendSlice(self.allocator, line);
     }
@@ -3257,6 +3264,58 @@ test "tools: grep 锚点与空行（零宽匹配）" {
     }
 }
 
+test "tools: grep 长行截断到 120 字符并附提示（阈值动态）" {
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    defer threaded.deinit();
+
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+
+    const root_name = "skynet_test_grep_linelen";
+    const root = try std.fs.path.join(testing.allocator, &.{ cwd, root_name });
+    defer testing.allocator.free(root);
+    removeTree(io, testing.allocator, root);
+    defer removeTree(io, testing.allocator, root);
+
+    // 一条 300 字符的长行（会被截断）+ 一条短行（不截断）
+    // 用 Zig 构造 JSON（不在 JSON 字符串里写 Zig 表达式）
+    {
+        var long_line_buf: [340]u8 = undefined;
+        @memset(long_line_buf[0..300], 'x');
+        const tail = " LONG_TAIL_MARKER";
+        @memcpy(long_line_buf[300 .. 300 + tail.len], tail);
+        // 注意：JSON 字符串里的换行必须写成 \\n（两个字符），不能是字面换行
+        const content = try std.fmt.allocPrint(testing.allocator, "SHORT line here\\n{s}\\n", .{long_line_buf[0 .. 300 + tail.len]});
+        defer testing.allocator.free(content);
+        const payload = try std.fmt.allocPrint(testing.allocator, "{{\"path\":\"skynet_test_grep_linelen/a.txt\",\"content\":\"{s}\"}}", .{content});
+        defer testing.allocator.free(payload);
+        const w = try execute(testing.allocator, io, cwd, "write", payload);
+        defer testing.allocator.free(w.content);
+        defer if (w.display) |d| testing.allocator.free(d);
+        try testing.expect(!w.is_error);
+    }
+
+    const r = try execute(testing.allocator, io, cwd, "grep", "{\"pattern\":\"SHORT|LONG_TAIL\",\"path\":\"skynet_test_grep_linelen/a.txt\"}");
+    defer testing.allocator.free(r.content);
+    defer if (r.display) |d| testing.allocator.free(d);
+    try testing.expect(!r.is_error);
+
+    // 长行：被截断（尾部标记消失）+ 提示（阈值动态显示为 120）
+    try testing.expect(std.mem.indexOf(u8, r.content, "LONG_TAIL_MARKER") == null);
+    try testing.expect(std.mem.indexOf(u8, r.content, "[truncated at 120 chars; use read to see it in full]") != null);
+    // 短行：不截断、无提示
+    try testing.expect(std.mem.indexOf(u8, r.content, "SHORT line here") != null);
+    // 提示只出现一次（短行不应附带）
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, r.content, idx, "truncated at 120 chars")) |pos| {
+        count += 1;
+        idx = pos + 1;
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
 test "tools: grep 因字节上限截断时提示不再误报为匹配数上限" {
     var threaded: std.Io.Threaded = undefined;
     const io = testIo(&threaded);
@@ -3271,8 +3330,10 @@ test "tools: grep 因字节上限截断时提示不再误报为匹配数上限" 
     removeTree(io, testing.allocator, root);
     defer removeTree(io, testing.allocator, root);
 
-    // 200 行 × 500 字符：命中数(200)远小于 limit(5000)，必然先撞上 50KB 字节上限
-    const nlines: usize = 200;
+    // 需要足够的行数撞到 50KB 字节上限。
+    // 注意：行长会被截断到 max_line_len(120)，每行实际输出约 120+40(提示)+16(前缀) ≈ 176 字节，
+    // 因此需要 ~300 行才能超过 50KB。
+    const nlines: usize = 400;
     const line_len: usize = 500;
     const content = try testing.allocator.alloc(u8, nlines * (line_len + 1));
     defer testing.allocator.free(content);
