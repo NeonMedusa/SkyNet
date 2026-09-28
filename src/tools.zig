@@ -454,6 +454,36 @@ fn commonPrefixLen(a: []const u8, b: []const u8) usize {
 }
 
 /// 组装"期望 vs 实际"提示（含空白/反斜杠差异加注）
+/// 首个不同字节的下标（两串公共前缀长度；全等返回 null）。
+/// 差异若在长度之外（一长一短且短的是前缀），返回短串长度。
+fn firstDiffIndex(a: []const u8, b: []const u8) ?usize {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < n and a[i] == b[i]) i += 1;
+    if (i == n and a.len == b.len) return null;
+    return i;
+}
+
+/// 差异点居中的显示窗口：围绕 `diff_at` 取一段（各侧 `side` 字节），
+/// 两侧被省略时加 "..." 前缀/后缀。窗口在 UTF-8 边界对齐（避免半个字符）。
+/// 用于诊断——**关键：保证差异点一定出现在显示内容里**
+/// （旧实现固定截断前 60 字符，差异在 60 之后时两行看起来一模一样）。
+fn diffWindow(allocator: Allocator, line: []const u8, diff_at: usize, side: usize) []const u8 {
+    if (line.len == 0) return allocator.dupe(u8, "") catch "";
+
+    // 窗口范围（先按字节取，再向两侧对齐到 UTF-8 边界）
+    var start = if (diff_at > side) diff_at - side else 0;
+    var end = @min(line.len, diff_at + side);
+    // start 右移到字符边界（跳过续接字节）
+    while (start < line.len and (line[start] & 0xC0) == 0x80) start += 1;
+    // end 左移到字符边界
+    while (end > start and end < line.len and (line[end] & 0xC0) == 0x80) end -= 1;
+
+    const prefix: []const u8 = if (start > 0) "..." else "";
+    const suffix: []const u8 = if (end < line.len) "..." else "";
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, line[start..end], suffix }) catch "";
+}
+
 fn formatLineMismatch(
     allocator: Allocator,
     old_line: []const u8,
@@ -461,8 +491,13 @@ fn formatLineMismatch(
     file_line_no: usize,
     eof: bool,
 ) []const u8 {
-    const o_show = truncForDiag(allocator, old_line, 60);
-    const d_show = truncForDiag(allocator, file_line, 60);
+    const side: usize = 36; // 差异点两侧各显示的字节数
+    const diff_at = firstDiffIndex(old_line, file_line);
+
+    // 差异点居中窗口（保证差异一定可见）；无差异（如仅长度不同）时退回前缀显示
+    const o_show = if (diff_at) |at| diffWindow(allocator, old_line, at, side) else truncForDiag(allocator, old_line, 60);
+    const d_show = if (diff_at) |at| diffWindow(allocator, file_line, at, side) else truncForDiag(allocator, file_line, 60);
+
     var note: []const u8 = "";
     if (eof) {
         note = " (file ends before this line)";
@@ -481,16 +516,22 @@ fn formatLineMismatch(
             }
         }
     }
+
+    // 差异位置放在**标题**（与行号同处一行，最醒目；行尾只留补充说明）
+    const title_pos = if (diff_at) |at|
+        (std.fmt.allocPrint(allocator, " (char {d})", .{at + 1}) catch "")
+    else
+        "";
+
     return std.fmt.allocPrint(
         allocator,
-        " Hint: line {d} of the file does not match:\n" ++
+        " Hint: file line {d} differs{s}:\n" ++
             "   old_text: \"{s}\"\n" ++
             "   file:     \"{s}\"{s}",
-        .{ file_line_no, o_show, d_show, note },
+        .{ file_line_no, title_pos, o_show, d_show, note },
     ) catch "";
 }
 
-/// 从指定字节偏移取文件行的行号（1 起）
 fn lineNoAt(data: []const u8, at: usize) usize {
     return std.mem.count(u8, data[0..@min(at, data.len)], "\n") + 1;
 }
@@ -613,7 +654,7 @@ fn diagnoseLineMismatch(allocator: Allocator, data: []const u8, old: []const u8)
         if (!std.mem.eql(u8, o_line, d_line)) {
             hint = std.fmt.allocPrint(
                 allocator,
-                "{s}\n   (multi-line old_text: line {d} of it)",
+                "{s}\n   (this is line {d} of old_text)",
                 .{ formatLineMismatch(allocator, o_line, d_line, file_line_no, eof), old_line_no },
             ) catch "";
             return hint;
@@ -2468,6 +2509,52 @@ test "tools: edit 生成行号 diff 展示" {
     }
 }
 
+test "tools: edit 诊断——长行差异在 60 字符之后也应可见（差异居中窗口）" {
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    defer threaded.deinit();
+
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+
+    const root_name = "skynet_test_edit_longdiff";
+    const root = try std.fs.path.join(testing.allocator, &.{ cwd, root_name });
+    defer testing.allocator.free(root);
+    removeTree(io, testing.allocator, root);
+    defer removeTree(io, testing.allocator, root);
+
+    // 造一条 130 字符的行：差异在第 ~90 字符处（远超旧实现的 60 字符截断点）
+    //   文件：...@as(i32, @floatFromInt(...))   ← 内层是 floatFromInt
+    //   old ：...@as(i32, @intFromFloat(...))   ← 内层是 intFromFloat（真实踩过的坑）
+    {
+        const real_line = "const x = foo(1234567890123456789012345678901234567890123456789012345678901234567890, @as(i32, @floatFromInt(v)), 42);";
+        const content = try std.fmt.allocPrint(testing.allocator, "{s}\\n", .{real_line});
+        defer testing.allocator.free(content);
+        const payload = try std.fmt.allocPrint(testing.allocator, "{{\"path\":\"{s}/a.txt\",\"content\":\"{s}\"}}", .{ root_name, content });
+        defer testing.allocator.free(payload);
+        const w = try execute(testing.allocator, io, cwd, "write", payload);
+        defer testing.allocator.free(w.content);
+        defer if (w.display) |d| testing.allocator.free(d);
+        try testing.expect(!w.is_error);
+    }
+
+    // old_text 同长度但内层不同（差异在 ~90 字符处）
+    const old_text = "const x = foo(1234567890123456789012345678901234567890123456789012345678901234567890, @as(i32, @intFromFloat(v)), 42);";
+    const payload2 = try std.fmt.allocPrint(testing.allocator, "{{\"path\":\"{s}/a.txt\",\"edits\":[{{\"old_text\":\"{s}\",\"new_text\":\"y\"}}]}}", .{ root_name, old_text });
+    defer testing.allocator.free(payload2);
+    const r = try execute(testing.allocator, io, cwd, "edit", payload2);
+    defer testing.allocator.free(r.content);
+    defer if (r.display) |d| testing.allocator.free(d);
+    try testing.expect(r.is_error);
+
+    // 关键断言：诊断里应能看到差异（intFromFloat vs floatFromInt）
+    try testing.expect(std.mem.indexOf(u8, r.content, "intFromFloat") != null);
+    try testing.expect(std.mem.indexOf(u8, r.content, "floatFromInt") != null);
+    // 且有差异位置标注
+    try testing.expect(std.mem.indexOf(u8, r.content, "(char ") != null);
+    try testing.expect(std.mem.indexOf(u8, r.content, "file line 1 differs") != null);
+}
+
 test "tools: edit 宽松匹配（放宽链）与失败诊断" {
     var threaded: std.Io.Threaded = undefined;
     const io = testIo(&threaded);
@@ -2599,7 +2686,7 @@ test "tools: edit 宽松匹配（放宽链）与失败诊断" {
         defer testing.allocator.free(r.content);
         defer if (r.display) |d| testing.allocator.free(d);
         try testing.expect(r.is_error);
-        try testing.expect(std.mem.indexOf(u8, r.content, "does not match") != null);
+        try testing.expect(std.mem.indexOf(u8, r.content, "differs") != null);
     }
     {
         // 完全无关：无 Hint，不崩
