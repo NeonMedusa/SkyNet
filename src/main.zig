@@ -598,8 +598,8 @@ const AppState = struct {
     // 上下文压缩（compaction）
     /// 上下文窗口覆盖（0 = 用 provider 配置/启发式；CLI --max-context 用）
     context_window_override: u64 = 0,
-    /// 自动压缩触发阈值（窗口百分比；0 = 关闭）
-    auto_compact_pct: u64 = 75,
+    /// 自动压缩触发阈值（窗口百分比；0 = 关闭），将来可考虑做成可配置项
+    auto_compact_pct: u64 = 90,
     /// 压缩时保留的最近 token 数
     keep_recent_tokens: usize = 20_000,
     /// 已加载的最近 compaction id（用于发现外部压缩）
@@ -1520,14 +1520,15 @@ const AppState = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        // 工具调用索引：id → 名称/参数（在 tool 行重建工具块时需要参数生成标题）
-        const CallIdx = struct { id: []const u8, name: []const u8, arguments: []const u8 };
-        var call_idx = std.ArrayListUnmanaged(CallIdx){ .items = &.{}, .capacity = 0 };
+        // 工具调用索引：id → 名称/参数（在 tool 行重建工具块时需要参数生成标题）。
+        // 哈希表：长会话（上万行）下逐行线性扫描是 O(n²)（实测 15.8k 行 ~95ms
+        // 仅此处），查表把这段降到 O(n)。
+        const CallIdx = struct { name: []const u8, arguments: []const u8 };
+        var call_idx = std.StringHashMapUnmanaged(CallIdx){};
         defer call_idx.deinit(arena);
 
         // 非块工具的调用行消息下标：id → msg_idx（结果到达后回填大小统计）
-        const CallLineIdx = struct { id: []const u8, msg_idx: usize };
-        var call_lines = std.ArrayListUnmanaged(CallLineIdx){ .items = &.{}, .capacity = 0 };
+        var call_lines = std.StringHashMapUnmanaged(usize){};
         defer call_lines.deinit(arena);
 
         // 政策A：请求前缀 = 程序当前的 system_prompt（打开/重建时只前置这一次）
@@ -1619,12 +1620,9 @@ const AppState = struct {
                 var name: []const u8 = row.tool_name;
                 var args: []const u8 = "";
                 var line_idx: ?usize = null;
-                for (call_idx.items) |ci| {
-                    if (std.mem.eql(u8, ci.id, row.tool_call_id)) {
-                        args = ci.arguments;
-                        if (name.len == 0) name = ci.name;
-                        break;
-                    }
+                if (call_idx.get(row.tool_call_id)) |ci| {
+                    args = ci.arguments;
+                    if (name.len == 0) name = ci.name;
                 }
                 // 增量刷新时，调用可能在本批次之外：从已有历史里找对应调用
                 if (args.len == 0) {
@@ -1640,12 +1638,7 @@ const AppState = struct {
                         }
                     }
                 }
-                for (call_lines.items) |cl| {
-                    if (std.mem.eql(u8, cl.id, row.tool_call_id)) {
-                        line_idx = cl.msg_idx;
-                        break;
-                    }
-                }
+                line_idx = call_lines.get(row.tool_call_id);
                 if (with_display) addLoadedToolDisplay(self, arena, name, args, line_idx, row);
                 continue;
             }
@@ -1664,12 +1657,17 @@ const AppState = struct {
                 if (with_display) self.addLoadedAssistantMessage(row.content, row.reasoning, row.reasoning_ms, row.id);
                 if (calls) |cs| {
                     for (cs) |c| {
-                        call_idx.append(arena, .{ .id = c.id, .name = c.name, .arguments = c.arguments }) catch {};
+                        // 先到先得（与旧线性扫描的首个匹配一致；id 理论唯一，防御重复）
+                        if (call_idx.getOrPut(arena, c.id)) |gop| {
+                            if (!gop.found_existing) gop.value_ptr.* = .{ .name = c.name, .arguments = c.arguments };
+                        } else |_| {}
                         // 块类工具（bash/edit）在对应的 tool 行重建；其余在此出一行提示
                         if (toolBlockKind(c.name) == null) {
                             if (with_display) addLoadedToolCallNote(self, arena, c.name, c.arguments);
                             if (with_display and self.messages.items.len > 0) {
-                                call_lines.append(arena, .{ .id = c.id, .msg_idx = self.messages.items.len - 1 }) catch {};
+                                if (call_lines.getOrPut(arena, c.id)) |gl| {
+                                    if (!gl.found_existing) gl.value_ptr.* = self.messages.items.len - 1;
+                                } else |_| {}
                             }
                         }
                     }
