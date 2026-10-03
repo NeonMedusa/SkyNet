@@ -8074,18 +8074,32 @@ fn updateMessageWindow(state: *AppState, width: usize, viewport_rows: usize) voi
     const anchor = state.anchor_msg;
     const keep = viewport_rows *| window_keep_screens;
 
-    // 1) 向前数：锚点起向下累计 keep 行 + 一屏，得到 keep_hi（只需触碰窗口内条目）
+    // 1) 向前数：从**锚点行**起向下累计 keep 行 + 一屏，得到 keep_hi。
+    //    注意：锚点可能在一条长消息的中间/尾部（如 894 行的超长正文），
+    //    此时视口会跨过该消息结尾、包含后续消息——必须从锚点剩余行起算
+    //    （旧写法用整条 span 去凑，导致 keep_hi 截断在 anchor+1，
+    //    把视口内跨界到的后续消息误判为“区间外”卸载 → 绘制空白；
+    //    实测复现：894 行消息尾部锚点，下一条消息被卸载）。
     var keep_hi: usize = state.messages.items.len;
     {
         var need = keep +| viewport_rows;
-        var i = anchor;
-        while (i < state.messages.items.len) : (i += 1) {
-            const span = state.msgSpan(i, width);
-            if (span >= need) {
-                keep_hi = i + 1;
-                break;
+        // 锚点所在消息的剩余行（含其后的分隔空行由 msgSpan 计入）
+        const a_rows = state.msgRows(anchor, width);
+        const a_span = state.msgSpan(anchor, width);
+        const in_msg = a_span - @min(state.anchor_row, a_rows);
+        if (in_msg >= need) {
+            keep_hi = anchor + 1;
+        } else {
+            need -= in_msg;
+            var i = anchor + 1;
+            while (i < state.messages.items.len) : (i += 1) {
+                const span = state.msgSpan(i, width);
+                if (span >= need) {
+                    keep_hi = i + 1;
+                    break;
+                }
+                need -= span;
             }
-            need -= span;
         }
     }
     // 2) 向后数：锚点起向上累计 keep 行，得到 keep_lo（反向数行）
@@ -14711,4 +14725,55 @@ test "锚点：上滚后再下滚不会越过内容末尾（底部钳制）" {
     // 锚点应指向"内容末尾 - 8 行"（首行 11）：msg5 的第 1 行（每条 2 行：内容 + 间隔）
     try std.testing.expectEqual(@as(usize, 5), state.anchor_msg);
     try std.testing.expectEqual(@as(usize, 1), state.anchor_row);
+}
+test "锚点：长消息尾部时，视口跨界消息保持加载（前向覆盖含 anchor_row）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    if (std.Io.Dir.cwd().access(io, "tmp/live/live2.db", .{})) |_| {} else |_| return error.SkipZigTest;
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    state.db = db_mod.Db.openFile(std.testing.allocator, io, "tmp/live/live2.db") catch return error.SkipZigTest;
+    defer {
+        if (state.db) |*d| d.deinit();
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+    }
+    state.windowing_enabled = true;
+    state.message_visible_rows = 40;
+    state.loadSessionContent(12);
+
+    // 找 19369（894 行的长消息）
+    var ix: ?usize = null;
+    for (state.messages.items, 0..) |m, k| {
+        if (m.db_id == 19369) {
+            ix = k;
+            break;
+        }
+    }
+    const long_idx = ix orelse return error.SkipZigTest;
+    const rows69 = state.msgRows(long_idx, 120);
+    try std.testing.expect(rows69 >= 200); // 确认是长消息（≥ keep+viewport）
+
+    // 第一步：让 19370 处于加载状态（把锚点放到 19370 上跑一次窗口）
+    state.follow_tail = false;
+    state.anchor_msg = long_idx + 1;
+    state.anchor_row = 0;
+    updateMessageWindow(&state, 120, 40);
+    try std.testing.expect(state.messages.items[long_idx + 1].content_loaded);
+
+    // 第二步：锚点放回 19369 尾部（视口跨界到 19370）。
+    // 注意：行数取"当前真实值"——首帧的 894 可能是壳估算，物化后以实际为准。
+    const real_rows = state.msgRows(long_idx, 120);
+    state.anchor_msg = long_idx;
+    state.anchor_row = real_rows -| 3; // 仅剩 3 行 → 视口必跨界到 19370
+    updateMessageWindow(&state, 120, 40);
+
+    // 19370 在视口内 → 必须保持加载（修复前会被误卸载 → 绘制空白）
+    try std.testing.expect(state.messages.items[long_idx + 1].content_loaded);
 }
