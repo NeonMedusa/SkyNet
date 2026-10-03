@@ -92,8 +92,14 @@ fn cliFlagValue(args: []const []const u8, i: *usize, short: []const u8, long: []
 
 pub fn parseCliArgs(args: []const []const u8) ?CliOptions {
     if (args.len == 0) return null;
-    var opt = CliOptions{ .command = args[0] };
-    var i: usize = 1;
+    var opt = CliOptions{};
+    var i: usize = 0;
+    // 首参是子命令（含 help/-h/--help）；TUI 无子命令：首参直接是选项（如 -db），
+    // 此时 command 保持空串（供 main 解析 -db 等）。
+    if (args[0].len > 0 and (args[0][0] != '-' or std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help"))) {
+        opt.command = args[0];
+        i = 1;
+    }
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--json") or std.mem.eql(u8, a, "-json")) {

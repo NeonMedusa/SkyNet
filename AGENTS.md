@@ -80,7 +80,7 @@ zig-out/bin/SkyNet.exe compact -session 3 -db skynet.db --json # 手动压缩（
 
 ## 数据库 / schema 约定
 
-- `schema_version` 在 `src/db.zig`（当前 **v8**）；版本处理：
+- `schema_version` 在 `src/db.zig`（当前 **v9**）；版本处理：
   - **有迁移路径**（`migration_min_version` ≤ 库版本 < 当前）→ `openFile` 里
     **自动迁移**：`migrateIfNeeded` 先整库备份（`<db>.v{old}.bak.db` + 侧车，
     copyFile 只读源）再逐级升级（`migrations` 表：每步一个函数，独立事务提交）；
@@ -100,6 +100,9 @@ zig-out/bin/SkyNet.exe compact -session 3 -db skynet.db --json # 手动压缩（
   `folded` 列记录已折，发给模型前换成 stub（`maybeFoldOldToolOutputs` /
   `applyLoadedMessagesWithCheckpoint`）。**导出/UI 始终用 `content` 全文**。
   （v8 迁移已 DROP 旧的 `tool_full` 列：内容只存一份。）
+- **显示元数据（v9）**：`message.disp_kind/disp_bytes/disp_lines/has_reasoning` 由
+  `insertMessage` 内部经 `computeDisplayMeta` 统一计算（懒加载显示的行高依据）；
+  覆盖索引 `idx_message_meta`（扫元数据不碰内容页）。新增写入路径不要手工填 `disp_*`。
 - 压缩 checkpoint 在 compaction 表：summary_message_id + tail_start_id（id >= tail_start_id 的消息才发给模型）；summary_message_id 指向一条 
 role='summary' 的消息（摘要原文，FTS 可搜）
 - TUI 的 /compact 是**异步**的：摘要流式渲染，Ctrl+Q 可取消；CLI compact 仍同步（脚本友好）
@@ -111,6 +114,7 @@ role='summary' 的消息（摘要原文，FTS 可搜）
 [`docs/architecture.md`](docs/architecture.md)。速览：
 
 - `src/main.zig`：TUI 绘制/事件、CLI（ask/new/sessions/messages/stats/compact）、agent worker、压缩调度
+- `src/display.zig`：显示文本纯函数（工具调用行/块标题/参数摘要/截断），迁移回填与运行时共用
 - `src/context.zig`：token 估算、工具输出折叠模拟、压缩区间选择与摘要输入构建（纯计算，可单测）
 - `src/cli_args.zig`：CLI 参数解析与输出辅助（无 AppState 依赖）
 - `src/ai.zig`：SSE 流式请求、工具调用分片、usage 解析、各厂会话亲和/缓存参数

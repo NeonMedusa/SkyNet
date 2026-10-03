@@ -37,6 +37,15 @@ pub const MessageRow = struct {
     output_tokens: i64 = 0,
     /// 该工具结果已对 AI 折叠（1 = 发给模型时用 stub；content 仍是全文）
     folded: i64 = 0,
+    /// 显示元数据（schema v9；懒加载显示用，由 insertMessage 统一计算）：
+    /// 0=文本 1=调用行 2=shell 块 3=diff 块
+    disp_kind: i64 = 0,
+    /// 显示正文字节数（块=截断前正文；文本=content；调用行=0）
+    disp_bytes: i64 = 0,
+    /// 显示正文逻辑行数（换行数 + 1；空为 0）
+    disp_lines: i64 = 0,
+    /// 是否有思考内容（1/0；估算思考块行数用）
+    has_reasoning: i64 = 0,
 };
 
 /// insertMessage 参数（字段较多，用具名结构）
@@ -93,6 +102,24 @@ pub const CompactionRow = struct {
     /// 压缩前的估算 token（展示用）
     tokens_before: i64 = 0,
     model: []const u8 = "",
+};
+
+/// 懒加载显示的“骨架行”：只含渲染定位需要的元数据（不含正文/思考原文）。
+/// 由覆盖索引 idx_message_meta 扫描（不触碰内容页；15.8k 行实测 ~24ms）。
+/// 内容在消息滚入视口时按 id 物化（见 main.zig 的 reloadMessage / 懒加载路径）。
+pub const DisplayMetaRow = struct {
+    id: i64 = 0,
+    role: []const u8 = "",
+    /// 0=文本 1=调用行 2=shell 块 3=diff 块
+    disp_kind: i64 = 0,
+    is_error: i64 = 0,
+    reasoning_ms: i64 = 0,
+    /// 显示正文字节数（块=截断前正文；文本=content；调用行=0）
+    disp_bytes: i64 = 0,
+    /// 显示正文逻辑行数（换行数 + 1；空为 0）
+    disp_lines: i64 = 0,
+    /// 是否有思考内容（1/0）
+    has_reasoning: i64 = 0,
 };
 
 /// 打开数据库时发现的版本不匹配信息（供上层决定：拒绝打开后如何处理）
@@ -223,7 +250,11 @@ pub const Db = struct {
         \\  input_tokens INTEGER NOT NULL DEFAULT 0,
         \\  cached_tokens INTEGER NOT NULL DEFAULT 0,
         \\  output_tokens INTEGER NOT NULL DEFAULT 0,
-        \\  folded INTEGER NOT NULL DEFAULT 0
+        \\  folded INTEGER NOT NULL DEFAULT 0,
+        \\  disp_kind INTEGER NOT NULL DEFAULT 0,
+        \\  disp_bytes INTEGER NOT NULL DEFAULT 0,
+        \\  disp_lines INTEGER NOT NULL DEFAULT 0,
+        \\  has_reasoning INTEGER NOT NULL DEFAULT 0
         \\);
         \\CREATE TABLE IF NOT EXISTS "compaction" (
         \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -237,6 +268,7 @@ pub const Db = struct {
         \\);
         \\CREATE INDEX IF NOT EXISTS "idx_compaction_session" ON "compaction"(session_id, id);
         \\CREATE INDEX IF NOT EXISTS "idx_message_session" ON "message"(session_id, id);
+        \\CREATE INDEX IF NOT EXISTS "idx_message_meta" ON "message"(session_id, id, role, disp_kind, is_error, reasoning_ms, disp_bytes, disp_lines, has_reasoning);
         \\CREATE VIRTUAL TABLE IF NOT EXISTS "message_fts" USING fts5(content, content='message', content_rowid='id', tokenize='trigram');
         \\CREATE TRIGGER IF NOT EXISTS "message_ai" AFTER INSERT ON "message" BEGIN
         \\  INSERT INTO "message_fts"(rowid, content) VALUES (new.id, new.content);
@@ -256,10 +288,11 @@ pub const Db = struct {
     ///
     /// 版本历史：
     /// - v8：`message.folded`——工具输出折叠仅面向 AI（content 始终存全文）
-    pub const schema_version: i64 = 8;
+    /// - v9：`message.disp_*` / `has_reasoning`——懒加载显示的元数据 + 覆盖索引
+    pub const schema_version: i64 = 9;
 
     /// 有迁移路径的最低旧版本：低于它一律拒绝（闸门提示备份后新建）。
-    /// 目前只有 v7→v8 一步；将来每加一步迁移函数就把这里前移。
+    /// 目前有 v7→v8→v9 两步；将来每加一步迁移函数就把这里前移。
     pub const migration_min_version: i64 = 7;
 
     /// 打开数据库。注意：不提供"默认路径"的便利函数——那会让调用方（曾导致
@@ -328,6 +361,7 @@ pub const Db = struct {
     /// ③ migration_min_version 保持不变（除非故意放弃对最旧版本的支持）。
     const migrations = [_]struct { from: i64, run: MigrationFn }{
         .{ .from = 7, .run = migrateV7ToV8 },
+        .{ .from = 8, .run = migrateV8ToV9 },
     };
 
     /// 备份 + 逐级迁移（v{current} → v{schema_version}）。
@@ -475,6 +509,44 @@ pub const Db = struct {
         try sess.conn.execAll("ALTER TABLE \"message\" DROP COLUMN tool_full;");
     }
 
+    /// v8 → v9：加懒加载显示的元数据列（disp_kind/disp_bytes/disp_lines/has_reasoning）。
+    ///
+    /// 回填策略：
+    /// - 先 DROP FTS 的 UPDATE 触发器——否则 16k 行 UPDATE 会逐行重索引 content
+    ///   （content 并未改变，FTS 无需更新；迁移结束后由 schema 语句重建触发器）；
+    /// - 纯 SQL 回填：
+    ///   disp_kind：tool 行按 tool_name（bash/edit→块、其余→调用行），其他行=文本；
+    ///   disp_bytes/disp_lines：显示正文（tool 错误=content、tool_display 非空用它、否则 content）；
+    ///   has_reasoning：reasoning 非空。
+    /// - 覆盖索引 idx_message_meta 由 migrateIfNeeded 尾部的 schema 语句创建。
+    fn migrateV8ToV9(sess: *fr.Session) !void {
+        try sess.conn.execAll(
+            "ALTER TABLE \"message\" ADD COLUMN disp_kind INTEGER NOT NULL DEFAULT 0;" ++
+                "ALTER TABLE \"message\" ADD COLUMN disp_bytes INTEGER NOT NULL DEFAULT 0;" ++
+                "ALTER TABLE \"message\" ADD COLUMN disp_lines INTEGER NOT NULL DEFAULT 0;" ++
+                "ALTER TABLE \"message\" ADD COLUMN has_reasoning INTEGER NOT NULL DEFAULT 0;",
+        );
+        try sess.conn.execAll("DROP TRIGGER IF EXISTS \"message_au\";");
+        // 注意：LENGTH() 对 TEXT 返回字符数；字节数需 CAST AS BLOB（与 Zig 侧 body.len 一致）
+        try sess.conn.execAll(
+            \\UPDATE "message" SET
+            \\  disp_kind = CASE
+            \\    WHEN role = 'tool' AND tool_name IN ('bash','edit') THEN CASE tool_name WHEN 'bash' THEN 2 ELSE 3 END
+            \\    WHEN role = 'tool' THEN 1
+            \\    ELSE 0 END,
+            \\  has_reasoning = CASE WHEN LENGTH(reasoning) > 0 THEN 1 ELSE 0 END;
+        );
+        try sess.conn.execAll(
+            \\UPDATE "message" SET
+            \\  disp_bytes = LENGTH(CAST(CASE WHEN role = 'tool' AND is_error = 0 AND tool_display <> '' THEN tool_display ELSE content END AS BLOB)),
+            \\  disp_lines = CASE WHEN LENGTH(CASE WHEN role = 'tool' AND is_error = 0 AND tool_display <> '' THEN tool_display ELSE content END) = 0
+            \\    THEN 0
+            \\    ELSE LENGTH(CASE WHEN role = 'tool' AND is_error = 0 AND tool_display <> '' THEN tool_display ELSE content END) -
+            \\         LENGTH(REPLACE(CASE WHEN role = 'tool' AND is_error = 0 AND tool_display <> '' THEN tool_display ELSE content END, char(10), '')) + 1
+            \\    END;
+        );
+    }
+
     pub fn deinit(self: *Db) void {
         if (self.path.len > 0) self.allocator.free(self.path);
         self.sess.deinit();
@@ -541,9 +613,52 @@ pub const Db = struct {
         return if (rows.len > 0) rows[0].data_version else 0;
     }
 
-    /// 加载某会话中 id 大于 after_id 的消息（按 id 升序，用于增量刷新）
     /// 消息行的完整列清单（多处查询共用，避免改动时遗漏）
-    const message_cols = "id, session_id, role, content, model, provider, created_at, reasoning, reasoning_ms, tool_calls, tool_call_id, tool_name, tool_display, is_error, input_tokens, cached_tokens, output_tokens, folded";
+    const message_cols = "id, session_id, role, content, model, provider, created_at, reasoning, reasoning_ms, tool_calls, tool_call_id, tool_name, tool_display, is_error, input_tokens, cached_tokens, output_tokens, folded, disp_kind, disp_bytes, disp_lines, has_reasoning";
+
+    /// 显示元数据（insertMessage 内部计算；schema v9）。
+    const DisplayMeta = struct {
+        kind: i64 = 0,
+        bytes: i64 = 0,
+        lines: i64 = 0,
+        has_reasoning: i64 = 0,
+    };
+
+    /// 根据行内容计算显示元数据（懒加载显示的行高估算用）。
+    /// 定义必须与 main.zig 的物化/reloadMessage 一致：
+    /// - tool 行：错误 → content；有 tool_display（edit diff）→ 用它；否则 content
+    /// - 其他行：content
+    /// 行数 = 换行数 + 1（空内容为 0），字节数按 UTF-8 字节数。
+    fn computeDisplayMeta(msg: NewMessage) DisplayMeta {
+        var kind: i64 = 0;
+        if (std.mem.eql(u8, msg.role, "tool")) {
+            if (std.mem.eql(u8, msg.tool_name, "bash")) {
+                kind = 2;
+            } else if (std.mem.eql(u8, msg.tool_name, "edit")) {
+                kind = 3;
+            } else {
+                kind = 1;
+            }
+        }
+        const body: []const u8 = if (kind != 0 and msg.is_error == 0 and msg.tool_display.len > 0)
+            msg.tool_display
+        else
+            msg.content;
+        return .{
+            .kind = kind,
+            .bytes = @intCast(body.len),
+            .lines = if (body.len == 0) 0 else countLines(body),
+            .has_reasoning = if (msg.reasoning.len > 0) 1 else 0,
+        };
+    }
+
+    fn countLines(s: []const u8) i64 {
+        var n: i64 = 1;
+        for (s) |c| {
+            if (c == '\n') n += 1;
+        }
+        return n;
+    }
 
     pub fn loadMessagesAfter(self: *Db, session_id: i64, after_id: i64) ![]const MessageRow {
         return try self.sess.raw(
@@ -620,11 +735,14 @@ pub const Db = struct {
         try self.sess.exec("DELETE FROM \"session\" WHERE id = ?", .{session_id});
     }
 
-    /// 插入一条消息，返回消息 id
+    /// 插入一条消息，返回消息 id。
+    /// 显示元数据（disp_*）由本函数根据行内容**统一计算**（schema v9；懒加载显示用），
+    /// 调用方无需（也不应）手工传入——避免各处格式漂移。
     pub fn insertMessage(self: *Db, msg: NewMessage) !i64 {
         const ts = self.now();
+        const disp = computeDisplayMeta(msg);
         try self.sess.exec(
-            "INSERT INTO \"message\" (session_id, role, content, model, provider, created_at, reasoning, reasoning_ms, tool_calls, tool_call_id, tool_name, tool_display, is_error, input_tokens, cached_tokens, output_tokens, folded) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO \"message\" (session_id, role, content, model, provider, created_at, reasoning, reasoning_ms, tool_calls, tool_call_id, tool_name, tool_display, is_error, input_tokens, cached_tokens, output_tokens, folded, disp_kind, disp_bytes, disp_lines, has_reasoning) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             .{
                 msg.session_id,
                 msg.role,
@@ -643,6 +761,10 @@ pub const Db = struct {
                 msg.cached_tokens,
                 msg.output_tokens,
                 msg.folded,
+                disp.kind,
+                disp.bytes,
+                disp.lines,
+                disp.has_reasoning,
             },
         );
         const id = try self.sess.conn.lastInsertRowId();
@@ -692,6 +814,48 @@ pub const Db = struct {
             lo_id,
             hi_id,
         );
+    }
+
+    /// 加载会话的全部显示骨架（按 id 升序；覆盖索引扫描，不读内容页）。
+    /// 懒加载显示用：内容按需物化，定位/滚动只依赖这些元数据。
+    pub fn loadDisplayMeta(self: *Db, allocator: Allocator, session_id: i64) ![]const DisplayMetaRow {
+        return db_query.queryAll1(
+            &self.sess,
+            allocator,
+            DisplayMetaRow,
+            "SELECT id, role, disp_kind, is_error, reasoning_ms, disp_bytes, disp_lines, has_reasoning " ++
+                "FROM \"message\" WHERE session_id = ? ORDER BY id",
+            session_id,
+        );
+    }
+
+    /// 加载某会话的全部 role='summary' 消息行（懒加载显示用：摘要行在压缩区，
+    /// 不在保留区范围内，需单独取；通常 0~几条）。
+    pub fn loadSummaryRows(self: *Db, allocator: Allocator, session_id: i64) ![]const MessageRow {
+        return db_query.queryAll1(
+            &self.sess,
+            allocator,
+            MessageRow,
+            "SELECT " ++ message_cols ++ " FROM \"message\" WHERE session_id = ? AND role = 'summary' ORDER BY id",
+            session_id,
+        );
+    }
+
+    /// 从 from_id 起（含）向前（id 递减）找最近的、带 tool_calls 的 assistant 行。
+    /// 懒加载物化工具行时反查调用参数（生成块标题/调用行）用；通常 1~5 行内命中。
+    /// 返回 null 表示没有（数据异常/裁剪）。结果归属 allocator。
+    pub fn findPrevAssistantToolCalls(self: *Db, allocator: Allocator, session_id: i64, from_id: i64) !?struct { id: i64, tool_calls: []const u8 } {
+        const Row = struct { id: i64 = 0, tool_calls: []const u8 = "" };
+        const rows = try db_query.queryAll2(
+            &self.sess,
+            allocator,
+            Row,
+            "SELECT id, tool_calls FROM \"message\" WHERE session_id = ? AND id <= ? AND role = 'assistant' AND tool_calls <> '' ORDER BY id DESC LIMIT 1",
+            session_id,
+            from_id,
+        );
+        if (rows.len == 0) return null;
+        return .{ .id = rows[0].id, .tool_calls = rows[0].tool_calls };
     }
 
     /// 会话标题为空时，用首条用户消息设置标题
@@ -1058,11 +1222,11 @@ test "db: v7 → v8 迁移（加 folded 列 + 还原 stub 为全文 + 备份）"
     {
         var db = try Db.openFile(testing.allocator, io, path);
         defer db.deinit();
-        // 版本号与 schema 同事务写入：迁移后应为 8
+        // 版本号与 schema 同事务写入：迁移链 v7 → v8 → v9
         {
             const Ver = struct { user_version: i64 = 0 };
             const ver = try db.sess.raw("SELECT user_version FROM pragma_user_version", .{}).fetchAll(Ver);
-            try testing.expectEqual(@as(i64, 8), ver[0].user_version);
+            try testing.expectEqual(@as(i64, 9), ver[0].user_version);
         }
         // tool_full 列已被彻底移除（不留冗余副本）
         {
@@ -1085,6 +1249,12 @@ test "db: v7 → v8 迁移（加 folded 列 + 还原 stub 为全文 + 备份）"
         // 未折叠行：folded = 0
         try testing.expectEqualStrings("未折叠全文", rows[1].content);
         try testing.expectEqual(@as(i64, 0), rows[1].folded);
+        // v9：显示元数据已回填（bash 块 = kind 2，read 调用行 = kind 1）
+        try testing.expectEqual(@as(i64, 2), rows[0].disp_kind);
+        try testing.expectEqual(@as(i64, 1), rows[1].disp_kind);
+        try testing.expectEqual(@as(i64, 6 * 3), rows[0].disp_bytes); // “真正全文内容” 6 字
+        try testing.expectEqual(@as(i64, 1), rows[0].disp_lines);
+        try testing.expectEqual(@as(i64, 0), rows[0].has_reasoning);
     }
 
     // 备份文件存在且内容为迁移前状态（含旧 stub）

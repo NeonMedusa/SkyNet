@@ -73,13 +73,20 @@ Terminal.flush → 仅输出变化单元格（SGR 合并）→ 同步输出块�
 **已落地**：① 行数缓存（`messageRowCountCached` + 绘制整条跳过）——每帧成本从
 O(全会话字符数) 降为 O(消息数)（3000 条实测 5.7ms → 0.44ms，Debug 构建）；
 ② **窗口化懒加载**（`updateMessageWindow` / `unloadMessage` / `reloadMessage`）——
-视口外的消息卸载内容，滚到时按 `db_id` 重载；语义、边界与内存行为见 3.4。
+视口外的消息卸载内容，滚到时按 `db_id` 重载；语义、边界与内存行为见 3.4；
+③ **加载期懒显示构建**（schema v9 + `loadSessionLazy` / `buildDisplayFromMeta`）——
+启动只读骨架元数据（覆盖索引 `idx_message_meta`，不碰内容页）+ 尾部 ~400 行物化，
+其余消息建壳（行高按字节数/行数估算，宽度 60~200 偏差 ≤3.4%），滚入视口时物化。
+实测（真实 15.8k 行会话，Debug）：加载 ~1300ms → ~230ms；首帧 ~410ms → ~3ms；
+内存峰值 ~53MB → ~24MB。物化导致的估算→真实行数变化会在视口下方自动补偿
+（`updateMessageWindow` / `drawMessages`），上方天然稳定。
 以下为可按需启用的**后续**方案：
 
 - **底部锚定窗口**（~50-100 行，中低风险）——`drawMessages` 改为从最后一条
   **反向累计**行数，凑够"可视行数 + scroll_offset"即停；`total_lines` 的既有用途
   （offset 钳制、▲▼ 指示）改用"回走是否仍有剩余"判断。边角：视口从消息中间开始、
-  offset 钳制语义。效果：每帧降为 O(视口内消息数)。**触发时机**：会话上万条仍嫌卡。
+  offset 钳制语义。效果：每帧降为 O(视口内消息数)。**触发时机**：会话十万条仍嫌卡
+  （当前每帧 O(消息数) 求和在 15.8k 条约 0.1-0.3ms）。
 - **单条超长消息增量计行**（理论缺口）——流式追加时对整条重扫；单条几万行时才会
   有感。思路：维护"末行已用列数"的增量状态。**触发时机**：长输出流式变卡。
 
@@ -340,30 +347,47 @@ Claude Code / Cursor / Aider 用 `old_string`/`old_str`，我们用蛇形 `old_t
 ### 3.4 内存行为说明（排查时先读这里）
 
 长会话的内存治理见 2.1（窗口化懒加载）与以下实现（`updateMessageWindow` / `unloadMessage` /
-`reloadMessage`，以及 `src/db_query.zig` 绕开 fridge session arena）。以下现象是**正常行为**，
-不要误判为泄漏：
+`reloadMessage`，以及 `src/db_query.zig` 绕开 fridge session arena）。
 
-**"滚动时内存缓涨 + 突然断崖下跌"**：
+**滚动时内存为什么会小幅波动（正常行为）**：
 
-- **缓涨**：滚动触发消息重载（分配 `content`/`reasoning`/`md`）。Zig 的默认分配器是
-  `DebugAllocator`（`std.process.Init.gpa`），**小分配释放后留在进程内的空闲桶里复用**
-  （不归还 OS）——这是性能优化（避免频繁系统调用），不是泄漏；
+- **缓涨**：滚动触发消息重载（分配 `content`/`reasoning`/`md`）。Zig 的 DebugAllocator
+  （`std.process.Init.gpa`）**小分配释放后留在进程内的空闲桶里复用**（桶页整页释放才归还
+  OS）——这是性能优化（避免频繁系统调用），不是泄漏；
 - **断崖跌**：窗口滑出视口的消息被 `unloadMessage` 卸载，释放的 `reasoning`/`content`
   常是几十 KB 的**大块**；GPA 对 `large_allocations`（≥ 页大小）走 `freeLarge` →
-  `rawFree` → **真正 munmap 归还 OS** → RSS 骤降；
-- 整体有界（实测：会话 4 启动 ~45MB，滚动往返在 16-26MB 间波动，闲置 90 秒零增长）。
+  `rawFree` → **真正 munmap 归还 OS** → RSS 骤降。
+- **判定标准**：长时间连续滚动后 RSS **有界且收敛**（不单调增长）。
 
-**想验证"是否真零增长"**：把入口的 `init.gpa` 换成 `std.heap.smp_allocator`（生产级，
+**分配器对照（实测）**：同一会话 3000 次 PgUp——Debug+GPA 稳定 ~25MB、
+Debug+smp 稳定 ~25MB、**ReleaseSafe 最省（~17MB，链接 libc → `c_allocator`，
+归还更激进）**。修复后三者都平稳，分配器差异不再关键。
+
+**验证方法**：临时把入口的 `init.gpa` 换成 `std.heap.smp_allocator`（生产级，
 分配/释放更接近直接向 OS 要/还）再测——GPA 的空闲桶复用会掩盖小分配的泄漏。
 代价：失去 GPA 的泄漏检测（debug 构建下的双释放/越界检查），**仅用于一次性验证，不要提交**。
+另一个更精确的办法：测试里包一层计数分配器（统计 live 字节），直接看"逻辑内存"是否收敛
+（参考 `tmp/scripts/hold_rss.py` 的真实滚动注入脚本）。
 
 **历史教训**（已修，勿回退）：
 - `fridge` 的查询构造全部分配在 session arena（仅 `deinit` 释放），长驻进程频繁小查询
   会持续泄漏（实测 2892B/次）。所有**高频**查询必须走 `src/db_query.zig`（临时 arena）；
   新增查询时若走 `sess.raw(...).fetchAll(...)`，请评估调用频率；
+- **`unloadMessage` 必须释放消息上的一切堆内存**——包括看似"小到无所谓"的
+  `tool_header`（单行标题）。曾经保留它（注释称"重载时取不到"，已过时：现在
+  `reloadMessage` 按 db_id 反查 assistant 行参数重算）。后果：**滚过的每条工具行
+  永久驻留一份标题，RSS 随滚动线性增长**（实测 300s 连续 PgUp：24.7MB → 77MB，
+  不归还；修复后稳定 25.7MB）。新增 `Message` 堆字段时同步检查卸载路径；
 - 窗口化的 `updateMessageWindow` **不能**加 `isStreaming` 早退（会退化成"只重载不卸载"，
   生成中滚动内存暴涨）；
-- 实时生成的消息必须回填 `db_id`（否则永不满足卸载条件，长会话只增不减）。
+- 实时生成的消息必须回填 `db_id`（否则永不满足卸载条件，长会话只增不减）；
+- **懒加载壳的行高是估算值**：物化后行数可能变化。视口**下方**的变化必须补偿
+  `scroll_offset`（`updateMessageWindow` / `drawMessages` 已做）；视口上方无需补偿
+  （offset 自底部计量）。新增"会改变行数"的路径时，参照这两处写法；
+- **显示元数据与显示条目必须一一对应**：`buildDisplayFromMeta` 遇到批次外/缺失行时
+  回退建壳（可后续物化），**不得静默跳过**——否则滚动定位与元数据错位；
+- `insertMessage` 内部统一计算显示元数据（`computeDisplayMeta`）；新增写入路径时
+  不要手工填 `disp_*`（会与物化形态漂移）；改"显示正文"定义时两处同改。
 
 ---
 

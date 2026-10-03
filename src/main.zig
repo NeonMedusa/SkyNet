@@ -12,6 +12,21 @@ const tools_mod = @import("tools.zig");
 const context_mod = @import("context.zig");
 const cli = @import("cli_args.zig");
 const Log = @import("log.zig");
+const display_mod = @import("display.zig");
+
+// 显示文本纯函数（display.zig）——保留短名，避免大范围改调用点
+const toolBlockKind = display_mod.toolBlockKind;
+const extractJsonString = display_mod.extractJsonString;
+const extractJsonInt = display_mod.extractJsonInt;
+const extractJsonBool = display_mod.extractJsonBool;
+const formatBytes = display_mod.formatBytes;
+const formatToolCallLine = display_mod.formatToolCallLine;
+const toolHeaderText = display_mod.toolHeaderText;
+const toolRowHeader = display_mod.toolRowHeader;
+const summarizeToolArgs = display_mod.summarizeToolArgs;
+const capBlockBody = display_mod.capBlockBody;
+const toolResultSummary = display_mod.toolResultSummary;
+const toolDisplayBody = display_mod.toolDisplayBody;
 
 // 上下文管理纯计算（context.zig）——保留短名，避免大范围改调用点
 const estimateTokens = context_mod.estimateTokens;
@@ -165,8 +180,30 @@ const RecentEntry = struct {
     len: usize = 0,
 };
 
-/// 工具块渲染类型：shell 输出 / 行号 diff
-const ToolBlockKind = enum { shell, diff };
+/// 工具块渲染类型：shell 输出 / 行号 diff（定义已迁至 display.zig）
+const ToolBlockKind = display_mod.ToolBlockKind;
+
+/// 显示条目类型（懒加载显示）：与 DB 的 disp_kind 对应（0=文本 1=调用行 2=shell 3=diff），
+/// fail_line 仅存在于显示层（工具失败时的红色“↳ 失败”行，与调用行成对）。
+/// 用途：① 未物化的壳按类型估算行高；② reloadMessage 按类型重建内容。
+const EntryKind = enum(u8) { text = 0, call_line = 1, shell_block = 2, diff_block = 3, fail_line = 4 };
+
+fn entryKindFromDispKind(k: i64) EntryKind {
+    return switch (k) {
+        1 => .call_line,
+        2 => .shell_block,
+        3 => .diff_block,
+        else => .text,
+    };
+}
+
+/// 工具行的显示条目类型：优先用落库的 disp_kind；为 0（手工构造行/旧数据）时
+/// 按 tool_name 回退判定（与 computeDisplayMeta 同规则）。
+fn entryKindForToolRow(row: db_mod.MessageRow) EntryKind {
+    if (row.disp_kind != 0) return entryKindFromDispKind(row.disp_kind);
+    if (toolBlockKind(row.tool_name)) |k| return if (k == .diff) .diff_block else .shell_block;
+    return .call_line;
+}
 
 const Message = struct {
     content: []const u8 = "",
@@ -191,8 +228,18 @@ const Message = struct {
     /// 内容是否驻留内存（窗口化）：false 时 content/reasoning/md 已被卸载，
     /// 仅保留行数缓存供滚动定位；滚回视口时按 db_id 从库里重新加载。
     content_loaded: bool = true,
+    /// 显示条目类型（DB 来源消息）：物化与重载的分支依据（见 reloadMessage）。
+    entry_kind: EntryKind = .text,
+    /// 懒加载壳（从未物化）：true 时行数按 estimateShellRows 估算（宽度相关）；
+    /// 物化后置 false，之后的卸载走“冻结真实行数”（与窗口化既有行为一致）。
+    is_shell: bool = false,
+    /// 壳的行高估算输入：显示正文字节数 / 逻辑行数 / 是否有思考块
+    shell_bytes: u32 = 0,
+    shell_lines: u32 = 0,
+    shell_thought: bool = false,
     /// 工具块首行标题（窗口化重载时与 capBlockBody 重新拼回 content）。
-    /// 仅 db_id != 0 的加载路径工具块使用；实时消息不设。
+    /// 实时路径与物化后的卸载都保留它（省一次参数反查）；
+    /// 壳消息为空：重载时按 db_id 反查最近的 assistant 行参数生成。
     tool_header: []const u8 = "",
     /// 行数缓存：drawMessages 每帧需要全部消息的行数，长会话下逐字符重算
     /// 会把输入/框选响应拖到不可用。缓存键 = 宽度 + 展开态 + 正文/思考字节数：
@@ -813,6 +860,7 @@ const AppState = struct {
             .style = .{ .fg = .green },
             .user = true,
             .db_id = db_id,
+            .entry_kind = .text,
         }) catch {
             self.allocator.free(owned);
             return;
@@ -879,13 +927,20 @@ const AppState = struct {
             md_mod.free(self.allocator, md);
             msg.md = null;
         }
-        // 注意：tool_header 保留——它是重载工具块时拼回 content 的必需信息
-        // （来自 assistant 行的调用参数，单行重载时无法再取到），且只有一行文本
+        // tool_header 也释放：重载时按 db_id 反查最近的 assistant 行参数重算
+        // （见 reloadMessage → materializeToolHeader → lookupToolArgs）。
+        // 不再常驻：滚过的每条工具行都留一份标题会让内存随会话线性增长。
+        if (msg.tool_header.len > 0) {
+            self.allocator.free(msg.tool_header);
+            msg.tool_header = "";
+        }
         msg.content_loaded = false;
     }
 
-    /// 窗口化：从数据库重载一条消息的内容（内容字段 + md 解析）。
-    /// 返回 false 表示无法重载（db 不可用/行已不存在），调用方应保留占位。
+    /// 窗口化/懒加载：从数据库物化一条消息的内容（内容字段 + md 解析）。
+    /// 返回 false 表示无法物化（db 不可用/行已不存在），调用方应保留占位。
+    /// 分支依据：优先 entry_kind（壳消息未存 tool_header），
+    /// 回退到旧启发式（tool_block/user/tool_header）以兼容既有卸载路径。
     fn reloadMessage(self: *AppState, msg: *Message, width: usize) bool {
         if (msg.content_loaded) return true;
         const db = if (self.db) |*d| d else return false;
@@ -894,52 +949,72 @@ const AppState = struct {
         const rows = db.loadMessagesRange(scratch.allocator(), self.session_id, msg.db_id, msg.db_id) catch return false;
         if (rows.len == 0) return false;
         const row = rows[0];
+        const a = scratch.allocator();
 
-        // 按角色重建内容（与 addLoaded* 路径一致的形态）
-        if (msg.tool_block) |kind| {
-            const name = row.tool_name;
-            const display_text: []const u8 = row.content;
-            const raw: []const u8 = if (row.is_error != 0)
-                display_text
-            else if (row.tool_display.len > 0)
-                row.tool_display
-            else
-                display_text;
-            const max_lines: usize = if (kind == .diff) 40 else 20;
-            const capped = capBlockBody(self.allocator, raw, max_lines) catch null;
-            defer if (capped) |c| self.allocator.free(c);
-            const body: []const u8 = if (capped) |c| c else raw;
-            const header: []const u8 = if (msg.tool_header.len > 0) msg.tool_header else name;
-            const joined = std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ header, body }) catch return false;
-            msg.content = joined;
-        } else if (msg.user) {
-            msg.content = self.allocator.dupe(u8, row.content) catch return false;
-        } else if (msg.tool_header.len > 0) {
-            // 非块工具的调用行（`→ Read path [limit=..] (982B)`）：
-            // 调用行文本存在 tool_header（卸载前保存），结果摘要从 DB 行重算，
-            // 拼回与实时路径一致的形态
-            const result = tools_mod.Result{
-                .content = @constCast(row.content),
-                .is_error = row.is_error != 0,
-            };
-            const summary = summarizeToolResult(scratch.allocator(), result) catch "";
-            if (summary.len > 0) {
-                msg.content = std.fmt.allocPrint(self.allocator, "{s} ({s})", .{ msg.tool_header, summary }) catch return false;
-            } else {
-                msg.content = self.allocator.dupe(u8, msg.tool_header) catch return false;
-            }
-        } else {
-            // assistant：正文 + 思考
-            if (row.content.len > 0) {
-                const owned = self.allocator.dupe(u8, row.content) catch return false;
-                msg.content = owned;
-                msg.md = md_mod.parse(self.allocator, owned, md_mod.default_styles) catch null;
-            }
-            if (row.reasoning.len > 0) {
-                msg.reasoning = self.allocator.dupe(u8, row.reasoning) catch null;
-            }
+        switch (msg.entry_kind) {
+            .shell_block, .diff_block => {
+                const tb_kind: ToolBlockKind = if (msg.entry_kind == .diff_block) .diff else .shell;
+                const header: []const u8 = if (msg.tool_header.len > 0)
+                    msg.tool_header
+                else
+                    self.materializeToolHeader(a, row, msg.entry_kind, null);
+                const raw = toolDisplayBody(row.content, row.tool_display, row.is_error != 0);
+                const max_lines: usize = if (tb_kind == .diff) 40 else 20;
+                const capped = capBlockBody(self.allocator, raw, max_lines) catch null;
+                defer if (capped) |c| self.allocator.free(c);
+                const body: []const u8 = if (capped) |c| c else raw;
+                msg.content = std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ header, body }) catch return false;
+                msg.tool_block = tb_kind;
+                msg.tool_error = row.is_error != 0;
+                if (msg.tool_header.len == 0) msg.tool_header = self.allocator.dupe(u8, header) catch "";
+            },
+            .call_line => {
+                const header: []const u8 = if (msg.tool_header.len > 0)
+                    msg.tool_header
+                else
+                    self.materializeToolHeader(a, row, .call_line, null);
+                if (row.is_error == 0) {
+                    const summary = toolResultSummary(a, row.content, false) catch "";
+                    msg.content = if (summary.len > 0)
+                        (std.fmt.allocPrint(self.allocator, "{s} ({s})", .{ header, summary }) catch return false)
+                    else
+                        (self.allocator.dupe(u8, header) catch return false);
+                } else {
+                    msg.content = self.allocator.dupe(u8, header) catch return false;
+                }
+                if (msg.tool_header.len == 0) msg.tool_header = self.allocator.dupe(u8, header) catch "";
+            },
+            .fail_line => {
+                const summary = toolResultSummary(a, row.content, true) catch "";
+                var buf: [320]u8 = undefined;
+                const line = std.fmt.bufPrint(&buf, "↳ 失败{s}{s}", .{
+                    if (summary.len > 0) " · " else "",
+                    summary,
+                }) catch "↳ 失败";
+                msg.content = self.allocator.dupe(u8, line) catch return false;
+            },
+            .text => {
+                if (msg.user) {
+                    msg.content = self.allocator.dupe(u8, row.content) catch return false;
+                } else {
+                    // assistant / summary：正文（摘要行剥包装）+ 思考
+                    const body = if (std.mem.eql(u8, row.role, "summary"))
+                        checkpointBody(row.content)
+                    else
+                        row.content;
+                    if (body.len > 0) {
+                        const owned = self.allocator.dupe(u8, body) catch return false;
+                        msg.content = owned;
+                        msg.md = md_mod.parse(self.allocator, owned, md_mod.default_styles) catch null;
+                    }
+                    if (row.reasoning.len > 0) {
+                        msg.reasoning = self.allocator.dupe(u8, row.reasoning) catch null;
+                    }
+                }
+            },
         }
         msg.content_loaded = true;
+        msg.is_shell = false;
         msg.row_count_width = 0; // 让行数缓存按重载后的内容重算
         _ = width;
         return true;
@@ -1520,16 +1595,11 @@ const AppState = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        // 工具调用索引：id → 名称/参数（在 tool 行重建工具块时需要参数生成标题）。
+        // 工具调用索引：id → 名称/参数（在 tool 行重建工具块/调用行时需要参数生成标题）。
         // 哈希表：长会话（上万行）下逐行线性扫描是 O(n²)（实测 15.8k 行 ~95ms
         // 仅此处），查表把这段降到 O(n)。
-        const CallIdx = struct { name: []const u8, arguments: []const u8 };
-        var call_idx = std.StringHashMapUnmanaged(CallIdx){};
+        var call_idx = std.StringHashMapUnmanaged(ToolCallArgs){};
         defer call_idx.deinit(arena);
-
-        // 非块工具的调用行消息下标：id → msg_idx（结果到达后回填大小统计）
-        var call_lines = std.StringHashMapUnmanaged(usize){};
-        defer call_lines.deinit(arena);
 
         // 政策A：请求前缀 = 程序当前的 system_prompt（打开/重建时只前置这一次）
         if (prepend_system) self.appendHistory("system", system_prompt);
@@ -1619,7 +1689,6 @@ const AppState = struct {
                 // 找到对应的调用（优先用落库的工具名，参数从调用索引取）
                 var name: []const u8 = row.tool_name;
                 var args: []const u8 = "";
-                var line_idx: ?usize = null;
                 if (call_idx.get(row.tool_call_id)) |ci| {
                     args = ci.arguments;
                     if (name.len == 0) name = ci.name;
@@ -1638,8 +1707,17 @@ const AppState = struct {
                         }
                     }
                 }
-                line_idx = call_lines.get(row.tool_call_id);
-                if (with_display) addLoadedToolDisplay(self, arena, name, args, line_idx, row);
+                if (with_display) {
+                    const kind = entryKindForToolRow(row);
+                    if (name.len == 0) name = "tool";
+                    if (kind == .call_line) {
+                        const header = formatToolCallLine(arena, name, args);
+                        self.appendCallLineEntry(row, header, header);
+                    } else {
+                        const header = toolHeaderText(arena, name, args) orelse name;
+                        self.appendBlockEntry(row, kind, header);
+                    }
+                }
                 continue;
             }
 
@@ -1653,7 +1731,7 @@ const AppState = struct {
                         .db_id = row.id,
                     });
                 }
-                // 先恢复正文，再补工具提示行/块（与实时渲染顺序一致）
+                // 先恢复正文（工具提示行/块由对应的 tool 行生成，与流式渲染顺序一致）
                 if (with_display) self.addLoadedAssistantMessage(row.content, row.reasoning, row.reasoning_ms, row.id);
                 if (calls) |cs| {
                     for (cs) |c| {
@@ -1661,15 +1739,6 @@ const AppState = struct {
                         if (call_idx.getOrPut(arena, c.id)) |gop| {
                             if (!gop.found_existing) gop.value_ptr.* = .{ .name = c.name, .arguments = c.arguments };
                         } else |_| {}
-                        // 块类工具（bash/edit）在对应的 tool 行重建；其余在此出一行提示
-                        if (toolBlockKind(c.name) == null) {
-                            if (with_display) addLoadedToolCallNote(self, arena, c.name, c.arguments);
-                            if (with_display and self.messages.items.len > 0) {
-                                if (call_lines.getOrPut(arena, c.id)) |gl| {
-                                    if (!gl.found_existing) gl.value_ptr.* = self.messages.items.len - 1;
-                                } else |_| {}
-                            }
-                        }
                     }
                 }
                 continue;
@@ -1716,6 +1785,7 @@ const AppState = struct {
             .reasoning = owned_reasoning,
             .reasoning_ms = reasoning_ms,
             .db_id = db_id,
+            .entry_kind = .text,
         }) catch {
             if (owned_content.len > 0) self.allocator.free(owned_content);
             if (parsed) |md| md_mod.free(self.allocator, md);
@@ -1725,7 +1795,9 @@ const AppState = struct {
         self.scroll_offset = 0;
     }
 
-    /// 加载会话内容（含 compaction checkpoint；会清空当前历史/显示）
+    /// 加载会话内容（含 compaction checkpoint；会清空当前历史/显示）。
+    /// TUI（windowing_enabled）走懒加载：元数据 + 尾部物化，内容按需加载；
+    /// 其余（CLI/测试/元数据不可用）走全量路径。
     fn loadSessionContent(self: *AppState, session_id: i64) void {
         const db = if (self.db) |*d| d else return;
         // 大结果集用临时 arena 承接，处理完立即整体释放：
@@ -1733,6 +1805,17 @@ const AppState = struct {
         // 长会话每次加载都会把全部行永久滞留其中
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
+        const checkpoint = db.latestCompaction(session_id) catch null;
+        const compactions = db.listCompactions(scratch.allocator(), session_id) catch &.{};
+
+        // 懒加载（TUI）：只读元数据（覆盖索引，不碰内容页）+ 尾部窗口物化
+        if (self.windowing_enabled) {
+            if (db.loadDisplayMeta(scratch.allocator(), session_id)) |meta| {
+                self.loadSessionLazy(session_id, meta, checkpoint, compactions);
+                return;
+            } else |_| {}
+        }
+
         const rows = db.loadMessagesWith(scratch.allocator(), session_id) catch {
             self.addMessage("加载会话失败", .{ .fg = .red });
             return;
@@ -1745,8 +1828,6 @@ const AppState = struct {
         // 记录"上次访问"：下次启动时自动恢复该会话
         db.touchSession(session_id) catch {};
         self.last_seen_msg_id = 0;
-        const checkpoint = db.latestCompaction(session_id) catch null;
-        const compactions = db.listCompactions(scratch.allocator(), session_id) catch &.{};
         self.last_compaction_id = if (checkpoint) |c| c.id else 0;
         if (rows.len == 0 and checkpoint == null) {
             // 空会话：历史 = 当前提示词（与新建一致），并刷新估算显示
@@ -1756,6 +1837,339 @@ const AppState = struct {
         }
         self.applyLoadedMessagesWithCheckpoint(rows, checkpoint, compactions, true, true);
         Log.info(.startup, "加载会话 {d}: {d} 行, checkpoint={}", .{ session_id, rows.len, checkpoint != null });
+    }
+
+    /// 懒加载显示路径（TUI）：加载耗时/内存不随会话增长。
+    /// - 历史：摘要行 + 保留区（与全量路径一致）；
+    /// - 显示：按元数据逐行建条目，尾部窗口（lazy_materialize_lines 行以内）
+    ///   完整构建，其余为壳（估算行高），滚入视口时经 reloadMessage 物化。
+    fn loadSessionLazy(
+        self: *AppState,
+        session_id: i64,
+        meta: []const db_mod.DisplayMetaRow,
+        checkpoint: ?db_mod.CompactionRow,
+        compactions: []const db_mod.CompactionRow,
+    ) void {
+        const db = if (self.db) |*d| d else return;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+
+        const tail_lo: i64 = if (checkpoint) |c| c.tail_start_id else 0;
+        const tail_rows = db.loadMessagesRange(a, session_id, tail_lo, std.math.maxInt(i64)) catch &.{};
+        const summary_rows = db.loadSummaryRows(a, session_id) catch &.{};
+
+        self.clearHistory();
+        self.clearDisplay();
+        self.clearSelection();
+        self.clearPendingSends();
+        self.session_id = session_id;
+        db.touchSession(session_id) catch {};
+        self.last_seen_msg_id = 0;
+        self.last_compaction_id = if (checkpoint) |c| c.id else 0;
+
+        if (meta.len == 0 and checkpoint == null) {
+            self.appendHistory("system", system_prompt);
+            self.refreshEstimatedUsage();
+            return;
+        }
+
+        // 历史：摘要行（供摘要文本解析）+ 保留区。摘要行 id 均 < tail_start，拼接后仍升序
+        var combined = std.ArrayListUnmanaged(db_mod.MessageRow){ .items = &.{}, .capacity = 0 };
+        combined.appendSlice(a, summary_rows) catch {};
+        combined.appendSlice(a, tail_rows) catch {};
+        self.applyLoadedMessagesWithCheckpoint(combined.items, checkpoint, compactions, false, true);
+
+        // 显示：元数据驱动（尾部物化 + 壳）
+        self.buildDisplayFromMeta(meta, tail_rows, summary_rows, compactions);
+        Log.info(.startup, "加载会话 {d}: {d} 行（懒加载）", .{ session_id, meta.len });
+    }
+
+    /// 按元数据构建显示条目（懒加载）：尾部窗口物化，其余为壳。
+    fn buildDisplayFromMeta(
+        self: *AppState,
+        meta: []const db_mod.DisplayMetaRow,
+        tail_rows: []const db_mod.MessageRow,
+        summary_rows: []const db_mod.MessageRow,
+        compactions: []const db_mod.CompactionRow,
+    ) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // 尾部行的 id → 行（物化时取内容/参数）
+        var tail_by_id = std.AutoHashMapUnmanaged(i64, *const db_mod.MessageRow){};
+        defer tail_by_id.deinit(arena);
+        for (tail_rows) |*r| tail_by_id.put(arena, r.id, r) catch {};
+        var summary_by_id = std.AutoHashMapUnmanaged(i64, *const db_mod.MessageRow){};
+        defer summary_by_id.deinit(arena);
+        for (summary_rows) |*r| summary_by_id.put(arena, r.id, r) catch {};
+
+        // 尾部工具行的参数索引：call_id → (name, arguments)（物化块/调用行时生成标题）
+        var call_idx = std.StringHashMapUnmanaged(ToolCallArgs){};
+        defer call_idx.deinit(arena);
+        for (tail_rows) |row| {
+            if (!std.mem.eql(u8, row.role, "assistant")) continue;
+            if (row.tool_calls.len == 0) continue;
+            const calls = parseToolCalls(arena, row.tool_calls) orelse continue;
+            for (calls) |c| {
+                if (call_idx.getOrPut(arena, c.id)) |gop| {
+                    if (!gop.found_existing) gop.value_ptr.* = .{ .name = c.name, .arguments = c.arguments };
+                } else |_| {}
+            }
+        }
+
+        // 物化阈值：从尾往前累计估算行数（屏幕宽度未知时按 80 列估），
+        // 到 lazy_materialize_lines 行止；这些条目完整构建，其余建壳。
+        var materialize_from: usize = meta.len;
+        {
+            var acc: usize = 0;
+            var i: usize = meta.len;
+            while (i > 0) {
+                i -= 1;
+                const m = meta[i];
+                acc += estimateShellRows(
+                    @intCast(@max(m.disp_bytes, 0)),
+                    @intCast(@max(m.disp_lines, 0)),
+                    entryKindFromDispKind(m.disp_kind),
+                    80,
+                    m.has_reasoning != 0,
+                ) + 1;
+                if (acc >= lazy_materialize_lines) {
+                    materialize_from = i;
+                    break;
+                }
+            }
+        }
+
+        for (meta, 0..) |m, i| {
+            const in_window = i >= materialize_from;
+            const role = m.role;
+            if (std.mem.eql(u8, role, "summary")) {
+                // 压缩摘要行：黄标题（极小，常驻 db_id=0）+ 摘要正文条目
+                var notice_buf: [256]u8 = undefined;
+                var tokens_before: i64 = 0;
+                var summarized: usize = 0;
+                for (compactions) |cp| {
+                    if (cp.summary_message_id == m.id) {
+                        tokens_before = cp.tokens_before;
+                        for (meta) |mm| {
+                            if (mm.id < cp.tail_start_id) summarized += 1;
+                        }
+                        break;
+                    }
+                }
+                const header = formatCompactionNotice(
+                    &notice_buf,
+                    summarized,
+                    @intCast(@max(m.disp_bytes, 0)),
+                    @intCast(@max(tokens_before, 0)),
+                );
+                self.addMessage(header, .{ .fg = busy_accent });
+                if (in_window and summary_by_id.get(m.id) != null) {
+                    const row = summary_by_id.get(m.id).?;
+                    self.addLoadedAssistantMessage(checkpointBody(row.content), row.reasoning, row.reasoning_ms, m.id);
+                    self.markLastEntry(.text);
+                } else {
+                    self.appendShellEntry(m, .text, false);
+                }
+                continue;
+            }
+
+            if (std.mem.eql(u8, role, "tool")) {
+                const kind = entryKindFromDispKind(m.disp_kind);
+                if (kind == .call_line) {
+                    // 调用行（+ 错误时的失败行）；批次外/缺失时回退建壳（可后续物化）
+                    if (in_window and tail_by_id.get(m.id) != null) {
+                        const row = tail_by_id.get(m.id).?;
+                        const header = self.materializeToolHeader(arena, row.*, .call_line, &call_idx);
+                        self.appendCallLineEntry(row.*, header, header);
+                    } else {
+                        self.appendShellEntry(m, .call_line, false);
+                        if (m.is_error != 0) self.appendShellEntry(m, .fail_line, false);
+                    }
+                } else {
+                    // 块（bash/edit）
+                    if (in_window and tail_by_id.get(m.id) != null) {
+                        const row = tail_by_id.get(m.id).?;
+                        const header = self.materializeToolHeader(arena, row.*, kind, &call_idx);
+                        self.appendBlockEntry(row.*, kind, header);
+                    } else {
+                        self.appendShellEntry(m, kind, false);
+                    }
+                }
+                continue;
+            }
+
+            if (std.mem.eql(u8, role, "assistant")) {
+                // 纯工具调用轮（无正文也无思考）不建条目（与全量路径一致）
+                if (m.disp_bytes == 0 and m.has_reasoning == 0) continue;
+                if (in_window and tail_by_id.get(m.id) != null) {
+                    const row = tail_by_id.get(m.id).?;
+                    self.addLoadedAssistantMessage(row.content, row.reasoning, row.reasoning_ms, m.id);
+                    self.markLastEntry(.text);
+                } else {
+                    self.appendShellEntry(m, .text, false);
+                }
+                continue;
+            }
+
+            // user 及其他角色
+            if (m.disp_bytes == 0) continue;
+            if (in_window and tail_by_id.get(m.id) != null) {
+                const row = tail_by_id.get(m.id).?;
+                self.addUserMessageDb(row.content, m.id);
+                self.markLastEntry(.text);
+            } else {
+                self.appendShellEntry(m, .text, std.mem.eql(u8, role, "user"));
+            }
+        }
+        self.scroll_offset = 0;
+    }
+
+    /// 给最后一条显示条目标记类型（物化路径用；无条目时忽略）
+    fn markLastEntry(self: *AppState, kind: EntryKind) void {
+        if (self.messages.items.len == 0) return;
+        self.messages.items[self.messages.items.len - 1].entry_kind = kind;
+    }
+
+    /// 追加一个壳条目（未物化；行高由元数据估算，滚入视口时 reloadMessage 物化）
+    fn appendShellEntry(self: *AppState, m: db_mod.DisplayMetaRow, kind: EntryKind, user: bool) void {
+        const style: Style = if (user)
+            .{ .fg = .green }
+        else if (kind == .call_line)
+            tool_call_style
+        else if (kind == .fail_line)
+            .{ .fg = .red }
+        else
+            .{ .fg = .white };
+        self.messages.append(self.allocator, .{
+            .content = "",
+            .style = style,
+            .user = user,
+            .db_id = m.id,
+            .content_loaded = false,
+            .entry_kind = kind,
+            .is_shell = true,
+            .shell_bytes = @intCast(@max(m.disp_bytes, 0)),
+            .shell_lines = @intCast(@max(m.disp_lines, 0)),
+            .shell_thought = m.has_reasoning != 0,
+            .reasoning_ms = m.reasoning_ms,
+        }) catch {};
+    }
+
+    /// 物化工具行的标题：优先用尾部批次的参数索引，回退到库内反查（压缩区分界等）。
+    /// call_idx 为 null 时直接走库内反查（reloadMessage 的单条物化路径）。
+    fn materializeToolHeader(
+        self: *AppState,
+        arena: Allocator,
+        row: db_mod.MessageRow,
+        kind: EntryKind,
+        call_idx: ?*std.StringHashMapUnmanaged(ToolCallArgs),
+    ) []const u8 {
+        var name: []const u8 = row.tool_name;
+        var args: []const u8 = "";
+        if (call_idx) |idx| {
+            if (idx.get(row.tool_call_id)) |ci| {
+                args = ci.arguments;
+                if (name.len == 0) name = ci.name;
+            } else {
+                args = self.lookupToolArgs(arena, row);
+            }
+        } else {
+            args = self.lookupToolArgs(arena, row);
+        }
+        if (name.len == 0) name = "tool";
+        if (kind == .call_line) return formatToolCallLine(arena, name, args);
+        return toolHeaderText(arena, name, args) orelse name;
+    }
+
+    /// 库内反查工具调用的参数（懒加载物化块/调用行时生成标题用）；失败返回空串
+    fn lookupToolArgs(self: *AppState, arena: Allocator, row: db_mod.MessageRow) []const u8 {
+        const db = if (self.db) |*d| d else return "";
+        const prev = (db.findPrevAssistantToolCalls(arena, self.session_id, row.id) catch null) orelse return "";
+        const calls = parseToolCalls(arena, prev.tool_calls) orelse return "";
+        for (calls) |c| {
+            if (std.mem.eql(u8, c.id, row.tool_call_id)) return c.arguments;
+        }
+        return "";
+    }
+
+    /// 物化一条块工具条目（bash/edit）：标题 + 截断正文
+    fn appendBlockEntry(self: *AppState, row: db_mod.MessageRow, kind: EntryKind, header: []const u8) void {
+        const tb_kind: ToolBlockKind = if (kind == .diff_block) .diff else .shell;
+        const raw = toolDisplayBody(row.content, row.tool_display, row.is_error != 0);
+        const max_lines: usize = if (tb_kind == .diff) 40 else 20;
+        const capped = capBlockBody(self.allocator, raw, max_lines) catch null;
+        defer if (capped) |c| self.allocator.free(c);
+        const body: []const u8 = if (capped) |c| c else raw;
+        const joined = std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ header, body }) catch return;
+        const header_owned = self.allocator.dupe(u8, header) catch null;
+        self.messages.append(self.allocator, .{
+            .content = joined,
+            .style = .{ .fg = .white },
+            .tool_block = tb_kind,
+            .tool_error = row.is_error != 0,
+            .db_id = row.id,
+            .tool_header = if (header_owned) |h| h else "",
+            .entry_kind = kind,
+        }) catch {
+            self.allocator.free(joined);
+            if (header_owned) |h| self.allocator.free(h);
+        };
+    }
+
+    /// 物化一条非块工具调用行（成功带结果摘要后缀）；错误时另补一条红色失败行
+    fn appendCallLineEntry(self: *AppState, row: db_mod.MessageRow, header: []const u8, header_keep: []const u8) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        if (row.is_error == 0) {
+            const summary = toolResultSummary(a, row.content, false) catch "";
+            const content = if (summary.len > 0)
+                (std.fmt.allocPrint(self.allocator, "{s} ({s})", .{ header, summary }) catch return)
+            else
+                (self.allocator.dupe(u8, header) catch return);
+            const header_owned = self.allocator.dupe(u8, header_keep) catch null;
+            self.messages.append(self.allocator, .{
+                .content = content,
+                .style = tool_call_style,
+                .db_id = row.id,
+                .tool_header = if (header_owned) |h| h else "",
+                .entry_kind = .call_line,
+            }) catch {
+                self.allocator.free(content);
+                if (header_owned) |h| self.allocator.free(h);
+            };
+            return;
+        }
+        // 失败：调用行（不带摘要）+ 红色失败行
+        const content = self.allocator.dupe(u8, header) catch return;
+        const header_owned = self.allocator.dupe(u8, header_keep) catch null;
+        self.messages.append(self.allocator, .{
+            .content = content,
+            .style = tool_call_style,
+            .db_id = row.id,
+            .tool_header = if (header_owned) |h| h else "",
+            .entry_kind = .call_line,
+        }) catch {
+            self.allocator.free(content);
+            if (header_owned) |h| self.allocator.free(h);
+            return;
+        };
+        const summary = toolResultSummary(a, row.content, true) catch "";
+        var buf: [320]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "↳ 失败{s}{s}", .{
+            if (summary.len > 0) " · " else "",
+            summary,
+        }) catch "↳ 失败";
+        const fail_content = self.allocator.dupe(u8, line) catch return;
+        self.messages.append(self.allocator, .{
+            .content = fail_content,
+            .style = .{ .fg = .red },
+            .db_id = row.id,
+            .entry_kind = .fail_line,
+        }) catch self.allocator.free(fail_content);
     }
 
     /// 仅重建内存历史（不动显示）：工具循环中途压缩后让主线程与 DB 对齐
@@ -2668,6 +3082,11 @@ const AppState = struct {
         var buf: [512]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
         self.addStreamMessage(line, style);
+        // 失败行：窗口化重载按失败行形态重建（与调用行同 db_id）
+        if (self.messages.items.len > 0) {
+            const msg = &self.messages.items[self.messages.items.len - 1];
+            if (!msg.user and msg.md == null and msg.tool_block == null) msg.entry_kind = .fail_line;
+        }
     }
 
     /// 向指定提示行追加后缀（工具结果统计，如 ` (3.0KB)`）
@@ -2710,6 +3129,7 @@ const AppState = struct {
             .style = .{ .fg = .white },
             .tool_block = kind,
             .tool_header = header_owned,
+            .entry_kind = if (kind == .diff) .diff_block else .shell_block,
         }) catch {
             self.allocator.free(owned);
             if (header_owned.len > 0) self.allocator.free(header_owned);
@@ -2725,6 +3145,8 @@ const AppState = struct {
         const msg = &self.messages.items[self.messages.items.len - 1];
         if (msg.tool_header.len > 0) self.allocator.free(msg.tool_header);
         msg.tool_header = self.allocator.dupe(u8, line) catch "";
+        // 该行是工具调用行（非块）：物化/重载按调用行形态重建
+        if (msg.entry_kind == .text and msg.tool_block == null and !msg.user) msg.entry_kind = .call_line;
     }
 
     /// 向最近的工具块追加正文（bash 输出 / diff）；失败返回 false
@@ -5838,6 +6260,8 @@ pub fn main(init: std.process.Init) !u8 {
 
     // 无界面子命令（ask/new/sessions/messages/help）：不初始化终端，直接执行后退出
     var tui_db_path: []const u8 = "skynet.db";
+    var tui_db_path_owned: ?[]u8 = null;
+    defer if (tui_db_path_owned) |p| allocator.free(p);
     {
         var arg_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
         defer arg_it.deinit();
@@ -5848,10 +6272,16 @@ pub fn main(init: std.process.Init) !u8 {
         if (arg_list.items.len > 0 and isCliCommand(arg_list.items[0])) {
             std.process.exit(runCli(init, arg_list.items));
         }
-        // TUI 分支：同样解析 -db（与 CLI 子命令一致；默认 skynet.db）
+        // TUI 分支：同样解析 -db（与 CLI 子命令一致；默认 skynet.db）。
+        // 参数切片归属 arg_it（块结束即释放）——必须复制到长生命周期内存。
         if (arg_list.items.len > 0) {
             if (cli.parseCliArgs(arg_list.items)) |parsed| {
-                if (parsed.db_path.len > 0) tui_db_path = parsed.db_path;
+                if (parsed.db_path.len > 0 and !std.mem.eql(u8, parsed.db_path, "skynet.db")) {
+                    if (allocator.dupe(u8, parsed.db_path)) |copy| {
+                        tui_db_path_owned = copy;
+                        tui_db_path = copy;
+                    } else |_| {}
+                }
             }
         }
     }
@@ -5911,6 +6341,9 @@ pub fn main(init: std.process.Init) !u8 {
         }
     else
         null;
+    // 窗口化/懒加载：长会话只物化视口附近的消息内容（见 updateMessageWindow /
+    // loadSessionLazy）。必须在 loadSessionContent 之前打开，否则会走全量加载路径。
+    state.windowing_enabled = true;
     if (state.db) |*db| {
         const latest = db.latestSession() catch null;
         if (latest) |s| {
@@ -5925,8 +6358,6 @@ pub fn main(init: std.process.Init) !u8 {
     }
     // 启动即显示上下文估算（加载路径里也会刷新）
     state.refreshEstimatedUsage();
-    // 窗口化：长会话只驻留视口附近的消息内容（见 updateMessageWindow）
-    state.windowing_enabled = true;
     Log.info(.startup, "TUI 启动 db={s} session={d} provider={s} model={s}", .{
         if (state.db != null) "ok" else "memory",
         state.session_id,
@@ -6336,61 +6767,11 @@ fn addLoadedToolDisplay(self: *AppState, arena: Allocator, name: []const u8, arg
     self.addMessage(line, .{ .fg = .red });
 }
 
-/// 工具 → 块渲染类型（仅 bash/edit 使用块渲染）
-fn toolBlockKind(name: []const u8) ?ToolBlockKind {
-    if (std.mem.eql(u8, name, "bash")) return .shell;
-    if (std.mem.eql(u8, name, "edit")) return .diff;
-    return null;
-}
+/// 工具 → 块渲染类型：见 display.zig 的 toolBlockKind（此处仅保留注释占位）
 
-/// 从参数 JSON 中取字符串字段
-fn extractJsonString(arena: Allocator, args_json: []const u8, field: []const u8) ?[]const u8 {
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return null;
-    const obj = switch (parsed) {
-        .object => |o| o,
-        else => return null,
-    };
-    const v = obj.get(field) orelse return null;
-    return switch (v) {
-        .string => |s| s,
-        else => null,
-    };
-}
+// （extractJsonString / extractJsonInt / extractJsonBool 已迁至 display.zig）
 
-/// 从参数 JSON 中取整数字段
-fn extractJsonInt(arena: Allocator, args_json: []const u8, field: []const u8) ?i64 {
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return null;
-    const obj = switch (parsed) {
-        .object => |o| o,
-        else => return null,
-    };
-    const v = obj.get(field) orelse return null;
-    return switch (v) {
-        .integer => |n| n,
-        .float => |f| @intFromFloat(f),
-        else => null,
-    };
-}
-
-/// 从参数 JSON 中取布尔字段
-fn extractJsonBool(arena: Allocator, args_json: []const u8, field: []const u8) bool {
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return false;
-    const obj = switch (parsed) {
-        .object => |o| o,
-        else => return false,
-    };
-    const v = obj.get(field) orelse return false;
-    return switch (v) {
-        .bool => |b| b,
-        else => false,
-    };
-}
-
-fn formatBytes(buf: []u8, len: usize) []const u8 {
-    if (len < 1024) return std.fmt.bufPrint(buf, "{d}B", .{len}) catch "?";
-    const kb100 = (len * 10) / 1024;
-    return std.fmt.bufPrint(buf, "{d}.{d}KB", .{ kb100 / 10, kb100 % 10 }) catch "?";
-}
+// （formatBytes 已迁至 display.zig）
 
 /// token 数量的紧凑显示（1.2k / 3.4M）
 fn formatCount(buf: []u8, n: u64) []const u8 {
@@ -6552,103 +6933,16 @@ fn cacheHitPercent(cached: u64, input: u64) u64 {
     return @min(cached * 100 / input, 100);
 }
 
-fn appendToolOpt(allocator: Allocator, list: *std.ArrayListUnmanaged(u8), comptime fmt: []const u8, args: anytype) void {
-    if (list.items.len > 0) list.appendSlice(allocator, ", ") catch return;
-    var buf: [256]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    list.appendSlice(allocator, s) catch {};
-}
+// （appendToolOpt / formatToolCallLine / toolHeaderText 已迁至 display.zig）
 
-/// 工具调用单行描述（`→ Read path [limit=.., offset=..]`）
-fn formatToolCallLine(arena: Allocator, name: []const u8, args_json: []const u8) []const u8 {
-    if (std.mem.eql(u8, name, "read")) {
-        const path = extractJsonString(arena, args_json, "path") orelse return "→ Read";
-        const offset = extractJsonInt(arena, args_json, "offset") orelse 0;
-        const limit = extractJsonInt(arena, args_json, "limit") orelse 0;
-        if (limit <= 0 and offset <= 0) return std.fmt.allocPrint(arena, "→ Read {s}", .{path}) catch "→ Read";
-        var opts = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
-        if (limit > 0) appendToolOpt(arena, &opts, "limit={d}", .{limit});
-        if (offset > 0) appendToolOpt(arena, &opts, "offset={d}", .{offset});
-        return std.fmt.allocPrint(arena, "→ Read {s} [{s}]", .{ path, opts.items }) catch "→ Read";
-    }
-    if (std.mem.eql(u8, name, "grep")) {
-        const pattern = extractJsonString(arena, args_json, "pattern") orelse return "→ Grep";
-        const path = extractJsonString(arena, args_json, "path") orelse "";
-        const glob = extractJsonString(arena, args_json, "glob") orelse "";
-        const ignore_case = extractJsonBool(arena, args_json, "ignore_case");
-        const literal = extractJsonBool(arena, args_json, "literal");
-        var opts = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
-        if (path.len > 0 and !std.mem.eql(u8, path, ".")) appendToolOpt(arena, &opts, "path={s}", .{path});
-        if (glob.len > 0) appendToolOpt(arena, &opts, "glob={s}", .{glob});
-        if (ignore_case) appendToolOpt(arena, &opts, "ignore_case", .{});
-        if (literal) appendToolOpt(arena, &opts, "literal", .{});
-        if (opts.items.len == 0) return std.fmt.allocPrint(arena, "→ Grep \"{s}\"", .{pattern}) catch "→ Grep";
-        return std.fmt.allocPrint(arena, "→ Grep \"{s}\" [{s}]", .{ pattern, opts.items }) catch "→ Grep";
-    }
-    if (std.mem.eql(u8, name, "find")) {
-        const pattern = extractJsonString(arena, args_json, "pattern") orelse return "→ Find";
-        const path = extractJsonString(arena, args_json, "path") orelse "";
-        if (path.len == 0 or std.mem.eql(u8, path, ".")) return std.fmt.allocPrint(arena, "→ Find {s}", .{pattern}) catch "→ Find";
-        return std.fmt.allocPrint(arena, "→ Find {s} [path={s}]", .{ pattern, path }) catch "→ Find";
-    }
-    if (std.mem.eql(u8, name, "ls")) {
-        const path = extractJsonString(arena, args_json, "path") orelse "";
-        if (path.len == 0) return "→ List .";
-        return std.fmt.allocPrint(arena, "→ List {s}", .{path}) catch "→ List";
-    }
-    if (std.mem.eql(u8, name, "write")) {
-        const path = extractJsonString(arena, args_json, "path") orelse return "→ Write";
-        const content = extractJsonString(arena, args_json, "content") orelse "";
-        var size_buf: [32]u8 = undefined;
-        return std.fmt.allocPrint(arena, "→ Write {s} ({s})", .{ path, formatBytes(&size_buf, content.len) }) catch "→ Write";
-    }
-
-    // 未知工具：退化为参数摘要
-    const summary = summarizeToolArgs(arena, args_json) catch "";
-    if (summary.len == 0) return std.fmt.allocPrint(arena, "→ {s}", .{name}) catch "→ ?";
-    return std.fmt.allocPrint(arena, "→ {s}: {s}", .{ name, summary }) catch "→ ?";
-}
+// （formatToolCallLine 已迁至 display.zig）
 
 /// 工具调用行样式（橙色）
 const tool_call_style = Style{ .fg = .{ .rgb = .{ .r = 235, .g = 155, .b = 60 } } };
 
-/// 块标题行：`$ 命令` / `← Edit 路径`
-fn toolHeaderText(arena: Allocator, name: []const u8, args_json: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, name, "bash")) {
-        const cmd = extractJsonString(arena, args_json, "command") orelse return null;
-        return std.fmt.allocPrint(arena, "$ {s}", .{cmd}) catch null;
-    }
-    if (std.mem.eql(u8, name, "edit")) {
-        const path = extractJsonString(arena, args_json, "path") orelse return null;
-        return std.fmt.allocPrint(arena, "← Edit {s}", .{path}) catch null;
-    }
-    return null;
-}
+// （toolHeaderText 已迁至 display.zig）
 
-/// 截断块正文到 max_lines 行，超出用 `…` 收尾
-fn capBlockBody(allocator: Allocator, body: []const u8, max_lines: usize) error{OutOfMemory}![]u8 {
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
-    errdefer out.deinit(allocator);
-    var i: usize = 0;
-    var shown: usize = 0;
-    var truncated = false;
-    while (i < body.len) {
-        const nl = std.mem.indexOfScalarPos(u8, body, i, '\n');
-        const end = nl orelse body.len;
-        if (shown >= max_lines) {
-            truncated = true;
-            break;
-        }
-        try out.appendSlice(allocator, body[i..end]);
-        try out.append(allocator, '\n');
-        shown += 1;
-        if (nl == null) break;
-        i = end + 1;
-    }
-    if (truncated) try out.appendSlice(allocator, "     …");
-    while (out.items.len > 0 and out.items[out.items.len - 1] == '\n') out.items.len -= 1;
-    return out.toOwnedSlice(allocator);
-}
+// （capBlockBody 已迁至 display.zig）
 
 /// 工具块按 '\n' 取一行（不自动换行）
 fn nextBlockLine(content: []const u8, pos: *usize) ?[]const u8 {
@@ -6840,64 +7134,11 @@ fn appendAssistantTurn(job: *StreamJob, arena: Allocator, calls: []const ai.Tool
     job.turn_flushed = true;
 }
 
-/// 工具调用参数摘要（key=value 形式，截断到 ~120 字符）
-fn summarizeToolArgs(arena: Allocator, args_json: []const u8) error{OutOfMemory}![]const u8 {
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return "";
-    const obj = switch (parsed) {
-        .object => |o| o,
-        else => return "",
-    };
+// （summarizeToolArgs 已迁至 display.zig）
 
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
-    var it = obj.iterator();
-    var first = true;
-    while (it.next()) |entry| {
-        if (!first) try out.appendSlice(arena, ", ");
-        first = false;
-        try out.appendSlice(arena, entry.key_ptr.*);
-        try out.append(arena, '=');
-        switch (entry.value_ptr.*) {
-            .string => |s| try out.appendSlice(arena, s),
-            .integer => |n| try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{n})),
-            .float => |f| try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{f})),
-            .bool => |b| try out.appendSlice(arena, if (b) "true" else "false"),
-            .null => try out.appendSlice(arena, "null"),
-            else => try out.appendSlice(arena, "…"),
-        }
-        if (out.items.len > 120) break;
-    }
-    // 按 UTF-8 边界截断
-    var width: usize = 0;
-    var i: usize = 0;
-    while (i < out.items.len) {
-        const n = std.unicode.utf8ByteSequenceLength(out.items[i]) catch 1;
-        if (i + n > out.items.len) break;
-        width += 1;
-        i += n;
-        if (width > 120) break;
-    }
-    return out.items[0..i];
-}
-
-/// 工具结果摘要（错误取首行，成功给大小）
+/// 工具结果摘要（错误取首行，成功给大小）——转发到 display.zig
 fn summarizeToolResult(arena: Allocator, result: tools_mod.Result) error{OutOfMemory}![]const u8 {
-    const nl = std.mem.indexOfScalar(u8, result.content, '\n') orelse result.content.len;
-    if (result.is_error) {
-        var line = result.content[0..nl];
-        var width: usize = 0;
-        var i: usize = 0;
-        while (i < line.len) {
-            const n = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
-            if (i + n > line.len) break;
-            width += 1;
-            i += n;
-            if (width > 80) break;
-        }
-        line = line[0..i];
-        return std.fmt.allocPrint(arena, "{s}", .{line});
-    }
-    var size_buf: [32]u8 = undefined;
-    return std.fmt.allocPrint(arena, "{s}", .{formatBytes(&size_buf, result.content.len)});
+    return toolResultSummary(arena, result.content, result.is_error);
 }
 
 /// 事件入队（线程安全）
@@ -7559,7 +7800,18 @@ fn messageRowCountCached(msg: *Message, width: usize) usize {
     // 已卸载（窗口化）：行数是唯一真相（卸载时已固化）。宽度变化后该值可能
     // 略有偏差（近似），但消息一旦进入视口就会被重载并重算，自愈。
     // 不做"宽度变化就全量重载"——交互式调整窗口大小时会每帧触发全量重载。
-    if (!msg.content_loaded) return msg.row_count;
+    if (!msg.content_loaded) {
+        // 懒加载壳（从未物化）：按元数据估算行高（宽度相关，按宽度缓存）。
+        // 物化后 is_shell=false，之后的卸载走"冻结真实行数"（与窗口化既有行为一致）。
+        if (msg.is_shell) {
+            if (msg.row_count_width != width) {
+                msg.row_count = estimateShellRows(msg.shell_bytes, msg.shell_lines, msg.entry_kind, width, msg.shell_thought);
+                msg.row_count_width = width;
+            }
+            return msg.row_count;
+        }
+        return msg.row_count;
+    }
     const rlen: usize = if (msg.reasoning) |r| r.len else 0;
     if (msg.row_count_width == width and
         msg.row_count_expanded == msg.reasoning_expanded and
@@ -7575,6 +7827,57 @@ fn messageRowCountCached(msg: *Message, width: usize) usize {
     msg.row_count_content_len = msg.content.len;
     msg.row_count_reasoning_len = rlen;
     return rows;
+}
+
+/// 工具调用的参数索引条目（懒加载物化块/调用行时生成标题用）
+const ToolCallArgs = struct { name: []const u8, arguments: []const u8 };
+
+/// 懒加载显示：尾部完整物化的行数阈值（估算口径）。
+/// 约 10 屏——首屏 + 上下滚动余量；更远的消息由窗口化机制按需物化。
+const lazy_materialize_lines: usize = 400;
+
+/// 懒加载壳的行高估算：不物化内容，仅按"字节数 + 逻辑行数"估算行数。
+/// 系数由真实长会话（15.8k 行）拟合，宽度 60~200 全程偏差 ≤3.4%；
+/// 真实行数在消息滚入视口物化后生效（物化会清掉 is_shell）。
+/// 参数：bytes = 显示正文字节数；lines = 显示正文逻辑行数（换行数 + 1）；
+///      has_reasoning = 是否有思考块（决定思考折叠头与空行）
+fn estimateShellRows(bytes: usize, lines: usize, kind: EntryKind, width: usize, has_reasoning: bool) usize {
+    if (width == 0) return 0;
+    var rows: usize = 0;
+    if (has_reasoning) {
+        rows += 1; // 思考折叠头
+        if (kind == .text and lines > 0) rows += 1; // 思考与正文之间的空行
+    }
+    switch (kind) {
+        .shell_block => {
+            // shell 块：标题 1 行 + 正文（≤20 行）+ 截断行 + 折行余量
+            const shown = @min(lines, 20);
+            const trunc: usize = if (lines > 20) 1 else 0;
+            const shown_bytes = if (lines > 0) bytes * shown / lines else 0;
+            const cols = shown_bytes * 3 / 2; // CF=1.5
+            const wrapped = (cols + width - 1) / width;
+            const extra = if (wrapped > shown) wrapped - shown else 0;
+            rows += 1 + shown + trunc + extra * 5 / 4; // G=1.25
+        },
+        .diff_block => {
+            // diff 块：标题 1 行 + 每逻辑行 1 行（≤40）+ 截断行（不折行）
+            const shown = @min(lines, 40);
+            const trunc: usize = if (lines > 40) 1 else 0;
+            rows += 1 + shown + trunc;
+        },
+        .call_line, .fail_line => {
+            // 调用行/失败行：单行（宽度极窄时可能折行，忽略不计）
+            rows += 1;
+        },
+        .text => {
+            // 普通文本：逻辑行数 + 折行余量
+            const cols = bytes * 13 / 10; // CF=1.3
+            const wrapped = (cols + width - 1) / width;
+            const extra = if (wrapped > lines) wrapped - lines else 0;
+            rows += lines + extra * 5 / 4; // G=1.25
+        },
+    }
+    return if (rows == 0) 1 else rows;
 }
 
 /// 思考块头行："▸/▾ Thought: 2.3s"（可点击展开/折叠）
@@ -7685,18 +7988,31 @@ fn updateMessageWindow(state: *AppState, width: usize, viewport_rows: usize) voi
     const keep_lo = start_line -| keep;
     const keep_hi = start_line +| viewport_rows +| keep;
 
-    // 3) 逐条判定：窗口内重载、窗口外卸载
+    // 3) 逐条判定：窗口内重载、窗口外卸载。
+    // 懒加载壳的行高是估算值，物化后可能变化；变化发生在视口下方（即更靠底部）
+    // 时，scroll_offset（自底部计量）需同步补偿，否则视口会跳。
     var line: usize = 0;
     for (state.messages.items) |*msg| {
-        const rows = messageRowCountCached(msg, width);
+        const rows_before = messageRowCountCached(msg, width);
         const sep: usize = 1; // 消息间隔（末条多算 1 行无碍）
-        const msg_hi = line +| rows +| sep;
+        const msg_hi = line +| rows_before +| sep;
         const outside = msg_hi <= keep_lo or line >= keep_hi;
 
+        const below_viewport = line >= start_line +| viewport_rows;
         if (outside and msg.content_loaded) {
             state.unloadMessage(msg, width);
+            // 卸载不改变行数（先固化再释放），无需补偿
         } else if (!outside and !msg.content_loaded) {
-            _ = state.reloadMessage(msg, width);
+            if (state.reloadMessage(msg, width)) {
+                const rows_after = messageRowCountCached(msg, width);
+                if (below_viewport) {
+                    if (rows_after > rows_before) {
+                        state.scroll_offset +|= rows_after - rows_before;
+                    } else {
+                        state.scroll_offset -|= rows_before - rows_after;
+                    }
+                }
+            }
         }
         line = msg_hi;
     }
@@ -7744,7 +8060,19 @@ fn drawMessages(state: *AppState, area: Rect, buf: *Buffer) void {
             const sep: usize = 1;
             const msg_hi = l +| rows +| sep;
             if (!msg.content_loaded and l < vis_hi and msg_hi > vis_lo) {
-                if (state.reloadMessage(msg, width)) _ = messageRowCountCached(msg, width);
+                // 物化后行数变化：位于视口下方（更靠底部）时补偿 scroll_offset，
+                // 避免内容跳变（与 updateMessageWindow 同一策略）。
+                const below = l >= start_line +| visible_lines;
+                if (state.reloadMessage(msg, width)) {
+                    const rows_after = messageRowCountCached(msg, width);
+                    if (below) {
+                        if (rows_after > rows) {
+                            state.scroll_offset +|= rows_after - rows;
+                        } else {
+                            state.scroll_offset -|= rows - rows_after;
+                        }
+                    }
+                }
             }
             l = msg_hi;
         }
@@ -9162,6 +9490,7 @@ test {
     _ = @import("context.zig");
     _ = @import("cli_args.zig");
     _ = @import("log.zig");
+    _ = @import("display.zig");
 }
 
 test "历史消息会清洗非法 UTF-8（避免 JSON 退化为字节数组）" {
@@ -12518,6 +12847,13 @@ test "窗口化 2a/2b/2c：回填 db_id 后三类实时消息均可卸载并原�
     }
 
     // ── 2b：块工具（bash），模拟落库后回填 db_id ──
+    // 真实流程：assistant 行（带 tool_calls）先落库，tool 行随后
+    _ = try state.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "assistant",
+        .content = "",
+        .tool_calls = "[{\"id\":\"call_bash\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}]",
+    });
     const t_id = try state.db.?.insertMessage(.{
         .session_id = sid,
         .role = "tool",
@@ -12533,6 +12869,12 @@ test "窗口化 2a/2b/2c：回填 db_id 后三类实时消息均可卸载并原�
     }
 
     // ── 2c：非块工具（read），调用行 + 后缀，db_id 给调用行 ──
+    _ = try state.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "assistant",
+        .content = "",
+        .tool_calls = "[{\"id\":\"call_read\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"src/foo.zig\\\",\\\"limit\\\":20,\\\"offset\\\":5}\"}]",
+    });
     const r_id = try state.db.?.insertMessage(.{
         .session_id = sid,
         .role = "tool",
@@ -13862,4 +14204,107 @@ test "上翻阅读：工具调用追加消息后端到端视口不变" {
     var row0_after2: [160]u8 = undefined;
     renderRowText(&buf3, &row0_after2);
     try std.testing.expectEqualStrings(row0_text, std.mem.trimEnd(u8, &row0_after2, " "));
+}
+
+test "懒加载：与全量加载的显示条目逐条等价（含工具行/思考/摘要）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    const db_path: [:0]const u8 = "skynet_test_lazy_equiv.db";
+    const cleanup = [_][]const u8{ "skynet_test_lazy_equiv.db", "skynet_test_lazy_equiv.db-wal", "skynet_test_lazy_equiv.db-shm" };
+    for (cleanup) |f| Io.Dir.cwd().deleteFile(io, f) catch {};
+    defer for (cleanup) |f| Io.Dir.cwd().deleteFile(io, f) catch {};
+
+    var full = AppState{};
+    full.io = io;
+    full.allocator = alloc;
+    full.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer if (full.db) |*d| d.deinit();
+    const sid = try full.db.?.createSession("");
+    defer {
+        for (full.messages.items) |m| full.freeDisplayMessage(m);
+        full.messages.deinit(alloc);
+        for (full.history.items) |m| freeMessage(alloc, m);
+        full.history.deinit(alloc);
+    }
+
+    // 完整序列：user / 思考+read 调用轮 / 工具结果 / bash 块 / 失败行 / edit 块 / 最终回答
+    _ = try full.db.?.insertMessage(.{ .session_id = sid, .role = "user", .content = "改代码" });
+    _ = try full.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "assistant",
+        .content = "",
+        .reasoning = "先看看",
+        .reasoning_ms = 800,
+        .tool_calls = "[{\"id\":\"c1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.zig\\\"}\"}]",
+    });
+    _ = try full.db.?.insertMessage(.{ .session_id = sid, .role = "tool", .content = "file body", .tool_call_id = "c1", .tool_name = "read" });
+    _ = try full.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "assistant",
+        .content = "",
+        .tool_calls = "[{\"id\":\"c2\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"zig build\\\"}\"}]",
+    });
+    _ = try full.db.?.insertMessage(.{ .session_id = sid, .role = "tool", .content = "ok\n", .tool_call_id = "c2", .tool_name = "bash" });
+    _ = try full.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "assistant",
+        .content = "",
+        .tool_calls = "[{\"id\":\"c3\",\"name\":\"edit\",\"arguments\":\"{\\\"path\\\":\\\"a.zig\\\"}\"}]",
+    });
+    _ = try full.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "tool",
+        .content = "Successfully replaced 1 block(s)",
+        .tool_call_id = "c3",
+        .tool_name = "edit",
+        .tool_display = "  1 - old\n  1 + new",
+    });
+    _ = try full.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "assistant",
+        .content = "改好了",
+        .reasoning = "总结一下",
+        .reasoning_ms = 300,
+    });
+
+    // 全量加载（windowing 关闭）
+    full.session_id = sid;
+    full.loadSessionContent(sid);
+    const full_count = full.messages.items.len;
+    try std.testing.expect(full_count > 0);
+
+    // 懒加载（windowing 开启）：同一库、同一会话
+    var lazy = AppState{};
+    lazy.io = io;
+    lazy.allocator = alloc;
+    lazy.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer if (lazy.db) |*d| d.deinit();
+    lazy.windowing_enabled = true;
+    defer {
+        for (lazy.messages.items) |m| lazy.freeDisplayMessage(m);
+        lazy.messages.deinit(alloc);
+        for (lazy.history.items) |m| freeMessage(alloc, m);
+        lazy.history.deinit(alloc);
+    }
+    lazy.loadSessionContent(sid);
+
+    // 条目数一致
+    try std.testing.expectEqual(full_count, lazy.messages.items.len);
+    // 逐条：类型 / db_id / user 标记一致
+    for (full.messages.items, lazy.messages.items) |fm, lm| {
+        try std.testing.expectEqual(fm.entry_kind, lm.entry_kind);
+        try std.testing.expectEqual(fm.db_id, lm.db_id);
+        try std.testing.expectEqual(fm.user, lm.user);
+    }
+    // 历史逐条一致（内容与工具字段）
+    try std.testing.expectEqual(full.history.items.len, lazy.history.items.len);
+    for (full.history.items, lazy.history.items) |fh, lh| {
+        try std.testing.expectEqualStrings(fh.role, lh.role);
+        try std.testing.expectEqualStrings(fh.content, lh.content);
+        try std.testing.expectEqual(fh.db_id, lh.db_id);
+    }
 }

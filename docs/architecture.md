@@ -31,7 +31,8 @@
 | `tools.zig` | ~2.5k | 7 个工具的 schema + 实现（无 UI 依赖，纯函数式接口） | `tool_defs`、`executeWithEnv` |
 | `ai.zig` | ~1.1k | HTTP/SSE 客户端、请求体构建、工具调用累积、重试 | `streamMessage`、`buildRequestBody` |
 | `markdown.zig` | ~1.1k | Markdown → 行模型的解析与渲染（表格/列表/代码块） | `parse`、`drawRow` |
-| `db.zig` | ~0.8k | SQLite 读写（消息、会话、压缩记录、FTS） | `insertMessage`、`loadMessages`、`latestCompaction` |
+| `db.zig` | ~1.1k | SQLite 读写（消息、会话、压缩记录、FTS、显示元数据） | `insertMessage`、`loadMessages`、`loadDisplayMeta` |
+| `display.zig` | ~0.3k | **纯函数**：工具调用行/块标题/参数摘要/截断/结果摘要（无 UI 依赖） | `formatToolCallLine`、`toolRowHeader` |
 | `textarea.zig` | ~0.7k | 多行输入框（折行、选择、粘贴、光标） | `insertBytes`、`draw` |
 | `config.zig` | ~0.7k | config.json 读写、提供商/预设/思考强度/宽度策略 | `load`、`behavior` |
 | `context.zig` | ~0.4k | **纯计算**：压缩区间选择、工具输出折叠扫描、checkpoint 包装 | `selectCompactionRange`、`FoldScanner` |
@@ -69,11 +70,19 @@
   `wrapCheckpoint`/`checkpointBody`（固定包装的构造与剥离）
 - **加载显示**：`applyLoadedMessagesWithCheckpoint`（摘要行就地渲染）
 
-### 2.4 持久化与窗口化
-- **加载**：`loadSessionContent`、`rebuildHistoryFromDb`、`applyLoadedMessages*`、
-  `addLoadedAssistantMessage`、`addLoadedToolDisplay`（重启后重建显示）
-- **窗口化（长会话渲染性能）**：`updateMessageWindow`、`unloadMessage`、`reloadMessage`、
+### 2.4 持久化与懒加载显示
+- **加载**：`loadSessionContent`（TUI 走 `loadSessionLazy` 懒加载；CLI/测试走全量
+  `applyLoadedMessagesWithCheckpoint`）、`rebuildHistoryFromDb`、`applyLoadedMessages*`
+- **懒加载显示（长会话性能关键）**：`loadSessionLazy` → `buildDisplayFromMeta`
+  （元数据驱动建条目：尾部窗口物化 + 远端建壳）→ `appendShellEntry` /
+  `appendBlockEntry` / `appendCallLineEntry`；滚入视口经 `reloadMessage` 物化
+  （按 `entry_kind` 分支）；行高估算见 `estimateShellRows`
+- **窗口化（内存治理）**：`updateMessageWindow`、`unloadMessage`、`reloadMessage`、
   `messageRowCountCached`（**改 `Message` 可变字段要同步缓存键**，见 AGENTS.md 契约）
+- **DB 侧**：`src/db.zig` 的 `loadDisplayMeta`（骨架元数据，覆盖索引
+  `idx_message_meta`，不读内容页）、`loadSummaryRows`、`findPrevAssistantToolCalls`
+  （物化工具行时反查参数）；显示元数据由 `insertMessage` 内部经
+  `computeDisplayMeta` 统一计算（schema v9）
 
 ### 2.5 折叠（工具输出控制，仅面向 AI）
 `maybeFoldOldToolOutputs`；纯逻辑在 `context.zig` 的 `FoldScanner`。
@@ -130,9 +139,16 @@ stub（实时折叠在 `maybeFoldOldToolOutputs`，重启重建在 `applyLoadedM
 ### 3.3 历史重建（重启/切换会话）
 ```
 loadSessionContent
-   ├─ loadMessages + latestCompaction + listCompactions
-   ├─ 历史 = [system(当前提示词)] + [checkpoint 伪消息] + [保留区]
-   └─ 显示 = 全部消息（含被压缩区）+ 摘要行就地渲染（不进历史）
+   ├─ TUI（windowing_enabled）→ loadSessionLazy（懒加载显示）：
+   │    ├─ loadDisplayMeta（骨架元数据，覆盖索引）+ latestCompaction + listCompactions
+   │    ├─ loadMessagesRange(保留区) + loadSummaryRows（摘要行）
+   │    ├─ 历史 = [system(当前提示词)] + [checkpoint 伪消息] + [保留区]
+   │    └─ 显示 = buildDisplayFromMeta：尾部 ~400 行物化 + 远端建壳（估算行高）
+   └─ CLI/测试 → 全量：loadMessages + applyLoadedMessagesWithCheckpoint
+        └─ 显示 = 全部消息（含被压缩区）+ 摘要行就地渲染（不进历史）
+
+工具行显示语义（两条路径一致，与流式渲染顺序对齐）：
+   assistant 行 → 正文/思考条目；tool 行 → 块（bash/edit）或调用行（+失败行）
 ```
 
 ## 4. 改动的连带影响（改前必看）
@@ -142,7 +158,8 @@ loadSessionContent
 | `Message` 新增"创建后可变且影响行数"字段 | 并入 `messageRowCountCached` 的匹配键（见 AGENTS.md 契约） |
 | 改正文内容 | 必须走 `msg.setContent(allocator, owned)`（否则行数缓存不失效） |
 | 新增工具 | `tools.zig` 的 `tool_defs` + `toolBlockKind`（是否块渲染）+ 提示词里的工具说明 |
-| 改工具结果格式 | `summarizeToolResult`（统计行）、`addLoadedToolDisplay`（重启恢复）要同步 |
+| 改工具结果格式 | `summarizeToolResult`（统计行）、`appendCallLineEntry`（重启恢复）要同步 |
+| 改显示条目形态（调用行/块/摘要） | 三处同步：`display.zig` 的 `toolRowHeader`、`buildDisplayFromMeta`（懒加载）、`applyLoadedMessagesWithCheckpoint`（全量）；以及 `db.computeDisplayMeta`（行高元数据） |
 | 改落库字段 | `db.zig` 的列定义 + `db_query` 映射 + `applyLoadedMessages*` + 窗口化重载 |
 | 改 schema（加列/表） | `schema_version` +1、在 `migrations` 表里加一步迁移函数、同步 `migration_min_version`（若放弃最旧版本支持）；旧库迁移走 `migrateIfNeeded`（自动备份 + 逐级升级） |
 | 新增模块 | 在 `main.zig` 末尾聚合块 `_ = @import("xxx.zig")` 登记 |
