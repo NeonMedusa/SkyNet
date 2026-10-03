@@ -77,6 +77,13 @@
   （元数据驱动建条目：尾部窗口物化 + 远端建壳）→ `appendShellEntry` /
   `appendBlockEntry` / `appendCallLineEntry`；滚入视口经 `reloadMessage` 物化
   （按 `entry_kind` 分支）；行高估算见 `estimateShellRows`
+- **锚点滚动模型**（视口不跳变的结构性保证）：`anchor_msg`/`anchor_row`（视口首行位置）、
+  `follow_tail`（贴底跟随态）、`scrollUp`/`scrollDown`/`computeTailTop`/`beginAnchor`。
+  视口上方/下方内容怎么变（物化/折叠/流式追加）都不动锚点，**不要新增"按行数差补偿"的代码**
+- **窗口裁剪 + 双向回拉**（内存常数化）：`trimWindow`（以锚点为中心保留上下各 4 屏 +
+  500 条，超出部分连结构体一起丢；保留条数必须 > 回拉批量）、`pullHistoryAbove` /
+  `pullHistoryBelow`（锚点接近数组边界时按 db_id 回拉 200 条；**必须保存/恢复锚定态**）；
+  偏移量 `trimmed_above`（下标→全局）、`tail_has_more`（尾部是否还有被裁历史）
 - **窗口化（内存治理）**：`updateMessageWindow`、`unloadMessage`、`reloadMessage`、
   `messageRowCountCached`（**改 `Message` 可变字段要同步缓存键**，见 AGENTS.md 契约）
 - **DB 侧**：`src/db.zig` 的 `loadDisplayMeta`（骨架元数据，覆盖索引

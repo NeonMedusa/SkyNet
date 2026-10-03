@@ -680,6 +680,21 @@ pub const Db = struct {
         );
     }
 
+    /// 加载 id 严格大于 after_id 的最近 limit 条消息（按 id **升序**）。
+    /// 窗口裁剪后向下滚动时按需回拉更晚的历史（尾部）。
+    /// 实现：降序取 limit 条再在调用方反转，或直接子查询；这里用子查询保持升序。
+    pub fn loadMessagesAfterLimited(self: *Db, allocator: Allocator, session_id: i64, after_id: i64, limit: usize) ![]const MessageRow {
+        return db_query.queryAll3(
+            &self.sess,
+            allocator,
+            MessageRow,
+            "SELECT " ++ message_cols ++ " FROM \"message\" WHERE session_id = ? AND id > ? ORDER BY id LIMIT ?",
+            session_id,
+            after_id,
+            @as(i64, @intCast(limit)),
+        );
+    }
+
     /// 写入一条压缩 checkpoint（summary_message_id 指向 role='summary' 的消息行）
     pub fn insertCompaction(
         self: *Db,
@@ -816,19 +831,6 @@ pub const Db = struct {
         );
     }
 
-    /// 加载会话的全部显示骨架（按 id 升序；覆盖索引扫描，不读内容页）。
-    /// 懒加载显示用：内容按需物化，定位/滚动只依赖这些元数据。
-    pub fn loadDisplayMeta(self: *Db, allocator: Allocator, session_id: i64) ![]const DisplayMetaRow {
-        return db_query.queryAll1(
-            &self.sess,
-            allocator,
-            DisplayMetaRow,
-            "SELECT id, role, disp_kind, is_error, reasoning_ms, disp_bytes, disp_lines, has_reasoning " ++
-                "FROM \"message\" WHERE session_id = ? ORDER BY id",
-            session_id,
-        );
-    }
-
     /// 加载某会话的全部 role='summary' 消息行（懒加载显示用：摘要行在压缩区，
     /// 不在保留区范围内，需单独取；通常 0~几条）。
     pub fn loadSummaryRows(self: *Db, allocator: Allocator, session_id: i64) ![]const MessageRow {
@@ -839,6 +841,78 @@ pub const Db = struct {
             "SELECT " ++ message_cols ++ " FROM \"message\" WHERE session_id = ? AND role = 'summary' ORDER BY id",
             session_id,
         );
+    }
+
+    /// 会话消息总数（走覆盖索引，不碰内容页；用于加载时估算 trimmed_above）。
+    pub fn countMessages(self: *Db, allocator: Allocator, session_id: i64) !i64 {
+        const Row = struct { n: i64 = 0 };
+        const rows = try db_query.queryAll1(
+            &self.sess,
+            allocator,
+            Row,
+            "SELECT COUNT(*) AS n FROM \"message\" WHERE session_id = ?",
+            session_id,
+        );
+        return if (rows.len > 0) rows[0].n else 0;
+    }
+
+    /// 尾部最近 limit 条显示元数据（升序返回）。加载时只读尾部，
+    /// 其余由滚动回拉（真正与会话规模无关）。
+    pub fn loadDisplayMetaTail(self: *Db, allocator: Allocator, session_id: i64, limit: usize) ![]const DisplayMetaRow {
+        const rows = try db_query.queryAll2(
+            &self.sess,
+            allocator,
+            DisplayMetaRow,
+            "SELECT id, role, disp_kind, is_error, reasoning_ms, disp_bytes, disp_lines, has_reasoning " ++
+                "FROM \"message\" WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            session_id,
+            @as(i64, @intCast(limit)),
+        );
+        std.mem.reverse(DisplayMetaRow, @constCast(rows));
+        return rows;
+    }
+
+    /// 加载 id 严格小于 before_id 的最近 limit 条消息（按 id **降序**，调用方通常再反转）。
+    /// 窗口裁剪后向上滚动时按需回拉更早的历史。
+    pub fn loadMessagesBefore(self: *Db, allocator: Allocator, session_id: i64, before_id: i64, limit: usize) ![]const MessageRow {
+        return db_query.queryAll3(
+            &self.sess,
+            allocator,
+            MessageRow,
+            "SELECT " ++ message_cols ++ " FROM \"message\" WHERE session_id = ? AND id < ? ORDER BY id DESC LIMIT ?",
+            session_id,
+            before_id,
+            @as(i64, @intCast(limit)),
+        );
+    }
+
+    /// 按 summary_message_id 查压缩记录（回拉摘要行时重建黄色标题用）
+    pub fn findCompactionBySummary(self: *Db, allocator: Allocator, session_id: i64, summary_message_id: i64) !?CompactionRow {
+        const rows = try db_query.queryAll2(
+            &self.sess,
+            allocator,
+            CompactionRow,
+            "SELECT id, session_id, created_at, summary, summary_message_id, tail_start_id, tokens_before, model " ++
+                "FROM \"compaction\" WHERE session_id = ? AND summary_message_id = ? LIMIT 1",
+            session_id,
+            summary_message_id,
+        );
+        if (rows.len == 0) return null;
+        return rows[0];
+    }
+
+    /// id < before_id 的消息条数（压缩标题的"已摘要 N 条"用）
+    pub fn countMessagesBefore(self: *Db, allocator: Allocator, session_id: i64, before_id: i64) !i64 {
+        const Row = struct { n: i64 = 0 };
+        const rows = try db_query.queryAll2(
+            &self.sess,
+            allocator,
+            Row,
+            "SELECT COUNT(*) AS n FROM \"message\" WHERE session_id = ? AND id < ?",
+            session_id,
+            before_id,
+        );
+        return if (rows.len > 0) rows[0].n else 0;
     }
 
     /// 从 from_id 起（含）向前（id 递减）找最近的、带 tool_calls 的 assistant 行。

@@ -78,6 +78,23 @@ IME 漂移/闪烁问题已在真实环境解决，说服力强；mock backend �
 注意：#3/#4 的 `restore.zig` 改动（复位序列）与 PR-2 同文件，若 PR-2 先合并，
 移植时基于合并后的 master 重建。
 
+## 分支清理（2026-10-03 完成）
+
+PR #38/#39/#42 全部合并、`skynet` 已 rebase 至新上游并推送后，已按
+`tmp/zigtui-branch-cleanup.md` 清单执行清理（该临时清单已删除）：
+
+- **fork 远端（origin）**：仅保留 `master` + `skynet`；
+  已删 `utf8-tolerance` / `windows-restore` / `windows-surrogate-input` /
+  `textinput-wide-render` / `wide-char-render` / `wide-char-support`；
+- **submodule clone（`libs/zigtui`）**：仅保留 `master` + `skynet`；
+  已删 `skynet-backup` / `skynet-backup2` / 各 PR 分支；
+- **开发 clone（`Develop\zigtui`）**：仅保留 `master`；
+  已删 `test-both` / `wide-char-render` / `wide-char-support` / `wide-chars-demo` /
+  `windows-surrogate-input`；临时物（wide_chars 示例、probe 脚本）备份至
+  SkyNet `tmp/zigtui-cleanup-backup/` 后清理。
+
+后续 PR（#3 起）按“每个 PR 的工作流”新建分支即可；旧分支不再需要。
+
 ## 已合并 PR 的语义备忘（存档：要点）
 
 PR-1/#38（utf8-tolerance）：非法输入 → U+FFFD（1 列），**每次前进 1 字节**（不吞后续合法

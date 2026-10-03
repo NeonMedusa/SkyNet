@@ -732,7 +732,27 @@ const AppState = struct {
     thinking_select_index: usize = 0,
 
     // 消息滚动状态
-    scroll_offset: usize = 0,
+    /// 滚动锚点（锚点模型，取代旧的"距底部行数"）：视口首行所在的**全局**显示
+    /// 条目下标 + 条目内行号。row ∈ [0, 条目行数]（row == 行数 = 条目后的分隔空行）。
+    /// follow_tail = true 时忽略锚点：视口钉在内容末尾（默认态；流式输出自动跟随），
+    /// 每帧绘制前会把锚点同步为当前尾部视口顶部，方便"上滚时从当前位置进入锚定"。
+    ///
+    /// 锚点模型的关键性质：视口上方/下方条目的行数变化（物化/折叠/流式追加）
+    /// 都不移动视口内容——"滚动不跳变"是结构性保证，无需任何偏移补偿。
+    anchor_msg: usize = 0,
+    anchor_row: usize = 0,
+    follow_tail: bool = true,
+
+    /// ── 窗口化显示（仅 windowing_enabled）──
+    /// 裁剪：窗口外的历史消息**整个丢弃**（连 Message 结构体也不留），
+    /// 数组最顶部的消息就是已加载的最早一条；`trimmed_above` 记录被裁掉条数，
+    /// 锚点/全局序号按它换算。向上滚到数组头时按 db_id 向前拉取一批插入头部。
+    /// 实时消息（db_id == 0）永不裁。
+    /// 本字段为“数组下标 → 全局下标”的偏移：global = local + trimmed_above。
+    trimmed_above: usize = 0,
+    /// 尾部是否还有被裁掉的历史（数组尾 ≠ 会话尾）。
+    /// 由 trimWindow 的尾部裁剪置 true；向下回拉到会话尾时置 false。
+    tail_has_more: bool = false,
     terminal_height: u16 = 0,
     menu_visible_rows: usize = 0,
     message_visible_rows: usize = 0,
@@ -865,7 +885,7 @@ const AppState = struct {
             self.allocator.free(owned);
             return;
         };
-        self.scroll_offset = 0;
+        self.follow_tail = true;
     }
 
     fn addMessageImpl(self: *AppState, content: []const u8, style: Style, markdown: bool, stick: bool) void {
@@ -884,22 +904,7 @@ const AppState = struct {
             if (parsed) |md| md_mod.free(self.allocator, md);
             return;
         };
-        if (stick) {
-            self.scroll_offset = 0;
-        } else {
-            self.preserveViewOnAppend();
-        }
-    }
-
-    /// 追加消息后的滚动处理：上翻时按新增行数补偿偏移保持视口，贴底时继续跟随。
-    /// 注意：新消息会让"上一条"末尾多出一个消息间隔空行，该行同样计入总行数
-    fn preserveViewOnAppend(self: *AppState) void {
-        const width = self.message_wrap_width;
-        if (width == 0 or self.scroll_offset == 0) return;
-        if (self.messages.items.len == 0) return;
-        const rows = messageRowCount(self.messages.items[self.messages.items.len - 1], width);
-        const sep: usize = if (self.messages.items.len > 1) 1 else 0;
-        if (rows + sep > 0) self.scroll_offset +|= rows + sep;
+        if (stick) self.follow_tail = true;
     }
 
     fn freeDisplayMessage(self: *AppState, msg: Message) void {
@@ -1110,17 +1115,9 @@ const AppState = struct {
         const rows = db.loadMessagesAfterWith(scratch.allocator(), self.session_id, self.last_seen_msg_id) catch return;
         if (rows.len == 0) return;
 
-        const offset_before = self.scroll_offset;
-        const msgs_before = self.messages.items.len;
         self.applyLoadedMessages(rows, false);
-        // 上翻阅读时按新增行数补偿偏移；贴底时跟随最新
-        if (offset_before > 0 and self.message_wrap_width > 0) {
-            var added: usize = 0;
-            for (self.messages.items[msgs_before..]) |m| added += messageRowCount(m, self.message_wrap_width);
-            if (added > 0) self.scroll_offset +|= added;
-        } else {
-            self.scroll_offset = 0;
-        }
+        // 锚点模型：锚定态下锚点指向的内容不动（新消息追加在末尾，不影响上方）；
+        // 跟随态保持跟随。无需任何补偿。
         self.setToast("会话已由外部更新");
     }
 
@@ -1235,7 +1232,7 @@ const AppState = struct {
             self.freeDisplayMessage(msg);
         }
         self.messages.clearRetainingCapacity();
-        self.scroll_offset = 0;
+        self.follow_tail = true;
         self.clearSelection();
     }
 
@@ -1322,6 +1319,144 @@ const AppState = struct {
     /// 消息区翻页步长（按实际可见行数）
     fn messagePageRows(self: *AppState) usize {
         return if (self.message_visible_rows > 0) self.message_visible_rows else 10;
+    }
+
+    /// ── 滚动锚点原语（锚点模型）──
+    ///
+    /// 视口位置由 (anchor_msg, anchor_row) 描述：视口首行 = 第 anchor_msg 条显示
+    /// 消息的第 anchor_row 行（row == 行数时为该消息后的分隔空行）。
+    /// follow_tail = true 时不看锚点，视口钉在末尾（默认态）。
+    /// 消息的行数（含行数缓存）
+    fn msgRows(self: *AppState, idx: usize, width: usize) usize {
+        if (idx >= self.messages.items.len) return 0;
+        return messageRowCountCached(&self.messages.items[idx], width);
+    }
+
+    /// 某消息"占用的总行数"（含其后分隔空行）
+    fn msgSpan(self: *AppState, idx: usize, width: usize) usize {
+        const rows = self.msgRows(idx, width);
+        return rows + (if (idx + 1 < self.messages.items.len) @as(usize, 1) else 0);
+    }
+
+    /// 把锚点向上移动 delta 行（越过消息边界时跨到上一条消息）。
+    /// 调用方需先确保处于锚定态（beginAnchor）；返回实际移动的行数。
+    fn anchorMoveUp(self: *AppState, delta: usize, width: usize) usize {
+        var moved: usize = 0;
+        var remaining = delta;
+        while (remaining > 0) {
+            // 当前消息内可上移的行数 = anchor_row
+            if (self.anchor_row > 0) {
+                const step = @min(self.anchor_row, remaining);
+                self.anchor_row -= step;
+                remaining -= step;
+                moved += step;
+                continue;
+            }
+            if (self.anchor_msg == 0) break; // 已到顶
+            // 跨到上一条消息：从它的分隔空行处继续（空行占 1 行，然后再进内容）
+            self.anchor_msg -= 1;
+            const rows = self.msgRows(self.anchor_msg, width);
+            const back: usize = 1 + rows; // 分隔空行 + 消息内容
+            if (remaining >= back) {
+                // 直接越过整条上一条消息，锚点停在它的首行
+                self.anchor_row = 0;
+                remaining -= back;
+                moved += back;
+            } else {
+                // 落在分隔空行或内容中间：从末尾往回数
+                self.anchor_row = back - remaining;
+                moved += remaining;
+                remaining = 0;
+            }
+        }
+        return moved;
+    }
+
+    /// 把锚点向下移动 delta 行（越过消息边界时跨到后一条消息）。
+    /// 返回实际移动的行数（到底则停在末尾并回到跟随态）。
+    fn anchorMoveDown(self: *AppState, delta: usize, width: usize) usize {
+        var moved: usize = 0;
+        var remaining = delta;
+        while (remaining > 0) {
+            const rows = self.msgRows(self.anchor_msg, width);
+            const span = self.msgSpan(self.anchor_msg, width);
+            const in_span = span - self.anchor_row;
+            if (remaining < in_span) {
+                self.anchor_row += remaining;
+                moved += remaining;
+                remaining = 0;
+                break;
+            }
+            // 跨到下一条消息
+            if (self.anchor_msg + 1 >= self.messages.items.len) {
+                // 已到已加载的末尾：若尾部还有被裁历史（tail_has_more），
+                // 停在末尾等回拉（下一帧 updateMessageWindow 会补），不回跟随态；
+                // 否则真正到底，回跟随态。
+                self.anchor_row = rows;
+                moved += in_span;
+                remaining = 0;
+                if (!self.tail_has_more) self.follow_tail = true;
+                break;
+            }
+            self.anchor_msg += 1;
+            self.anchor_row = 0;
+            moved += in_span;
+            remaining -= in_span;
+        }
+        return moved;
+    }
+
+    /// 计算"尾部视口顶部"位置写入锚点（不改 follow_tail）。
+    /// viewport_rows = 真实视口高度；从末尾往回累计行数直到凑够一屏，
+    /// 只有视口内几条消息被触碰（O(可视)）。
+    fn computeTailTop(self: *AppState, width: usize, viewport_rows: usize) void {
+        if (self.messages.items.len == 0) {
+            self.anchor_msg = 0;
+            self.anchor_row = 0;
+            return;
+        }
+        var need = if (viewport_rows > 0) viewport_rows else 1;
+        var i: usize = self.messages.items.len;
+        while (i > 0) {
+            i -= 1;
+            const span = self.msgSpan(i, width);
+            if (span >= need) {
+                self.anchor_msg = i;
+                self.anchor_row = span - need;
+                return;
+            }
+            need -= span;
+        }
+        self.anchor_msg = 0;
+        self.anchor_row = 0;
+    }
+
+    /// 进入锚定模式：跟随态下先把锚点定到当前尾部视口顶部。
+    fn beginAnchor(self: *AppState, width: usize) void {
+        if (!self.follow_tail) return;
+        self.computeTailTop(width, self.messagePageRows());
+        self.follow_tail = false;
+    }
+
+    /// 向上滚动 delta 行（进入锚定态；到顶停住）。
+    fn scrollUp(self: *AppState, delta: usize) void {
+        const width = self.message_wrap_width;
+        if (width == 0) return;
+        self.beginAnchor(width);
+        _ = self.anchorMoveUp(delta, width);
+    }
+
+    /// 向下滚动 delta 行（跟随态无操作；到底回到跟随态）。
+    fn scrollDown(self: *AppState, delta: usize) void {
+        const width = self.message_wrap_width;
+        if (width == 0 or self.follow_tail) return;
+        _ = self.anchorMoveDown(delta, width);
+    }
+
+    /// 是否可上滚（视口上方还有内容）
+    fn canScrollUp(self: *AppState) bool {
+        if (self.follow_tail) return true; // 跟随态：上方总有内容（除非空会话）
+        return self.anchor_msg > 0 or self.anchor_row > 0;
     }
 
     /// 右上角临时悬浮通知（2 秒）
@@ -1792,7 +1927,7 @@ const AppState = struct {
             if (owned_reasoning) |r| self.allocator.free(r);
             return;
         };
-        self.scroll_offset = 0;
+        self.follow_tail = true;
     }
 
     /// 加载会话内容（含 compaction checkpoint；会清空当前历史/显示）。
@@ -1808,9 +1943,11 @@ const AppState = struct {
         const checkpoint = db.latestCompaction(session_id) catch null;
         const compactions = db.listCompactions(scratch.allocator(), session_id) catch &.{};
 
-        // 懒加载（TUI）：只读元数据（覆盖索引，不碰内容页）+ 尾部窗口物化
+        // 懒加载（TUI）：只读尾部元数据（覆盖索引，不碰内容页；上方条数用 COUNT 估算）
+        // + 尾部窗口物化。加载耗时/内存不再随会话规模增长。
         if (self.windowing_enabled) {
-            if (db.loadDisplayMeta(scratch.allocator(), session_id)) |meta| {
+            const meta_limit: usize = 600; // 尾部元数据条数（窗口 ~500 + 余量）
+            if (db.loadDisplayMetaTail(scratch.allocator(), session_id, meta_limit)) |meta| {
                 self.loadSessionLazy(session_id, meta, checkpoint, compactions);
                 return;
             } else |_| {}
@@ -1880,9 +2017,16 @@ const AppState = struct {
         combined.appendSlice(a, tail_rows) catch {};
         self.applyLoadedMessagesWithCheckpoint(combined.items, checkpoint, compactions, false, true);
 
-        // 显示：元数据驱动（尾部物化 + 壳）
+        // 显示：只取尾部元数据（limit 条），上方条数记入 trimmed_above——
+        // 不再全量读元数据 + 建壳再裁掉（那会让加载耗时随会话线性增长）。
+        const head_count: usize = blk: {
+            const total = db.countMessages(a, session_id) catch 0;
+            break :blk if (total > @as(i64, @intCast(meta.len))) @intCast(total - @as(i64, @intCast(meta.len))) else 0;
+        };
+        self.trimmed_above = head_count;
+        self.tail_has_more = false; // 尾部就是会话尾（只裁了头部）
         self.buildDisplayFromMeta(meta, tail_rows, summary_rows, compactions);
-        Log.info(.startup, "加载会话 {d}: {d} 行（懒加载）", .{ session_id, meta.len });
+        Log.info(.startup, "加载会话 {d}: {d} 行（懒加载，尾部 {d} 条元数据）", .{ session_id, head_count + meta.len, meta.len });
     }
 
     /// 按元数据构建显示条目（懒加载）：尾部窗口物化，其余为壳。
@@ -2024,7 +2168,70 @@ const AppState = struct {
                 self.appendShellEntry(m, .text, std.mem.eql(u8, role, "user"));
             }
         }
-        self.scroll_offset = 0;
+        // 加载完毕：显示条目数已定，收缩数组容量回收增长松弛（实测 15.8k 行会话
+        // 可省 ~1MB：capacity 21074 → len 14223）。流式追加路径不受影响。
+        if (self.messages.capacity > self.messages.items.len) {
+            self.messages.shrinkAndFree(self.allocator, self.messages.items.len);
+        }
+        if (self.history.capacity > self.history.items.len) {
+            self.history.shrinkAndFree(self.allocator, self.history.items.len);
+        }
+        self.follow_tail = true;
+    }
+
+    /// 把一条 DB 行物化为显示条目追加到数组尾（窗口回拉用）。
+    /// 与 buildDisplayFromMeta 的 in_window 分支同语义（工具行/助手/用户/摘要）。
+    fn materializeRowAt(self: *AppState, row: db_mod.MessageRow, index: usize) void {
+        _ = index;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+
+        if (std.mem.eql(u8, row.role, "summary")) {
+            // 回拉到压缩摘要行：重建黄色标题（"▣ 上下文已压缩…"）+ 摘要正文。
+            // 标题的"已摘要 N 条"按 tail_start_id 前条数查库（尾部加载时同语义）。
+            var notice_buf: [256]u8 = undefined;
+            var tokens_before: i64 = 0;
+            var summarized: usize = 0;
+            if (self.db) |*db| {
+                if (db.findCompactionBySummary(arena, self.session_id, row.id) catch null) |cp| {
+                    tokens_before = cp.tokens_before;
+                    const n = db.countMessagesBefore(arena, self.session_id, cp.tail_start_id) catch 0;
+                    summarized = @intCast(@max(n, 0));
+                }
+            }
+            const header = formatCompactionNotice(
+                &notice_buf,
+                summarized,
+                row.content.len,
+                @intCast(@max(tokens_before, 0)),
+            );
+            self.addMessage(header, .{ .fg = busy_accent });
+            self.addLoadedAssistantMessage(checkpointBody(row.content), row.reasoning, row.reasoning_ms, row.id);
+            self.markLastEntry(.text);
+            return;
+        }
+        if (std.mem.eql(u8, row.role, "tool")) {
+            const kind = entryKindForToolRow(row);
+            if (kind == .call_line) {
+                const header = self.materializeToolHeader(arena, row, .call_line, null);
+                self.appendCallLineEntry(row, header, header);
+            } else {
+                const header = self.materializeToolHeader(arena, row, kind, null);
+                self.appendBlockEntry(row, kind, header);
+            }
+            return;
+        }
+        if (std.mem.eql(u8, row.role, "assistant")) {
+            if (row.content.len == 0 and row.reasoning.len == 0) return;
+            self.addLoadedAssistantMessage(row.content, row.reasoning, row.reasoning_ms, row.id);
+            self.markLastEntry(.text);
+            return;
+        }
+        // user 及其他角色
+        if (row.content.len == 0) return;
+        self.addUserMessageDb(row.content, row.id);
+        self.markLastEntry(.text);
     }
 
     /// 给最后一条显示条目标记类型（物化路径用；无条目时忽略）
@@ -2650,9 +2857,6 @@ const AppState = struct {
         const msg = &self.messages.items[idx];
 
         const first_reasoning = msg.reasoning == null;
-        const width = self.message_wrap_width;
-        const rows_before = if (width > 0) messageRowCount(msg.*, width) else 0;
-
         const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
         if (msg.reasoning == null) msg.reasoning_start_ms = now;
         msg.reasoning_end_ms = now;
@@ -2664,11 +2868,6 @@ const AppState = struct {
         if (old.len > 0) self.allocator.free(old);
         msg.reasoning = joined;
 
-        if (width > 0) {
-            const rows_after = messageRowCount(msg.*, width);
-            const added = rows_after -| rows_before;
-            if (self.scroll_offset > 0 and added > 0) self.scroll_offset +|= added;
-        }
         if (first_reasoning) setThoughtExpanded(self, idx, true, false);
     }
 
@@ -2677,9 +2876,6 @@ const AppState = struct {
         self.ensureCompactDisplayMessages();
         const idx = self.compact_msg_idx orelse return;
         const msg = &self.messages.items[idx];
-        const width = self.message_wrap_width;
-        const rows_before = if (width > 0) messageRowCount(msg.*, width) else 0;
-
         const first_content = msg.content.len == 0;
         const joined = self.allocator.alloc(u8, msg.content.len + chunk.len) catch return;
         @memcpy(joined[0..msg.content.len], msg.content);
@@ -2688,11 +2884,6 @@ const AppState = struct {
         if (msg.md) |old| md_mod.free(self.allocator, old);
         msg.md = md_mod.parse(self.allocator, joined, md_mod.default_styles) catch null;
 
-        if (width > 0) {
-            const rows_after = messageRowCount(msg.*, width);
-            const added = rows_after -| rows_before;
-            if (self.scroll_offset > 0 and added > 0) self.scroll_offset +|= added;
-        }
         // 正文开始：思考结束 → 折叠（与普通回复一致）
         if (first_content and msg.reasoning != null) setThoughtExpanded(self, idx, false, false);
     }
@@ -3063,14 +3254,13 @@ const AppState = struct {
     fn removeStreamingMessage(self: *AppState) void {
         if (self.streaming_msg_idx) |idx| {
             if (idx < self.messages.items.len) {
-                const width = self.message_wrap_width;
-                const rows = if (width > 0) messageRowCount(self.messages.items[idx], width) else 0;
                 self.freeDisplayMessage(self.messages.items[idx]);
                 _ = self.messages.orderedRemove(idx);
-                // 反向补偿：移除的消息及其与上一条之间的间隔空行
-                if (self.scroll_offset > 0) {
-                    const sep: usize = if (idx > 0) 1 else 0;
-                    self.scroll_offset -|= rows + sep;
+                // 锚点模型：移除的是流式空消息（始终在末尾，锚点之前不可能有它），
+                // 锚点指向的内容不动；若锚点引用被移除的下标则钳到新末尾。
+                if (!self.follow_tail and self.anchor_msg >= self.messages.items.len) {
+                    self.anchor_msg = if (self.messages.items.len > 0) self.messages.items.len - 1 else 0;
+                    self.anchor_row = 0;
                 }
             }
             self.streaming_msg_idx = null;
@@ -3096,17 +3286,8 @@ const AppState = struct {
         const msg = &self.messages.items[idx];
         if (msg.tool_block != null or msg.md != null or msg.user) return;
 
-        const width = self.message_wrap_width;
-        const rows_before = if (width > 0) messageRowCount(msg.*, width) else 0;
         const joined = std.fmt.allocPrint(self.allocator, "{s} ({s})", .{ msg.content, suffix }) catch return;
         msg.setContent(self.allocator, joined);
-
-        // 贴底时保持跟随；已上翻时补偿偏移，保持视口不动
-        if (width > 0) {
-            const rows_after = messageRowCount(msg.*, width);
-            const added = rows_after -| rows_before;
-            if (self.scroll_offset > 0 and added > 0) self.scroll_offset +|= added;
-        }
     }
 
     /// 向最后一条提示行追加后缀（实时路径：调用行刚输出，结果随后到达）
@@ -3135,7 +3316,6 @@ const AppState = struct {
             if (header_owned.len > 0) self.allocator.free(header_owned);
             return false;
         };
-        self.preserveViewOnAppend();
         return true;
     }
 
@@ -3158,9 +3338,6 @@ const AppState = struct {
         if (msg.tool_block == null or msg.tool_block.? != kind) return false;
         if (is_error) msg.tool_error = true;
 
-        const width = self.message_wrap_width;
-        const rows_before = if (width > 0) messageRowCount(msg.*, width) else 0;
-
         const max_lines: usize = if (kind == .diff) 40 else 20;
         const capped = capBlockBody(self.allocator, body, max_lines) catch return false;
         defer self.allocator.free(capped);
@@ -3168,12 +3345,6 @@ const AppState = struct {
         const joined = std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ msg.content, capped }) catch return false;
         msg.setContent(self.allocator, joined);
 
-        // 贴底时保持跟随；已上翻时补偿偏移，保持视口不动
-        if (width > 0) {
-            const rows_after = messageRowCount(msg.*, width);
-            const added = rows_after -| rows_before;
-            if (self.scroll_offset > 0 and added > 0) self.scroll_offset +|= added;
-        }
         return true;
     }
 
@@ -3213,7 +3384,7 @@ const AppState = struct {
         self.clearStreamEventsLocked();
         self.stream_mutex.unlock(self.io);
         self.streaming_msg_idx = null;
-        self.scroll_offset = 0;
+        self.follow_tail = true;
         self.stream_error = null;
         self.stream_cancel.store(false, .release);
         self.setStreamStatus(.running);
@@ -3325,8 +3496,7 @@ const AppState = struct {
         }) catch return null;
         const idx = self.messages.items.len - 1;
         self.streaming_msg_idx = idx;
-        // 新建空消息同样会多出消息间隔空行：上翻阅读时保持视口不动
-        self.preserveViewOnAppend();
+        // 锚点模型：新空消息在末尾，不影响锚点指向的视口内容
         return idx;
     }
 
@@ -3479,8 +3649,6 @@ const AppState = struct {
         const msg = &self.messages.items[idx];
 
         const first_content = msg.content.len == 0;
-        const width = self.message_wrap_width;
-        const rows_before = if (width > 0) messageRowCount(msg.*, width) else 0;
 
         const joined = self.allocator.alloc(u8, msg.content.len + chunk.len) catch return;
         @memcpy(joined[0..msg.content.len], msg.content);
@@ -3490,13 +3658,6 @@ const AppState = struct {
         // 重新解析 Markdown（整段，KB 级内容足够快）
         if (msg.md) |old| md_mod.free(self.allocator, old);
         msg.md = md_mod.parse(self.allocator, joined, md_mod.default_styles) catch null;
-
-        // 贴底时保持跟随；已上翻时补偿偏移，保持视口不动
-        if (width > 0) {
-            const rows_after = messageRowCount(msg.*, width);
-            const added = rows_after -| rows_before;
-            if (self.scroll_offset > 0 and added > 0) self.scroll_offset +|= added;
-        }
 
         // 思考结束（正文开始）：始终自动折叠（即使中途手动展开过）
         if (first_content and msg.reasoning != null) {
@@ -3509,9 +3670,6 @@ const AppState = struct {
         const msg = &self.messages.items[idx];
 
         const first_reasoning = msg.reasoning == null;
-        const width = self.message_wrap_width;
-        const rows_before = if (width > 0) messageRowCount(msg.*, width) else 0;
-
         const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
         if (msg.reasoning == null) msg.reasoning_start_ms = now;
         msg.reasoning_end_ms = now;
@@ -3522,13 +3680,6 @@ const AppState = struct {
         @memcpy(joined[old.len..], chunk);
         if (old.len > 0) self.allocator.free(old);
         msg.reasoning = joined;
-
-        // 贴底时保持跟随；已上翻时补偿偏移，保持视口不动
-        if (width > 0) {
-            const rows_after = messageRowCount(msg.*, width);
-            const added = rows_after -| rows_before;
-            if (self.scroll_offset > 0 and added > 0) self.scroll_offset +|= added;
-        }
 
         // 思考开始：展开，流式显示思考内容（思考结束后自动折叠）
         if (first_reasoning) {
@@ -4568,10 +4719,10 @@ const AppState = struct {
                 _ = self.input.moveCursorVert(self.input_wrap_width, false);
             },
             .page_up => {
-                self.scroll_offset +|= @max(self.messagePageRows() / 2, 1);
+                self.scrollUp(@max(self.messagePageRows() / 2, 1));
             },
             .page_down => {
-                self.scroll_offset -|= @max(self.messagePageRows() / 2, 1);
+                self.scrollDown(@max(self.messagePageRows() / 2, 1));
             },
             .esc => {
                 // 有选中内容时先清除选区；否则打开主菜单
@@ -6460,9 +6611,9 @@ pub fn main(init: std.process.Init) !u8 {
             switch (state.sel_area) {
                 .messages => {
                     if (state.auto_scroll_dir < 0) {
-                        state.scroll_offset +|= 1; // 向更早的内容滚动
+                        state.scrollUp(1); // 向更早的内容滚动
                     } else {
-                        state.scroll_offset -|= 1; // 向更新的内容滚动
+                        state.scrollDown(1); // 向更新的内容滚动
                     }
                 },
                 .input => {
@@ -6646,14 +6797,14 @@ fn handleTerminalEvent(state: *AppState, terminal: *Terminal, event: tui.Event) 
                         if (state.input_box_top > 0 and m.y >= state.input_box_top) {
                             state.input.scrollView(true, state.input_wrap_width, state.input_content_rows);
                         } else {
-                            state.scroll_offset +|= 3;
+                            state.scrollUp(3);
                         }
                     },
                     .scroll_down => {
                         if (state.input_box_top > 0 and m.y >= state.input_box_top) {
                             state.input.scrollView(false, state.input_wrap_width, state.input_content_rows);
                         } else {
-                            state.scroll_offset -|= 3;
+                            state.scrollDown(3);
                         }
                     },
                     else => {},
@@ -6699,72 +6850,6 @@ fn parseToolCalls(allocator: Allocator, json: []const u8) ?[]ai.ToolCall {
         list[i] = .{ .id = r.id, .name = r.name, .arguments = r.arguments };
     }
     return list;
-}
-
-/// 恢复工具调用提示行（非块类工具，如 ls/read/grep）
-fn addLoadedToolCallNote(self: *AppState, arena: Allocator, name: []const u8, args: []const u8) void {
-    const line = formatToolCallLine(arena, name, args);
-    self.addMessage(line, tool_call_style);
-    // 窗口化：调用行文本留一份（卸载后重载时恢复该行）
-    self.setLastToolHeader(line);
-}
-
-/// 恢复一条工具结果：块类工具（bash/edit）重建工具块，其余回填统计或补错误行。
-/// 展示始终用 content（全文）。
-fn addLoadedToolDisplay(self: *AppState, arena: Allocator, name: []const u8, args: []const u8, line_idx: ?usize, row: db_mod.MessageRow) void {
-    const display_text: []const u8 = row.content;
-    if (name.len > 0) {
-        if (toolBlockKind(name)) |kind| {
-            const header = toolHeaderText(arena, name, args) orelse name;
-            // 正文：edit → 落库的 diff；shell → 原始输出；错误 → 错误文本
-            const raw: []const u8 = if (row.is_error != 0)
-                display_text
-            else if (row.tool_display.len > 0)
-                row.tool_display
-            else
-                display_text;
-            const max_lines: usize = if (kind == .diff) 40 else 20;
-            const capped = capBlockBody(self.allocator, raw, max_lines) catch null;
-            defer if (capped) |c| self.allocator.free(c);
-            const body: []const u8 = if (capped) |c| c else raw;
-            const joined = std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ header, body }) catch return;
-            const header_owned = self.allocator.dupe(u8, header) catch null;
-            self.messages.append(self.allocator, .{
-                .content = joined,
-                .style = .{ .fg = .white },
-                .tool_block = kind,
-                .tool_error = row.is_error != 0,
-                .db_id = row.id,
-                .tool_header = if (header_owned) |h| h else "",
-            }) catch {
-                self.allocator.free(joined);
-                if (header_owned) |h| self.allocator.free(h);
-                return;
-            };
-            self.scroll_offset = 0;
-            return;
-        }
-    }
-
-    // 非块工具：成功回填大小统计到调用行；失败补红色错误行
-    if (row.is_error == 0) {
-        const result = tools_mod.Result{ .content = @constCast(display_text), .is_error = false };
-        const summary = summarizeToolResult(arena, result) catch "";
-        if (line_idx) |idx| {
-            self.appendNoteSuffixAt(idx, summary);
-            // 窗口化：调用行承载完整信息（调用文本 + 结果摘要），db_id 给它
-            if (idx < self.messages.items.len) self.messages.items[idx].db_id = row.id;
-        }
-        return;
-    }
-    const result = tools_mod.Result{ .content = @constCast(display_text), .is_error = true };
-    const summary = summarizeToolResult(arena, result) catch "";
-    var buf: [320]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "↳ 失败{s}{s}", .{
-        if (summary.len > 0) " · " else "",
-        summary,
-    }) catch "↳ 失败";
-    self.addMessage(line, .{ .fg = .red });
 }
 
 /// 工具 → 块渲染类型：见 display.zig 的 toolBlockKind（此处仅保留注释占位）
@@ -7936,14 +8021,23 @@ fn setThoughtExpanded(state: *AppState, msg_idx: usize, expanded: bool, keep_vie
     const width = state.message_wrap_width;
     const rows_before = if (width > 0) messageRowCount(msg.*, width) else 0;
     msg.reasoning_expanded = expanded;
-    const rows_after = if (width > 0) messageRowCount(msg.*, width) else rows_before;
 
-    if (!keep_view and state.scroll_offset == 0) return;
+    // 锚点模型：展开/折叠只改变**该条消息自身**的行数。
+    // - 锚点在其他消息：视口内容不动，无需处理；
+    // - 锚点在本消息：展开/折叠插入/删除的行都在正文之前（思考头之下），
+    //   若锚点行在思考头之后，行号同步平移，保持指向的视觉内容不变。
+    if (width == 0 or state.follow_tail or state.anchor_msg != msg_idx) return;
+    const rows_after = messageRowCount(msg.*, width);
+    if (rows_after == rows_before) return;
+    if (state.anchor_row == 0) return; // 锚在思考头：头部行不变
     if (rows_after > rows_before) {
-        state.scroll_offset +|= rows_after - rows_before;
-    } else if (rows_before > rows_after) {
-        state.scroll_offset -|= rows_before - rows_after;
+        state.anchor_row += rows_after - rows_before;
+        if (state.anchor_row > rows_after) state.anchor_row = rows_after;
+    } else {
+        const drop = rows_before - rows_after;
+        state.anchor_row = if (state.anchor_row > drop) state.anchor_row - drop else 0;
     }
+    _ = keep_view;
 }
 
 fn toggleThought(state: *AppState, msg_idx: usize) void {
@@ -7953,69 +8047,350 @@ fn toggleThought(state: *AppState, msg_idx: usize) void {
     setThoughtExpanded(state, msg_idx, !msg.reasoning_expanded, true);
 }
 
-/// ── 窗口化：按视口卸载/重载消息内容 ──
+/// ── 窗口化：按锚点位置卸载/重载消息内容（锚点模型）──
 ///
-/// 长会话（数千条）全量驻留内容会占几十 MB。这里按"视口 ± 若干屏"维护一个
-/// 驻留窗口：窗口外的消息卸载内容（释放 content/reasoning/md，保留行数缓存
-/// 供滚动定位），滚回时按 db_id 从库中重载。
-/// 只处理 db_id != 0 的历史消息；实时生成/系统提示等内存消息永不卸载。
+/// 长会话（数千条）全量驻留内容会占几十 MB。这里按"锚点 ± 若干屏"维护一个
+/// 驻留窗口：窗口外的消息卸载内容（释放 content/reasoning/md），滚回时按 db_id
+/// 重载。只处理 db_id != 0 的历史消息；实时生成/系统提示等内存消息永不卸载。
+///
+/// 锚点模型下，窗口区间从锚点向上下各数 keep 行（O(可视窗口) 而非 O(全消息数)）。
+/// 物化导致的行数变化不影响锚点内容（视口上方不依赖下方行数），无需补偿。
 const window_keep_screens: usize = 4; // 视口上下各保留的屏数
+/// 回拉触发：锚点上方可滚行数不足这么多时，向前拉一批更早历史。
+/// 必须**小于** trimWindow 的 keep_lines（否则拉/裁死循环）。
+const trim_pull_trigger_rows: usize = 60;
 
 fn updateMessageWindow(state: *AppState, width: usize, viewport_rows: usize) void {
     if (!state.windowing_enabled) return;
     if (width == 0 or viewport_rows == 0) return;
     if (state.messages.items.len == 0) return;
-    // 注意：流式期间同样执行卸载。会随生成变化的消息（正在生成的 assistant、
-    // 工具块、提示行）全部是 db_id == 0，已被 unloadMessage 的第一道守卫挡住；
-    // 从 DB 加载的历史消息在流式期间不会被修改，可以安全卸载。
-    //
-    // 宽度变化：已卸载消息的行数是按旧宽度固化的近似值。不在此处全量重载
-    // （调整窗口大小时会每帧触发）；偏差由"进入视口即重载重算"自愈。
 
-    // 1) 全量行数（卸载的走缓存，O(消息数)）
-    var total_lines: usize = 0;
-    for (state.messages.items) |*msg| {
-        total_lines += messageRowCountCached(msg, width);
-    }
-    if (state.messages.items.len > 1) total_lines += state.messages.items.len - 1;
-
-    const max_offset = if (total_lines > viewport_rows) total_lines - viewport_rows else 0;
-    const offset = @min(state.scroll_offset, max_offset);
-    const start_line = total_lines -| viewport_rows -| offset;
-
-    // 2) 计算驻留窗口的绝对行区间 [keep_lo, keep_hi)
+    // 锚点位置（跟随态：先同步到尾部视口顶部）
+    if (state.follow_tail) state.computeTailTop(width, viewport_rows);
+    const anchor = state.anchor_msg;
     const keep = viewport_rows *| window_keep_screens;
-    const keep_lo = start_line -| keep;
-    const keep_hi = start_line +| viewport_rows +| keep;
 
-    // 3) 逐条判定：窗口内重载、窗口外卸载。
-    // 懒加载壳的行高是估算值，物化后可能变化；变化发生在视口下方（即更靠底部）
-    // 时，scroll_offset（自底部计量）需同步补偿，否则视口会跳。
-    var line: usize = 0;
-    for (state.messages.items) |*msg| {
-        const rows_before = messageRowCountCached(msg, width);
-        const sep: usize = 1; // 消息间隔（末条多算 1 行无碍）
-        const msg_hi = line +| rows_before +| sep;
-        const outside = msg_hi <= keep_lo or line >= keep_hi;
+    // 1) 向前数：锚点起向下累计 keep 行 + 一屏，得到 keep_hi（只需触碰窗口内条目）
+    var keep_hi: usize = state.messages.items.len;
+    {
+        var need = keep +| viewport_rows;
+        var i = anchor;
+        while (i < state.messages.items.len) : (i += 1) {
+            const span = state.msgSpan(i, width);
+            if (span >= need) {
+                keep_hi = i + 1;
+                break;
+            }
+            need -= span;
+        }
+    }
+    // 2) 向后数：锚点起向上累计 keep 行，得到 keep_lo（反向数行）
+    var keep_lo: usize = 0;
+    {
+        var need = keep;
+        var i = anchor;
+        // 锚点行本身算入
+        if (state.anchor_row < need) need -= state.anchor_row else need = 0;
+        while (i > 0 and need > 0) {
+            i -= 1;
+            const span = state.msgSpan(i, width);
+            if (span >= need) break;
+            need -= span;
+        }
+        keep_lo = i;
+    }
 
-        const below_viewport = line >= start_line +| viewport_rows;
-        if (outside and msg.content_loaded) {
+    // 3) 区间内重载、区间外卸载（只遍历窗口区间 + 边界外一条，O(窗口大小)）
+    var i = keep_lo;
+    while (i < keep_hi) : (i += 1) {
+        const msg = &state.messages.items[i];
+        if (!msg.content_loaded) _ = state.reloadMessage(msg, width);
+    }
+    // 区间外：锚点下方一段（只扫到下一个已卸载的即可）
+    var j = keep_hi;
+    while (j < state.messages.items.len) : (j += 1) {
+        const msg = &state.messages.items[j];
+        if (!msg.content_loaded) break;
+        state.unloadMessage(msg, width);
+    }
+    // 区间外：锚点上方一段（从 keep_lo-1 向下扫到第一个已卸载的）
+    if (keep_lo > 0) {
+        var k = keep_lo;
+        while (k > 0) {
+            k -= 1;
+            const msg = &state.messages.items[k];
+            if (!msg.content_loaded) break;
             state.unloadMessage(msg, width);
-            // 卸载不改变行数（先固化再释放），无需补偿
-        } else if (!outside and !msg.content_loaded) {
-            if (state.reloadMessage(msg, width)) {
-                const rows_after = messageRowCountCached(msg, width);
-                if (below_viewport) {
-                    if (rows_after > rows_before) {
-                        state.scroll_offset +|= rows_after - rows_before;
-                    } else {
-                        state.scroll_offset -|= rows_before - rows_after;
-                    }
-                }
+        }
+    }
+
+    // 4) 回拉：锚点靠近数组头（上方可滚条数不足）且有被裁历史时，
+    //    先向前拉一批（默认 200 条），插到数组头供继续上滚；
+    //    再裁剪远端（顺序很重要：先拉后裁，避免刚拉到的又被裁掉）。
+    //    触发条件与裁剪保留量解耦：用“锚点距数组头的行数”而非下标，
+    //    否则保留量大时永远触发不了回拉。
+    if (state.trimmed_above > 0) {
+        var above_rows: usize = state.anchor_row;
+        var k = state.anchor_msg;
+        while (k > 0 and above_rows < trim_pull_trigger_rows) {
+            k -= 1;
+            above_rows +|= state.msgSpan(k, width);
+        }
+        if (above_rows < trim_pull_trigger_rows) {
+            _ = pullHistoryAbove(state, width, 200);
+        }
+    }
+    trimWindow(state, width);
+
+    // 4b) 尾部不足：锚点下方可绘行数 < 一屏时——
+    //     - 还有未加载历史（tail_has_more）→ 回拉一批补到尾部；
+    //     - 已到会话尾 → 吸附回跟随态（**底部钳制**，等价旧模型的 max_offset 钳制）。
+    //     不加钳制时锚点会越过"内容末尾 - 一屏"，视口底部露出大片空白
+    //     （实测：上滚后再下滚，锚点停在倒数几条消息处、下方只剩十几行）。
+    {
+        var below: usize = 0;
+        var bi = state.anchor_msg;
+        if (bi < state.messages.items.len) {
+            const rows = state.msgRows(bi, width);
+            below +|= rows - @min(state.anchor_row, rows);
+            bi += 1;
+        }
+        while (bi < state.messages.items.len and below < viewport_rows) : (bi += 1) {
+            below +|= state.msgSpan(bi, width);
+        }
+        if (below < viewport_rows) {
+            if (state.tail_has_more) {
+                _ = pullHistoryBelow(state, width, 200);
+            } else if (!state.follow_tail) {
+                // 吸附跟随态：下一帧 computeTailTop 把锚点对齐到"内容末尾 - 一屏"
+                state.follow_tail = true;
             }
         }
-        line = msg_hi;
     }
+
+    // 防御：锚点越界（裁剪后可能短暂不一致）时钳回合法范围
+    if (state.messages.items.len == 0) {
+        state.anchor_msg = 0;
+        state.anchor_row = 0;
+        state.follow_tail = true;
+    } else if (state.anchor_msg >= state.messages.items.len) {
+        state.anchor_msg = state.messages.items.len - 1;
+        state.anchor_row = 0;
+    }
+}
+
+/// 窗口裁剪：保留锚点上下各 window_keep_screens 屏的历史消息，
+/// 更远的历史**整个丢弃**（连 Message 结构体），内存不随会话增长。
+/// 实时消息（db_id == 0）永不裁：它们总在数组尾部（本轮生成），
+/// 所以“头部连续段可裁”的判定天然安全。
+fn trimWindow(state: *AppState, width: usize) void {
+    if (state.messages.items.len == 0) return;
+    // 保留量：**同时**满足"≥4 屏行数"与"≥keep_entries 条"，
+    // 保证一次回拉（400 条）的量不会被下一次裁剪立刻吃掉（否则拉/裁互相抵消）。
+    // 保留量：**同时**满足"≥4 屏行数"与"≥keep_entries 条"。
+    // keep_entries 必须大于回拉批量（200）：回拉会把锚点推向数组中部，
+    // 若保留条数小于批量，刚拉的批次会被下一帧当作"远端口"裁掉 → 死循环。
+    const viewport = if (state.message_visible_rows > 0) state.message_visible_rows else state.messagePageRows();
+    const keep_lines = (viewport +| 1) *| window_keep_screens;
+    const keep_entries: usize = 500;
+
+    // 头部：从锚点向上累计，直到**行数与条数两个阈值都满足**；再往前的历史可裁。
+    // 注意循环退出条件：两个需求都为 0 才停（旧写法先减条目再检查，
+    // 导致提前退出、保留量不足，回拉批次被下一帧裁掉→死循环）。
+    var cut_hi: usize = 0;
+    {
+        var need_lines = keep_lines;
+        var need_entries = keep_entries;
+        if (state.anchor_row < need_lines) need_lines -= state.anchor_row else need_lines = 0;
+        var i = state.anchor_msg;
+        while (i > 0 and (need_lines > 0 or need_entries > 0)) {
+            i -= 1;
+            if (need_entries > 0) need_entries -= 1;
+            const span = state.msgSpan(i, width);
+            if (need_lines > 0) need_lines = if (span >= need_lines) 0 else need_lines - span;
+        }
+        cut_hi = i;
+    }
+    if (cut_hi > 0) {
+        // 只裁历史段：遇到本轮实时消息立即停。
+        // 注意 db_id == 0 不能单独作为“实时”判据：历史区也有 db_id=0 的派生显示行
+        // （压缩摘要黄标题、格式化提示）。真正的“本轮”消息都在数组尾部，
+        // 由保护区间 [protect_from, len) 划定。
+        const protect_from = blk: {
+            var p = state.messages.items.len;
+            if (state.streaming_msg_idx) |idx| p = @min(p, idx);
+            if (state.compact_head_idx) |idx| p = @min(p, idx);
+            if (state.compact_msg_idx) |idx| p = @min(p, idx);
+            break :blk p;
+        };
+        const n = @min(cut_hi, protect_from);
+        if (n > 0) {
+            clearRefsAbove(state, n);
+            for (state.messages.items[0..n]) |m| state.freeDisplayMessage(m);
+            const remaining = state.messages.items.len - n;
+            std.mem.copyForwards(Message, state.messages.items[0..remaining], state.messages.items[n..]);
+            state.messages.items.len = remaining;
+            state.trimmed_above += n;
+            state.anchor_msg -|= n;
+        }
+    }
+
+    // 尾部裁剪：锚点向下超过 keep 行且尾部是历史消息（非本轮实时）时，
+    // 把远端尾部整个丢弃；tail_has_more 置 true（向下滚到数组尾时回拉）。
+    {
+        var need_lines = keep_lines;
+        var need_entries = keep_entries;
+        // 锚点所在条目剩余行 + 向后累计
+        const rows = state.msgRows(state.anchor_msg, width);
+        const in_msg = rows - @min(state.anchor_row, rows);
+        need_lines = if (in_msg >= need_lines) 0 else need_lines - in_msg;
+        var j = state.anchor_msg + 1;
+        while (j < state.messages.items.len and (need_lines > 0 or need_entries > 0)) : (j += 1) {
+            if (need_entries > 0) need_entries -= 1;
+            const span = state.msgSpan(j, width);
+            if (need_lines > 0) need_lines = if (span >= need_lines) 0 else need_lines - span;
+        }
+        const cut_lo = j;
+        if (cut_lo < state.messages.items.len) {
+            // 尾部段必须全是可丢弃的历史（不能被本轮实时消息隔断）：
+            // 从 cut_lo 到末尾逐条检查，遇到 db_id == 0（实时/派生）则放弃尾部裁剪。
+            var all_hist = true;
+            for (state.messages.items[cut_lo..]) |m| {
+                if (m.db_id == 0) {
+                    all_hist = false;
+                    break;
+                }
+            }
+            if (all_hist) {
+                for (state.messages.items[cut_lo..]) |m| state.freeDisplayMessage(m);
+                state.messages.items.len = cut_lo;
+                state.tail_has_more = true;
+            }
+        }
+    }
+}
+
+/// 清除指向“即将被裁掉的前 n 条”的引用（保守：直接清除整个选区/思考行缓存，
+/// 并钳制各保存下标；选区高亮下一帧会随新绘制重建）。
+fn clearRefsAbove(state: *AppState, n: usize) void {
+    if (state.sel_active and state.sel_area == .messages) {
+        if (state.sel_anchor.msg < n or state.sel_current.msg < n) state.clearSelection();
+    }
+    state.thought_row_count = 0; // 每帧重建，直接清空
+    if (state.streaming_msg_idx) |idx| {
+        state.streaming_msg_idx = if (idx >= n) idx - n else null;
+    }
+    if (state.compact_msg_idx) |idx| state.compact_msg_idx = if (idx >= n) idx - n else null;
+    if (state.compact_head_idx) |idx| state.compact_head_idx = if (idx >= n) idx - n else null;
+}
+
+/// 向上滚动到窗口头部时，按 db_id 回拉一批更早的历史插入数组头。
+/// 返回拉取条数（0 = 已到会话开头）。
+fn pullHistoryAbove(state: *AppState, width: usize, count: usize) usize {
+    _ = width;
+    if (!state.windowing_enabled) return 0;
+    if (state.messages.items.len == 0) return 0;
+    const db = if (state.db) |*d| d else return 0;
+    // 取数组中**最小**的 db_id（最早已加载行）。不能取“头部第一个非 0”：
+    // 数组头可能是 db_id == 0 的派生行（压缩摘要标题），跳过它会取到更大的 id，
+    // 导致反复回拉同一批（拉进来又被裁，锚点震荡）。
+    var min_id: i64 = 0;
+    for (state.messages.items) |m| {
+        if (m.db_id == 0) continue;
+        if (min_id == 0 or m.db_id < min_id) min_id = m.db_id;
+    }
+    if (min_id == 0) return 0;
+    var scratch = std.heap.ArenaAllocator.init(state.allocator);
+    defer scratch.deinit();
+    const rows = db.loadMessagesBefore(scratch.allocator(), state.session_id, min_id, count) catch return 0;
+    if (rows.len == 0) return 0;
+
+    // 保存锚定态：materializeRowAt 内部（addLoadedAssistantMessage / addUserMessageDb）
+    // 会把 follow_tail 置 true（那是"加载会话"路径的语义：新内容应贴底跟随），
+    // 但回拉是向**头部**插入历史，必须保持用户当前的锚定位置不变，否则锚点会被
+    // 重置到尾端，与回拉互相抵消（实测表现：拉/裁死循环、锚点卡住）。
+    const saved_follow = state.follow_tail;
+    const saved_anchor_msg = state.anchor_msg;
+    const saved_anchor_row = state.anchor_row;
+
+    // 降序 → 反转成升序，逐条物化为显示条目插到头部。
+    // 复用懒加载物化路径：这里直接用 buildDisplayFromMeta 的单条子集逻辑，
+    // 为避免大改，插入前先临时 append 到尾部再用 rotate 移到头部？
+    // 简单稳妥：逐条插入头部（条数少，O(n) 移动可接受）。
+    var inserted: usize = 0;
+    var i: usize = rows.len;
+    while (i > 0) {
+        i -= 1;
+        const row = rows[i];
+        const n_before = state.messages.items.len;
+        state.materializeRowAt(row, 0); // 先追加到尾部
+        if (state.messages.items.len == n_before) continue;
+        // 把最后一条旋转到头部
+        const last = state.messages.items[state.messages.items.len - 1];
+        var k: usize = state.messages.items.len - 1;
+        while (k > 0) : (k -= 1) {
+            state.messages.items[k] = state.messages.items[k - 1];
+        }
+        state.messages.items[0] = last;
+        inserted += 1;
+    }
+    if (inserted > 0) {
+        state.trimmed_above -|= inserted;
+        // 恢复锚定态：锚点随头部插入整体后移 inserted（指向同一条内容）
+        state.follow_tail = saved_follow;
+        state.anchor_msg = saved_anchor_msg + inserted;
+        state.anchor_row = saved_anchor_row;
+        // 下标引用整体后移 inserted
+        if (state.streaming_msg_idx) |idx| state.streaming_msg_idx = idx + inserted;
+        if (state.compact_msg_idx) |idx| state.compact_msg_idx = idx + inserted;
+        if (state.compact_head_idx) |idx| state.compact_head_idx = idx + inserted;
+    }
+    return inserted;
+}
+
+/// 向下滚动到窗口尾部时，按 db_id 回拉一批更晚的历史追加到数组尾。
+/// 返回拉取条数（0 = 已到会话尾）。
+fn pullHistoryBelow(state: *AppState, width: usize, count: usize) usize {
+    _ = width;
+    if (!state.windowing_enabled) return 0;
+    if (state.messages.items.len == 0) return 0;
+    const db = if (state.db) |*d| d else return 0;
+    // 取数组中**最大**的 db_id（最晚已加载行）
+    var max_id: i64 = 0;
+    for (state.messages.items) |m| {
+        if (m.db_id == 0) continue;
+        if (m.db_id > max_id) max_id = m.db_id;
+    }
+    if (max_id == 0) return 0;
+    var scratch = std.heap.ArenaAllocator.init(state.allocator);
+    defer scratch.deinit();
+    const rows = db.loadMessagesAfterLimited(scratch.allocator(), state.session_id, max_id, count) catch return 0;
+    if (rows.len == 0) {
+        state.tail_has_more = false; // 已到会话尾
+        return 0;
+    }
+
+    // 保存锚定态（materializeRowAt 会置 follow_tail，见 pullHistoryAbove 注释）
+    const saved_follow = state.follow_tail;
+    const saved_anchor_msg = state.anchor_msg;
+    const saved_anchor_row = state.anchor_row;
+
+    var inserted: usize = 0;
+    for (rows) |row| {
+        const n_before = state.messages.items.len;
+        state.materializeRowAt(row, state.messages.items.len);
+        if (state.messages.items.len > n_before) inserted += 1;
+    }
+    if (inserted > 0) {
+        state.follow_tail = saved_follow;
+        state.anchor_msg = saved_anchor_msg;
+        state.anchor_row = saved_anchor_row;
+        // 若拉到会话尾（不足一批），标记尾部已完整
+        if (inserted < count) state.tail_has_more = false;
+    } else {
+        state.tail_has_more = false;
+    }
+    return inserted;
 }
 
 fn drawMessages(state: *AppState, area: Rect, buf: *Buffer) void {
@@ -8030,61 +8405,26 @@ fn drawMessages(state: *AppState, area: Rect, buf: *Buffer) void {
     state.sel_row_count = 0;
     state.thought_row_count = 0;
 
-    // 统计全部可视行数（消息之间各有一个空行；走缓存，命中为 O(消息数)）
-    var total_lines: usize = 0;
-    for (state.messages.items) |*msg| {
-        total_lines += messageRowCountCached(msg, width);
-    }
-    if (state.messages.items.len > 1) total_lines += state.messages.items.len - 1;
-
-    if (total_lines == 0) {
+    if (state.messages.items.len == 0) {
         buf.setString(area.x, area.y, "暂无消息", .{ .fg = .dark_gray });
         return;
     }
 
-    // scroll_offset = 从底部往上滚动的行数（0 = 显示最新内容）
-    const max_offset = if (total_lines > visible_lines) total_lines - visible_lines else 0;
-    const offset = @min(state.scroll_offset, max_offset);
-    state.scroll_offset = offset;
-    const start_line = total_lines -| visible_lines -| offset;
-
-    // 防御：窗口更新与本处之间若出现未重载消息（如重载后行数变化导致可视区间偏移），
-    // 只补载与**可视区间相交**的消息。不可放宽为"起点之后全部"——上滚时那会把
-    // 视口下方的消息全量重载，窗口化形同虚设。
-    if (state.windowing_enabled) {
-        const vis_lo = start_line;
-        const vis_hi = start_line +| visible_lines;
-        var l: usize = 0;
-        for (state.messages.items) |*msg| {
-            const rows = messageRowCountCached(msg, width);
-            const sep: usize = 1;
-            const msg_hi = l +| rows +| sep;
-            if (!msg.content_loaded and l < vis_hi and msg_hi > vis_lo) {
-                // 物化后行数变化：位于视口下方（更靠底部）时补偿 scroll_offset，
-                // 避免内容跳变（与 updateMessageWindow 同一策略）。
-                const below = l >= start_line +| visible_lines;
-                if (state.reloadMessage(msg, width)) {
-                    const rows_after = messageRowCountCached(msg, width);
-                    if (below) {
-                        if (rows_after > rows) {
-                            state.scroll_offset +|= rows_after - rows;
-                        } else {
-                            state.scroll_offset -|= rows - rows_after;
-                        }
-                    }
-                }
-            }
-            l = msg_hi;
-        }
+    // 锚点模型：视口从 (anchor_msg, anchor_row) 开始向下绘制。
+    // 跟随态：锚点 = 尾部视口顶部（按真实视口高度回数）。
+    // 上/下方消息的行数变化（物化/折叠/流式追加）不影响本视口——无需补偿。
+    if (state.follow_tail) state.computeTailTop(width, visible_lines);
+    if (state.anchor_msg >= state.messages.items.len) {
+        state.anchor_msg = state.messages.items.len - 1;
+        state.anchor_row = 0;
     }
+    const start_line = state.anchor_row;
 
-    // 从 start_line 开始绘制（同时构建选择映射）
+    // 从锚点开始绘制（同时构建选择映射）
     var current_line: usize = 0;
     var y = area.y;
-    outer: for (state.messages.items, 0..) |*msg, msg_idx| {
+    outer: for (state.messages.items[state.anchor_msg..], state.anchor_msg..) |*msg, msg_idx| {
         // 整条消息完全位于视口之上：用缓存行数直接跳过，不触碰其内容。
-        // 长会话下这是把每帧成本从 O(全会话字符数) 降为 O(消息数) 的关键
-        // （行数与下方逐行走内容的结果一致，是渲染/滚动共用的既有不变量）。
         const msg_rows = messageRowCountCached(msg, width);
         const sep_rows: usize = if (msg_idx + 1 < state.messages.items.len) 1 else 0;
         if (current_line + msg_rows + sep_rows <= start_line) {
@@ -8218,14 +8558,14 @@ fn drawMessages(state: *AppState, area: Rect, buf: *Buffer) void {
         highlightSelection(state, buf);
     }
 
-    // 滚动指示器
-    if (total_lines > visible_lines) {
-        if (offset + visible_lines < total_lines) {
+    // 滚动指示器（锚点模型）：▲ = 锚点上方还有内容；▼ = 不在跟随态
+    if (!state.follow_tail or state.anchor_msg > 0 or state.anchor_row > 0) {
+        if (state.anchor_msg > 0 or state.anchor_row > 0) {
             buf.setString(area.x + area.width -| 3, area.y, " ▲ ", .{ .fg = .yellow });
         }
-        if (offset > 0) {
-            buf.setString(area.x + area.width -| 3, area.y + area.height -| 1, " ▼ ", .{ .fg = .yellow });
-        }
+    }
+    if (!state.follow_tail) {
+        buf.setString(area.x + area.width -| 3, area.y + area.height -| 1, " ▼ ", .{ .fg = .yellow });
     }
 }
 
@@ -12374,15 +12714,17 @@ test "绘制跳过：视口之上的消息不逐行走，滚动位置正确" {
     defer buf.deinit();
     var line: [160]u8 = undefined;
 
-    // offset=2 → 顶部起始行 = 19 - 8 - 2 = 9 → msg2 的第二行 "msg2b"
-    state.scroll_offset = 2;
+    // 锚点定位：msg2 的第二行 "msg2b" 作为视口首行（上滚 9 行的等价位置）
+    state.anchor_msg = 2;
+    state.anchor_row = 1;
+    state.follow_tail = false;
     drawMessages(&state, .{ .x = 0, .y = 0, .width = 40, .height = 8 }, &buf);
     renderRowText(&buf, &line);
     const top = std.mem.trimEnd(u8, &line, " ");
     try std.testing.expect(std.mem.startsWith(u8, top, "msg2b"));
 
-    // offset=0（贴底）→ 起始行 11（msg2/msg3 之间空行）→ 第 1 行是 "msg3"
-    state.scroll_offset = 0;
+    // 贴底（跟随态）→ 尾部视口：8 行高，总 19 行 → 首行在 msg3 附近
+    state.follow_tail = true;
     buf.clear();
     drawMessages(&state, .{ .x = 0, .y = 0, .width = 40, .height = 8 }, &buf);
     var row1: [160]u8 = undefined;
@@ -12782,7 +13124,9 @@ test "窗口化：流式期间照常卸载历史消息，实时消息受保护�
     state.setStreamStatus(.running);
 
     // 滚到最顶：窗口外的历史消息应被卸载（流式守卫已移除）
-    state.scroll_offset = 100_000;
+    state.anchor_msg = 0;
+    state.anchor_row = 0;
+    state.follow_tail = false;
     updateMessageWindow(&state, 40, 10);
 
     var unloaded_count: usize = 0;
@@ -14054,7 +14398,7 @@ fn renderRowText(buf: *tui.render.Buffer, out: *[160]u8) void {
     }
 }
 
-test "流式追加消息：上翻阅读时保持视口不动" {
+test "流式追加消息：上翻阅读时保持视口不动（锚点模型）" {
     var state = AppState{};
     state.allocator = std.testing.allocator;
     state.message_wrap_width = 40;
@@ -14064,27 +14408,29 @@ test "流式追加消息：上翻阅读时保持视口不动" {
     }
 
     state.addUserMessage("hi");
-    try std.testing.expectEqual(@as(usize, 0), state.scroll_offset);
+    try std.testing.expect(state.follow_tail);
 
-    // 上翻阅读中：新增 1 行内容 + 1 个消息间隔空行 → 偏移 +2，视口原地不动
-    state.scroll_offset = 10;
+    // 上翻阅读：进入锚定态（锚点指向已读位置）
+    state.anchor_msg = 0;
+    state.anchor_row = 0;
+    state.follow_tail = false;
+
+    // 流式追加（工具调用行 / 工具块 / 多行内容）
     state.addStreamMessage("→ Read foo.zig", tool_call_style);
-    try std.testing.expectEqual(@as(usize, 12), state.scroll_offset);
-
-    // 贴底：继续跟随最新消息
-    state.scroll_offset = 0;
-    state.addStreamMessage("→ Read bar.zig", tool_call_style);
-    try std.testing.expectEqual(@as(usize, 0), state.scroll_offset);
-
-    // 工具块（bash）标题同样保持视口（标题 1 行 + 间隔 1 行）
-    state.scroll_offset = 5;
     try std.testing.expect(state.beginToolBlock("bash", "{\"command\":\"echo hi\"}", .shell));
-    try std.testing.expectEqual(@as(usize, 7), state.scroll_offset);
-
-    // 多行追加按实际行数 + 间隔补偿
-    state.scroll_offset = 3;
     state.addStreamMessage("a\nb\nc", .{});
-    try std.testing.expectEqual(@as(usize, 7), state.scroll_offset);
+
+    // 锚点模型：锚点指向的视口首行内容不变（仍是 msg0 的第 0 行）——不跳变
+    try std.testing.expectEqual(@as(usize, 0), state.anchor_msg);
+    try std.testing.expectEqual(@as(usize, 0), state.anchor_row);
+    try std.testing.expect(!state.follow_tail);
+
+    // 贴底（跟随态）：新内容自动跟随（绘制时锚点重算到尾部）
+    state.follow_tail = true;
+    var buf = try tui.render.Buffer.init(std.testing.allocator, 40, 6);
+    defer buf.deinit();
+    drawMessages(&state, .{ .x = 0, .y = 0, .width = 40, .height = 6 }, &buf);
+    try std.testing.expect(state.follow_tail);
 }
 
 test "启动恢复：打开会话即记录访问，重启加载的是它（非最大 id）" {
@@ -14133,7 +14479,7 @@ test "启动恢复：打开会话即记录访问，重启加载的是它（非�
     try std.testing.expectEqual(sid_a, latest.id);
 }
 
-test "空占位的流式消息移除时反向补偿偏移" {
+test "空占位的流式消息移除：锚点指向的内容不动（锚点模型）" {
     var state = AppState{};
     state.allocator = std.testing.allocator;
     state.message_wrap_width = 40;
@@ -14143,15 +14489,20 @@ test "空占位的流式消息移除时反向补偿偏移" {
     }
 
     state.addMessage("已有消息", .{});
-    state.scroll_offset = 3;
+    // 锚定在第一条消息首行（上翻阅读）
+    state.anchor_msg = 0;
+    state.anchor_row = 0;
+    state.follow_tail = false;
 
-    // 新建空流式消息：多出间隔空行 → 偏移 +1
+    // 新建空流式消息（追加在末尾，不影响锚点）
     _ = state.ensureStreamingMessage();
-    try std.testing.expectEqual(@as(usize, 4), state.scroll_offset);
+    try std.testing.expectEqual(@as(usize, 0), state.anchor_msg);
+    try std.testing.expectEqual(@as(usize, 0), state.anchor_row);
 
-    // 回合结束时回收空消息 → 偏移 -1，视口原地不动
+    // 回合结束时回收空消息 → 锚点指向的内容仍不变
     state.closeCurrentTurn();
-    try std.testing.expectEqual(@as(usize, 3), state.scroll_offset);
+    try std.testing.expectEqual(@as(usize, 0), state.anchor_msg);
+    try std.testing.expectEqual(@as(usize, 0), state.anchor_row);
     try std.testing.expectEqual(@as(usize, 1), state.messages.items.len);
 }
 
@@ -14170,13 +14521,15 @@ test "上翻阅读：工具调用追加消息后端到端视口不变" {
         state.messages.deinit(std.testing.allocator);
     }
 
-    // 10 条历史消息（各 1 行 + 间隔 = 19 行），上翻到中途
+    // 10 条历史消息（各 1 行 + 间隔 = 19 行），上翻到中途（锚定第 5 条）
     for (0..10) |i| {
         var b: [32]u8 = undefined;
         const text = std.fmt.bufPrint(&b, "历史消息 {d}", .{i}) catch unreachable;
         state.addMessage(text, .{});
     }
-    state.scroll_offset = 5;
+    state.anchor_msg = 5;
+    state.anchor_row = 0;
+    state.follow_tail = false;
 
     var buf = try tui.render.Buffer.init(std.testing.allocator, 40, 10);
     defer buf.deinit();
@@ -14307,4 +14660,51 @@ test "懒加载：与全量加载的显示条目逐条等价（含工具行/思�
         try std.testing.expectEqualStrings(fh.content, lh.content);
         try std.testing.expectEqual(fh.db_id, lh.db_id);
     }
+}
+
+test "锚点：上滚后再下滚不会越过内容末尾（底部钳制）" {
+    var state = AppState{};
+    state.allocator = std.testing.allocator;
+    state.message_wrap_width = 40;
+    state.message_visible_rows = 8;
+    defer {
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+    }
+
+    // 10 条消息（各 1 行 + 间隔 = 19 行），视口 8 行
+    for (0..10) |i| {
+        var b: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&b, "msg {d}", .{i}) catch unreachable;
+        state.addMessage(text, .{});
+    }
+
+    var buf = try tui.render.Buffer.init(std.testing.allocator, 40, 8);
+    defer buf.deinit();
+    const area = Rect{ .x = 0, .y = 0, .width = 40, .height = 8 };
+
+    // 上滚 20 行 → 锚定态
+    state.scrollUp(20);
+    drawMessages(&state, area, &buf);
+    try std.testing.expect(!state.follow_tail);
+
+    // 下滚 100 行（远超剩余内容）：到底后必须回跟随态，且不得停在半空
+    var k: usize = 0;
+    while (k < 100) : (k += 1) {
+        state.scrollDown(10);
+        drawMessages(&state, area, &buf);
+        if (state.follow_tail) break;
+    }
+    try std.testing.expect(state.follow_tail);
+
+    // 跟随态下：尾部视口首行 = 内容末尾 - 8 行（总 19 行 → 首行 11）
+    var total: usize = 0;
+    for (state.messages.items, 0..) |*m, i| {
+        total += messageRowCountCached(m, 40);
+        if (i + 1 < state.messages.items.len) total += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 19), total);
+    // 锚点应指向"内容末尾 - 8 行"（首行 11）：msg5 的第 1 行（每条 2 行：内容 + 间隔）
+    try std.testing.expectEqual(@as(usize, 5), state.anchor_msg);
+    try std.testing.expectEqual(@as(usize, 1), state.anchor_row);
 }
