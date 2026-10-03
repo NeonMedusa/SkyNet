@@ -32,6 +32,7 @@ zig build -Doptimize=ReleaseSafe
 | `test/mock_summary.ps1` | 18125 | compaction 摘要请求（返回 `MOCK_SUMMARY`） |
 | `test/mock_openai_truncated.ps1` | 18126 | 响应流中途断开（无 [DONE]/finish_reason）→ 验证 StreamTruncated 检测与重试预算耗尽 |
 | `test/mock_openai_retry.ps1` | 18127 | 每个唯一标记（提问中的 `#<毫秒>` 或 `#503<毫秒>`）的第一次请求失败、后续成功：无 `503` 前缀 → 截断（验证断连重试）；有 → HTTP 503（验证瞬时故障重试）。可重复运行 |
+| `test/mock_conn_test.ps1` | 18128 | **连接复用验证**：手工实现 HTTP/1.1 keep-alive 服务端，按 TCP 连接记录请求归属，日志写入 `%TEMP%\skynet_conn_test.log`（`CONN n accepted` / `REQ m conn=n`）。多轮工具循环应显示多个 REQ 共用同一 conn |
 
 启动（在工作目录执行，脚本会写 `test/mock_*.running` 标记）：
 
@@ -40,6 +41,7 @@ Start-Process pwsh -ArgumentList '-NoProfile','-File','test/mock_openai_sse.ps1'
 Start-Process pwsh -ArgumentList '-NoProfile','-File','test/mock_summary.ps1'
 Start-Process pwsh -ArgumentList '-NoProfile','-File','test/mock_openai_truncated.ps1'
 Start-Process pwsh -ArgumentList '-NoProfile','-File','test/mock_openai_retry.ps1'
+Start-Process pwsh -ArgumentList '-NoProfile','-File','test/mock_conn_test.ps1'
 ```
 
 清理时注意**排除当前进程**，否则会误杀自己：

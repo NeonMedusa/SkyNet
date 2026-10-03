@@ -409,6 +409,12 @@ Debug+smp 稳定 ~25MB、**ReleaseSafe 最省（~17MB，链接 libc → `c_alloc
   回退建壳（可后续物化），**不得静默跳过**——否则滚动定位与元数据错位；
 - `insertMessage` 内部统一计算显示元数据（`computeDisplayMeta`）；新增写入路径时
   不要手工填 `disp_*`（会与物化形态漂移）；改“显示正文”定义时两处同改。
+- **HTTP 客户端必须跨请求复用**（2026-10-03）：早期实现每次请求新建
+  `std.http.Client` 并 `deinit`，且 `keep_alive = false`——每请求一次 TCP+TLS
+  握手 + 重读系统 CA 证书。现由 `AI.getClient()` 懒初始化并跨请求复用
+  （自带 LRU 连接池，默认 32 条）。实测对照（3 轮工具循环）：旧行为 3 条连接，
+  修复后 1 条。新增 HTTP 调用点时用 `self.getClient()`，不要在请求里新建客户端；
+  AI 生命周期结束时记得 `deinitClient()`（否则连接池泄漏）。
 
 ---
 

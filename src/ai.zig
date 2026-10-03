@@ -457,12 +457,51 @@ pub const AI = struct {
     /// 最近一次请求的 token 用量（含缓存命中）
     usage: Usage = .{},
 
+    /// ── HTTP 客户端（长生命周期，跨请求复用）──
+    /// std.http.Client 自带 LRU 连接池（同 host:port 复用，默认 32 条）与懒加载
+    /// CA 证书包；每次请求新建客户端等于每请求一次 TCP+TLS 握手 + 重读系统证书。
+    /// 工具循环一个回合可能有几十次请求，故在 AI 生命周期内复用。
+    /// 线程安全：AI 实例不跨线程共享（worker 线程各自持有）。
+    client: ?http.Client = null,
+    /// 代理配置的分配域（initDefaultProxies 要求比客户端活得久）
+    proxy_arena: ?*std.heap.ArenaAllocator = null,
+
     pub fn init(allocator: Allocator, io: Io, config: OpenAIConfig) AI {
         return .{
             .config = config,
             .allocator = allocator,
             .io = io,
         };
+    }
+
+    /// 销毁懒初始化的 HTTP 客户端与代理 arena（AI 不再使用时调用）
+    pub fn deinitClient(self: *AI) void {
+        if (self.client) |*c| {
+            c.deinit();
+            self.client = null;
+        }
+        if (self.proxy_arena) |pa| {
+            pa.deinit();
+            self.allocator.destroy(pa);
+            self.proxy_arena = null;
+        }
+    }
+
+    /// 取得可复用的 HTTP 客户端（首次调用时创建，含代理配置）
+    fn getClient(self: *AI) *http.Client {
+        if (self.client) |*c| return c;
+        self.client = .{
+            .allocator = self.allocator,
+            .io = self.io,
+        };
+        if (self.environ_map) |env| {
+            // 代理配置的分配域必须比客户端活得久：单独 arena，随 deinitClient 释放
+            const pa = self.allocator.create(std.heap.ArenaAllocator) catch return &self.client.?;
+            pa.* = std.heap.ArenaAllocator.init(self.allocator);
+            self.proxy_arena = pa;
+            self.client.?.initDefaultProxies(pa.allocator(), env) catch {};
+        }
+        return &self.client.?;
     }
 
     /// 读取错误响应体（最多 4KB，兼容 gzip 等压缩），非法字节替换为 U+FFFD
@@ -500,17 +539,7 @@ pub const AI = struct {
         return body;
     }
 
-    /// 创建带代理支持的 HTTP 客户端（proxy_arena 需比客户端活得久）
-    fn makeClient(self: *AI, proxy_arena: Allocator) http.Client {
-        var client: http.Client = .{
-            .allocator = self.allocator,
-            .io = self.io,
-        };
-        if (self.environ_map) |env| {
-            client.initDefaultProxies(proxy_arena, env) catch {};
-        }
-        return client;
-    }
+    // （makeClient 已由 getClient 取代：客户端跨请求复用，见字段注释）
 
     /// 构建会话路由头与自定义头（按 affinity 方言）：
     /// zen → x-opencode-session/client；openai → session_id/x-client-request-id/x-session-affinity；
@@ -610,18 +639,15 @@ pub const AI = struct {
             null;
         defer if (auth_header) |h| self.allocator.free(h);
 
-        // Create a fresh client for each request to avoid stale connections
-        var proxy_arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer proxy_arena.deinit();
-        var client = self.makeClient(proxy_arena.allocator());
-        defer client.deinit();
+        // 复用长生命周期客户端（连接池 + CA 证书包跨请求保持）
+        const client = self.getClient();
 
         var extra_headers = std.ArrayListUnmanaged(http.Header){ .items = &.{}, .capacity = 0 };
         defer extra_headers.deinit(self.allocator);
         self.appendBehaviorHeaders(&extra_headers);
 
         var request = client.request(.POST, uri, .{
-            .keep_alive = false,
+            .keep_alive = true,
             .extra_headers = extra_headers.items,
             .headers = .{
                 .user_agent = .{ .override = user_agent },
@@ -732,18 +758,15 @@ pub const AI = struct {
             null;
         defer if (auth_header) |h| self.allocator.free(h);
 
-        // 与 streamMessage 使用相同的 HTTP 客户端模式
-        var proxy_arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer proxy_arena.deinit();
-        var client = self.makeClient(proxy_arena.allocator());
-        defer client.deinit();
+        // 与 streamMessage 使用同一个复用客户端
+        const client = self.getClient();
 
         var extra_headers = std.ArrayListUnmanaged(http.Header){ .items = &.{}, .capacity = 0 };
         defer extra_headers.deinit(self.allocator);
         self.appendBehaviorHeaders(&extra_headers);
 
         var request = client.request(.GET, uri, .{
-            .keep_alive = false,
+            .keep_alive = true,
             .extra_headers = extra_headers.items,
             .headers = .{
                 .user_agent = .{ .override = user_agent },

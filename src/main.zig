@@ -4053,6 +4053,7 @@ const AppState = struct {
             .behavior = config_mod.behavior(&p),
         });
         client.environ_map = self.environ_map;
+        defer client.deinitClient();
 
         self.freeModelSelectModels();
 
@@ -5172,6 +5173,7 @@ fn compactionExecute(plan: *CompactionPlan) void {
         .behavior = beh,
     });
     client.environ_map = plan.environ_map;
+    defer client.deinitClient();
 
     const msgs = [_]ai.Message{
         .{ .role = "system", .content = compaction_system_prompt },
@@ -5326,6 +5328,7 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
         .behavior = beh,
     });
     client.environ_map = job.environ_map;
+    defer client.deinitClient();
 
     const msgs = [_]ai.Message{
         .{ .role = "system", .content = compaction_system_prompt },
@@ -7434,6 +7437,7 @@ fn streamWorker(job: *StreamJob) void {
         .behavior = job.behavior,
     });
     client.environ_map = job.environ_map;
+    defer client.deinitClient();
 
     // 实时落库/中途压缩共用一条 worker 连接（主线程连接不跨线程使用）
     var worker_db: ?db_mod.Db = null;
