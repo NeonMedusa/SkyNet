@@ -941,6 +941,14 @@ pub const Db = struct {
             .{ title, session_id },
         );
     }
+
+    /// 重命名会话（直接覆盖标题，不做空标题保护；空标题由 UI 层决定是否允许）
+    pub fn setSessionTitle(self: *Db, session_id: i64, title: []const u8) !void {
+        try self.sess.exec(
+            "UPDATE \"session\" SET title = ? WHERE id = ?",
+            .{ title, session_id },
+        );
+    }
 };
 
 /// 从消息内容截取会话标题（最多 30 个字符，遇换行截止）

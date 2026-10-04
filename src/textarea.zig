@@ -107,8 +107,11 @@ pub const TextArea = struct {
         self.buf.items.len -= n;
     }
 
-    /// 删除字节区间 [start, end)（越界自动裁剪），光标落在区间起点
+    /// 删除字节区间 [start, end)（越界自动裁剪），光标落在区间起点。
+    /// 同时清除选区：调用方（输入替换/剪切/删除选区）语义上选区已被消费，
+    /// 若不清除，下一次插入会再删一遍区间——重命名框表现为"永远只剩一个字符"。
     pub fn deleteRange(self: *Self, start: usize, end: usize) void {
+        self.sel_range = null;
         const lo = @min(start, self.buf.items.len);
         const hi = @min(end, self.buf.items.len);
         if (hi <= lo) return;
@@ -116,6 +119,21 @@ pub const TextArea = struct {
         self.buf.items.len -= (hi - lo);
         self.cursor = lo;
         self.follow_cursor = true;
+    }
+
+    /// 方向键折叠选区（主流编辑器语义）：左/上折叠到左边缘、右/下折叠到右边缘。
+    /// 清除选区并把光标移到边缘，返回 true 表示存在有效选区并已折叠
+    /// （调用方不要再移动光标）。无选区/空选区返回 false。
+    pub fn collapseSelection(self: *Self, to_right: bool) bool {
+        const r = self.sel_range orelse return false;
+        self.sel_range = null;
+        const len = self.buf.items.len;
+        const lo = @min(@min(r[0], r[1]), len);
+        const hi = @min(@max(r[0], r[1]), len);
+        if (hi <= lo) return false;
+        self.cursor = if (to_right) hi else lo;
+        self.follow_cursor = true;
+        return true;
     }
 
     pub fn moveCursorLeft(self: *Self) void {
@@ -693,6 +711,8 @@ test "TextArea: deleteRange 删除选区" {
     ta.deleteRange(0, 6); // 删除 "hello "
     try testing.expectEqualStrings("world", ta.value());
     try testing.expectEqual(@as(usize, 0), ta.cursor);
+    // 选区必须被清除：否则后续插入会再次删除该区间（重命名框只剩一个字符的 bug）
+    try testing.expect(ta.sel_range == null);
 
     // 越界裁剪
     ta.deleteRange(3, 99);
@@ -708,6 +728,53 @@ test "TextArea: deleteRange 删除选区" {
     ta.insertBytes("中文字符");
     ta.deleteRange(3, 6); // 删除 "文"
     try testing.expectEqualStrings("中字符", ta.value());
+
+    // 替换语义：设选区 → deleteRange → 逐字符插入（模拟键盘输入）
+    // 关键：若 deleteRange 不清选区，第二个字符会再次删除区间 → 永远只剩一个字符
+    ta.clear();
+    ta.insertBytes("旧标题");
+    ta.sel_range = .{ 0, ta.value().len };
+    ta.deleteRange(0, ta.value().len);
+    ta.insertCodepoint('a');
+    ta.insertCodepoint('b');
+    ta.insertCodepoint('c');
+    try testing.expectEqualStrings("abc", ta.value());
+    try testing.expect(ta.sel_range == null);
+}
+
+test "TextArea: collapseSelection 折叠到边缘" {
+    var ta = TextArea{ .allocator = testing.allocator };
+    defer ta.deinit();
+    ta.insertBytes("hello world");
+
+    // 左折：光标到左边缘
+    ta.cursor = 5;
+    ta.sel_range = .{ 2, 8 };
+    try testing.expect(ta.collapseSelection(false));
+    try testing.expectEqual(@as(usize, 2), ta.cursor);
+    try testing.expect(ta.sel_range == null);
+
+    // 右折：光标到右边缘
+    ta.sel_range = .{ 2, 8 };
+    try testing.expect(ta.collapseSelection(true));
+    try testing.expectEqual(@as(usize, 8), ta.cursor);
+    try testing.expect(ta.sel_range == null);
+
+    // 反向区间（anchor > current）同样按数值边缘折叠
+    ta.sel_range = .{ 8, 2 };
+    try testing.expect(ta.collapseSelection(false));
+    try testing.expectEqual(@as(usize, 2), ta.cursor);
+
+    // 无选区 / 空选区：返回 false
+    try testing.expect(!ta.collapseSelection(false));
+    ta.sel_range = .{ 4, 4 };
+    try testing.expect(!ta.collapseSelection(false));
+    try testing.expect(ta.sel_range == null);
+
+    // 越界选区裁剪
+    ta.sel_range = .{ 3, 999 };
+    try testing.expect(ta.collapseSelection(true));
+    try testing.expectEqual(ta.value().len, ta.cursor);
 }
 
 test "TextArea: 光标闪烁开关影响光标块" {

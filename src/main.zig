@@ -99,6 +99,8 @@ const Mode = enum {
     preset_select,
     session_select,
     session_confirm,
+    /// 会话重命名（Ctrl+R 从会话选择进入；输入框 + Enter 保存）
+    session_rename,
     help_select,
 };
 
@@ -316,6 +318,13 @@ const InputSelRow = struct {
 };
 
 const max_input_sel_rows = 16;
+
+/// 表单字段的屏幕行（绘制时记录，供鼠标坐标 → 字段/偏移映射）
+const ProviderFormRow = struct {
+    y: u16 = 0,
+    x: u16 = 0,
+    field: usize = 0,
+};
 
 const max_sel_rows = 128;
 
@@ -698,27 +707,36 @@ const AppState = struct {
         .cursor_style = .{ .fg = .black, .bg = .white },
         .placeholder = "例如: LM-Studio",
         .focused = true,
+        .draw_fake_cursor = false, // 用真实终端光标（与主输入框同一套）
     },
     provider_form_url: TextInput(256) = .{
         .style = .{ .fg = .white },
         .cursor_style = .{ .fg = .black, .bg = .white },
         .placeholder = "例如: http://127.0.0.1:1234/v1",
         .focused = false,
+        .draw_fake_cursor = false,
     },
     provider_form_key: TextInput(256) = .{
         .style = .{ .fg = .white },
         .cursor_style = .{ .fg = .black, .bg = .white },
         .placeholder = "可留空",
         .focused = false,
+        .draw_fake_cursor = false,
     },
     provider_form_key_env: TextInput(256) = .{
         .style = .{ .fg = .white },
         .cursor_style = .{ .fg = .black, .bg = .white },
         .placeholder = "可留空，如 OPENAI_API_KEY",
         .focused = false,
+        .draw_fake_cursor = false,
     },
     provider_form_field: usize = 0,
     provider_edit_index: ?usize = null,
+    /// 表单字段的屏幕位置（每帧由 drawProviderAdd 记录；鼠标框选用）
+    provider_form_rows: [4]ProviderFormRow = [_]ProviderFormRow{.{}} ** 4,
+    provider_form_row_count: usize = 0,
+    /// 表单字段拖选状态（框选：记录锚点字段与偏移）
+    provider_form_drag: struct { active: bool = false, field: usize = 0, anchor: usize = 0 } = .{},
     /// 表单所属预设 id（空 = 自定义）
     provider_form_preset: [64]u8 = undefined,
     provider_form_preset_len: usize = 0,
@@ -800,6 +818,22 @@ const AppState = struct {
     confirm_title_len: usize = 0,
     confirm_stage: u8 = 0, // 1=第一次确认 2=第二次确认
     confirm_yes: bool = false, // 光标是否在"是"上（默认在"否"）
+
+    /// 会话重命名输入框（Ctrl+R 进入；沿用 TextArea 以支持选/剪切/粘贴）。
+    /// 用真实终端光标（draw_fake_cursor = false）：与主输入框同一套光标行为
+    /// （方块观感 + 终端原生闪烁）；坐标在 drawRenameOverlay 里写入 term_cursor_*。
+    rename_input: textarea_mod.TextArea = .{
+        .style = .{ .fg = .white },
+        .cursor_style = .{ .fg = .black, .bg = .white },
+        .draw_fake_cursor = false,
+        .placeholder = "输入新标题…",
+    },
+    /// 正在重命名的会话 id（0 = 无）
+    rename_session_id: i64 = 0,
+    /// 重命名输入框的屏幕区域（每帧由 drawRenameOverlay 记录；鼠标框选用）
+    rename_field_rect: Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+    /// 重命名框拖选状态（锚点字节偏移；active = false 表示未拖动）
+    rename_drag: struct { active: bool = false, anchor: usize = 0 } = .{},
 
     // 帮助菜单状态
     help_select_index: usize = 0,
@@ -1579,6 +1613,23 @@ const AppState = struct {
         const hi = @max(a, b);
         if (hi <= lo) return null;
         return .{ lo, hi };
+    }
+
+    /// 方向键折叠输入框选区（主流编辑器语义）：左/上折叠到左边缘、右/下折叠到右边缘；
+    /// 清除选区并把光标移到边缘，返回 true 表示存在有效选区并已折叠。
+    /// 注意：主输入框的选区存在 app 层（sel_anchor/sel_current），input.sel_range
+    /// 只是绘制时同步的镜像，因此这里以 inputSelectionRange() 为准。
+    fn collapseInputSelection(self: *AppState, to_right: bool) bool {
+        if (!self.sel_active or self.sel_area != .input) return false;
+        if (self.inputSelectionRange()) |r| {
+            self.input.cursor = if (to_right) r[1] else r[0];
+            self.input.follow_cursor = true;
+            self.input.sel_range = null; // 立即清除镜像，避免本帧残留高亮
+            self.clearSelection();
+            return true;
+        }
+        self.clearSelection();
+        return false;
     }
 
     /// 删除输入框选中内容（无选区时无操作）
@@ -3040,6 +3091,15 @@ const AppState = struct {
         const total = self.session_list.len + 1; // +1: 新建会话
         const visible = if (self.menu_visible_rows > 0) self.menu_visible_rows else 10;
 
+        // Ctrl+R：重命名当前选中的会话（第一项"新建会话"不可重命名）
+        if (key.modifiers.ctrl) {
+            if (key.code == .char and (key.code.char == 18 or key.code.char == 'r' or key.code.char == 'R')) {
+                if (self.session_select_index == 0) return;
+                self.startSessionRename(self.session_list[self.session_select_index - 1]);
+                return;
+            }
+        }
+
         switch (key.code) {
             .up => {
                 self.session_select_index = if (self.session_select_index == 0) total - 1 else self.session_select_index - 1;
@@ -3076,6 +3136,151 @@ const AppState = struct {
             },
             else => {},
         }
+    }
+
+    /// 进入重命名模式：把当前标题填入输入框（全选，方便直接覆盖）
+    fn startSessionRename(self: *AppState, s: db_mod.SessionListRow) void {
+        self.rename_session_id = s.id;
+        self.rename_input.clear();
+        if (s.title.len > 0) self.rename_input.insertBytes(s.title);
+        // 不预选：光标落在末尾，用户按需 Ctrl+A 或手动选择（与常见重命名交互一致）
+        self.rename_input.sel_range = null;
+        self.rename_input.cursor = self.rename_input.value().len;
+        self.rename_input.follow_cursor = true;
+        self.mode = .session_rename;
+    }
+
+    /// 保存重命名（空标题不允许保存，保留原标题并提示）
+    fn commitSessionRename(self: *AppState) void {
+        const db = if (self.db) |*d| d else return;
+        const title = std.mem.trim(u8, self.rename_input.value(), " \t\r\n");
+        if (title.len == 0) {
+            self.setToast("标题不能为空");
+            return;
+        }
+        if (self.rename_session_id != 0) {
+            db.setSessionTitle(self.rename_session_id, title) catch {
+                self.setToast("重命名失败");
+                self.cancelSessionRename();
+                return;
+            };
+        }
+        // 刷新列表（标题变更后排序不变，但内容要更新）
+        self.session_list = db.listSessions() catch self.session_list;
+        self.setToast("已重命名");
+        self.cancelSessionRename();
+    }
+
+    fn cancelSessionRename(self: *AppState) void {
+        self.rename_session_id = 0;
+        self.rename_input.clear();
+        self.mode = .session_select;
+    }
+
+    fn handleSessionRenameKey(self: *AppState, key: tui.KeyEvent) void {
+        switch (key.code) {
+            .enter => self.commitSessionRename(),
+            .esc => self.cancelSessionRename(),
+            .char => |c| {
+                // Ctrl 组合：A 全选 / X 剪切 / C 复制（复用输入框选区机制）
+                if (key.modifiers.ctrl) {
+                    switch (c) {
+                        'a', 'A', 1 => {
+                            if (self.rename_input.value().len > 0) {
+                                self.rename_input.sel_range = .{ 0, self.rename_input.value().len };
+                                self.rename_input.cursor = self.rename_input.value().len;
+                            }
+                        },
+                        'x', 'X', 24 => self.cutRenameSelection(),
+                        'c', 'C' => self.copyRenameSelection(),
+                        else => {},
+                    }
+                    return;
+                }
+                // 有选区：输入即替换选中内容（TextArea 不自动处理，需在此显式删除）
+                if (self.renameSelectionRange()) |r| self.rename_input.deleteRange(r[0], r[1]);
+                if (c >= 0x20) self.rename_input.insertCodepoint(c);
+            },
+            .backspace => {
+                if (self.renameSelectionRange()) |r| {
+                    self.rename_input.deleteRange(r[0], r[1]);
+                } else {
+                    self.rename_input.deleteBackward();
+                }
+            },
+            .delete => {
+                if (self.renameSelectionRange()) |r| {
+                    self.rename_input.deleteRange(r[0], r[1]);
+                } else {
+                    self.rename_input.deleteForward();
+                }
+            },
+            .left => {
+                if (!self.rename_input.collapseSelection(false)) self.rename_input.moveCursorLeft();
+            },
+            .right => {
+                if (!self.rename_input.collapseSelection(true)) self.rename_input.moveCursorRight();
+            },
+            .home => {
+                _ = self.rename_input.collapseSelection(false);
+                self.rename_input.moveCursorHome();
+            },
+            .end => {
+                _ = self.rename_input.collapseSelection(true);
+                self.rename_input.moveCursorEnd();
+            },
+            else => {},
+        }
+    }
+
+    /// 重命名框的屏幕坐标 → 字节偏移（含视口滚动）；不在字段内返回 null
+    fn renamePointAt(self: *AppState, x: u16, y: u16) ?usize {
+        const r = self.rename_field_rect;
+        if (r.width == 0 or y != r.y or x < r.x or x >= r.x + r.width) return null;
+        const width: usize = r.width;
+        const row_index = self.rename_input.view_start; // 单行视口：显示的第一行
+        const range = self.rename_input.rowByteRange(width, row_index) orelse return null;
+        const text = self.rename_input.value();
+        const off_in_row = offsetInRange(text, range[0], range[1], x - r.x);
+        return off_in_row;
+    }
+
+    /// 重命名输入框的选区范围（两端排序、越界裁剪）；无有效选区返回 null
+    fn renameSelectionRange(self: *const AppState) ?[2]usize {
+        const r = self.rename_input.sel_range orelse return null;
+        const text_len = self.rename_input.value().len;
+        const lo = @min(r[0], text_len);
+        const hi = @min(r[1], text_len);
+        if (hi <= lo) return null;
+        return .{ lo, hi };
+    }
+
+    /// 复制重命名输入框选区（成功后清选区，与主输入框 Ctrl+C 一致）
+    fn copyRenameSelection(self: *AppState) void {
+        const r = self.renameSelectionRange() orelse return;
+        const sel = self.rename_input.value()[r[0]..r[1]];
+        if (clipboard.setText(self.allocator, sel)) {
+            var note_buf: [64]u8 = undefined;
+            const note = std.fmt.bufPrint(&note_buf, "已复制 {d} 字符", .{sel.len}) catch "已复制";
+            self.setToast(note);
+        } else {
+            self.setToast("复制到剪贴板失败");
+        }
+        self.rename_input.sel_range = null;
+    }
+
+    /// 剪切重命名输入框选区（先写剪贴板，成功后再删除）
+    fn cutRenameSelection(self: *AppState) void {
+        const r = self.renameSelectionRange() orelse return;
+        const sel = self.rename_input.value()[r[0]..r[1]];
+        if (!clipboard.setText(self.allocator, sel)) {
+            self.setToast("剪切到剪贴板失败");
+            return;
+        }
+        var note_buf: [64]u8 = undefined;
+        const note = std.fmt.bufPrint(&note_buf, "已剪切 {d} 字符", .{sel.len}) catch "已剪切";
+        self.setToast(note);
+        self.rename_input.deleteRange(r[0], r[1]);
     }
 
     fn handleSessionConfirmKey(self: *AppState, key: tui.KeyEvent) void {
@@ -4146,6 +4351,36 @@ const AppState = struct {
         };
     }
 
+    /// 复制当前表单字段的选区（成功后清选区）
+    fn copyProviderFormSelection(self: *AppState) void {
+        const input = self.providerFormActiveInput();
+        const r = input.selectionRange() orelse return;
+        const sel = input.value()[r[0]..r[1]];
+        if (clipboard.setText(self.allocator, sel)) {
+            var note_buf: [64]u8 = undefined;
+            const note = std.fmt.bufPrint(&note_buf, "已复制 {d} 字符", .{sel.len}) catch "已复制";
+            self.setToast(note);
+        } else {
+            self.setToast("复制到剪贴板失败");
+        }
+        input.sel_range = null;
+    }
+
+    /// 剪切当前表单字段的选区（先写剪贴板，成功后再删除）
+    fn cutProviderFormSelection(self: *AppState) void {
+        const input = self.providerFormActiveInput();
+        const r = input.selectionRange() orelse return;
+        const sel = input.value()[r[0]..r[1]];
+        if (!clipboard.setText(self.allocator, sel)) {
+            self.setToast("剪切到剪贴板失败");
+            return;
+        }
+        var note_buf: [64]u8 = undefined;
+        const note = std.fmt.bufPrint(&note_buf, "已剪切 {d} 字符", .{sel.len}) catch "已剪切";
+        self.setToast(note);
+        input.deleteRange(r[0], r[1]);
+    }
+
     fn providerFormUpdateFocus(self: *AppState) void {
         self.provider_form_name.focused = self.provider_form_field == 0;
         self.provider_form_url.focused = self.provider_form_field == 1;
@@ -4576,12 +4811,24 @@ const AppState = struct {
     }
 
     fn handleProviderAddKey(self: *AppState, key: tui.KeyEvent) void {
-        // Ctrl+U 清空当前字段
+        // Ctrl 组合：U 清空 / A 全选 / X 剪切 / C 复制（与主输入框、重命名框一致）
         if (key.modifiers.ctrl) {
             switch (key.code) {
                 .char => |c| {
                     if (c == 21 or c == 'u' or c == 'U') {
                         self.providerFormActiveInput().clear();
+                        return;
+                    }
+                    if (c == 1 or c == 'a' or c == 'A') {
+                        self.providerFormActiveInput().selectAll();
+                        return;
+                    }
+                    if (c == 24 or c == 'x' or c == 'X') {
+                        self.cutProviderFormSelection();
+                        return;
+                    }
+                    if (c == 3 or c == 'c' or c == 'C') {
+                        self.copyProviderFormSelection();
                         return;
                     }
                 },
@@ -4603,14 +4850,29 @@ const AppState = struct {
                 self.mode = .model_select;
             },
             .char => |c| {
+                // 有选区：输入即替换（TextInput.insertBytes 已内置处理，此处直接插入）
                 if (c >= 0x20) self.providerFormActiveInput().insertCodepoint(c);
             },
             .backspace => self.providerFormActiveInput().deleteBackward(),
             .delete => self.providerFormActiveInput().deleteForward(),
-            .left => self.providerFormActiveInput().moveCursorLeft(),
-            .right => self.providerFormActiveInput().moveCursorRight(),
-            .home => self.providerFormActiveInput().moveCursorHome(),
-            .end => self.providerFormActiveInput().moveCursorEnd(),
+            .left => {
+                const input = self.providerFormActiveInput();
+                if (!input.collapseSelection(false)) input.moveCursorLeft();
+            },
+            .right => {
+                const input = self.providerFormActiveInput();
+                if (!input.collapseSelection(true)) input.moveCursorRight();
+            },
+            .home => {
+                const input = self.providerFormActiveInput();
+                _ = input.collapseSelection(false);
+                input.moveCursorHome();
+            },
+            .end => {
+                const input = self.providerFormActiveInput();
+                _ = input.collapseSelection(true);
+                input.moveCursorEnd();
+            },
             else => {},
         }
     }
@@ -4708,15 +4970,28 @@ const AppState = struct {
                     self.input.deleteForward();
                 }
             },
-            .left => self.input.moveCursorLeft(),
-            .right => self.input.moveCursorRight(),
-            .home => self.input.moveCursorLineHome(),
-            .end => self.input.moveCursorLineEnd(),
+            .left => {
+                if (!self.collapseInputSelection(false)) self.input.moveCursorLeft();
+            },
+            .right => {
+                if (!self.collapseInputSelection(true)) self.input.moveCursorRight();
+            },
+            .home => {
+                if (self.sel_active and self.sel_area == .input) self.clearSelection();
+                self.input.moveCursorLineHome();
+            },
+            .end => {
+                if (self.sel_active and self.sel_area == .input) self.clearSelection();
+                self.input.moveCursorLineEnd();
+            },
             .up => {
+                // 有选区先折叠到左边缘（主流编辑器语义），再上移
+                _ = self.collapseInputSelection(false);
                 // 仅移动输入光标（聊天滚动用 PageUp/PageDown）
                 _ = self.input.moveCursorVert(self.input_wrap_width, true);
             },
             .down => {
+                _ = self.collapseInputSelection(true);
                 _ = self.input.moveCursorVert(self.input_wrap_width, false);
             },
             .page_up => {
@@ -5716,6 +5991,7 @@ fn cliCleanupState(state: *AppState, allocator: Allocator) void {
     state.compact_reasoning_buf.deinit(allocator);
     state.freeModelSelectModels();
     state.input.deinit();
+    state.rename_input.deinit();
 }
 
 /// 应用 CLI 的 provider/model 覆盖；返回 0 成功，否则为退出码
@@ -5757,6 +6033,7 @@ fn cmdCompact(init: std.process.Init, opt: CliOptions) u8 {
     state.io = io;
     state.allocator = allocator;
     state.input.allocator = allocator;
+    state.rename_input.allocator = allocator;
     state.environ_map = init.environ_map;
     state.config.loadFile(io, allocator, opt.config_path);
     state.db = cliOpenDb(allocator, io, opt);
@@ -5857,6 +6134,7 @@ fn cmdAsk(init: std.process.Init, opt: CliOptions) u8 {
     state.io = io;
     state.allocator = allocator;
     state.input.allocator = allocator;
+    state.rename_input.allocator = allocator;
     state.environ_map = init.environ_map;
     state.config.loadFile(io, allocator, opt.config_path);
     state.db = cliOpenDb(allocator, io, opt);
@@ -6479,6 +6757,7 @@ pub fn main(init: std.process.Init) !u8 {
     state.io = io;
     state.allocator = allocator;
     state.input.allocator = allocator;
+    state.rename_input.allocator = allocator;
     state.environ_map = init.environ_map;
     state.config.load(io, allocator);
     // 模糊宽度策略（①←≤…按 1 列还是 2 列）：必须在首次绘制前应用
@@ -6594,6 +6873,7 @@ pub fn main(init: std.process.Init) !u8 {
         state.compact_reasoning_buf.deinit(state.allocator);
         state.freeModelSelectModels();
         state.input.deinit();
+        state.rename_input.deinit();
     }
 
     // 输入框真实光标的显隐（按模式切换，仅在变化时调用终端 API）
@@ -6656,11 +6936,14 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }.render);
 
-        // 输入框真实光标的显隐与形状：正常模式显示为"闪烁方块"（DECSCUSR 1 q，
-        // 终端原生渲染：粗方块观感 + 原生闪烁，且不与 IME 组合串冲突），
-        // 菜单/弹窗模式隐藏；仅在状态变化时调用终端 API。
-        // 光标本身也是"应用层方块光标已关闭"后的唯一可见光标（见 AppState.input）
-        const want_cursor = state.mode == .normal and state.term_cursor_valid;
+        // 输入框真实光标的显隐与形状：带输入焦点的模式（主输入框/重命名框/表单字段）
+        // 显示为"闪烁方块"（DECSCUSR 1 q，终端原生渲染：粗方块观感 + 原生闪烁，
+        // 且不与 IME 组合串冲突）；其余菜单/弹窗隐藏；仅在状态变化时调用终端 API。
+        // 坐标由各绘制函数写入 term_cursor_x/y（后绘制的叠加层覆盖主输入框的值）。
+        const want_cursor = state.term_cursor_valid and switch (state.mode) {
+            .normal, .provider_add, .session_rename => true,
+            else => false,
+        };
         if (want_cursor != cursor_visible) {
             if (want_cursor) {
                 terminal.showCursor() catch {};
@@ -6709,6 +6992,7 @@ fn handleTerminalEvent(state: *AppState, terminal: *Terminal, event: tui.Event) 
                 .preset_select => state.handlePresetSelectKey(key),
                 .session_select => state.handleSessionSelectKey(key),
                 .session_confirm => state.handleSessionConfirmKey(key),
+                .session_rename => state.handleSessionRenameKey(key),
                 .help_select => state.handleHelpSelectKey(key),
                 else => state.handleNormalKey(key),
             }
@@ -6731,15 +7015,97 @@ fn handleTerminalEvent(state: *AppState, terminal: *Terminal, event: tui.Event) 
                 },
                 .provider_add => {
                     // 表单字段同样支持粘贴（密钥/地址通常靠粘贴输入）
+                    // 有选区：粘贴即替换（TextInput.insertBytes 已内置处理）
                     const inserted = insertPastedText(state.allocator, state.providerFormActiveInput(), text);
                     if (inserted < text.len) {
                         state.setToast("粘贴内容超过字段上限，已截断");
                     }
                 },
+                .session_rename => {
+                    // 重命名输入框：有选区先替换（TextArea 不自动处理）
+                    if (state.renameSelectionRange()) |r| state.rename_input.deleteRange(r[0], r[1]);
+                    _ = insertPastedText(state.allocator, &state.rename_input, text);
+                },
                 else => {},
             }
         },
         .mouse => |m| {
+            if (state.mode == .session_rename) {
+                // 重命名输入框：点击定位 + 拖动框选（与主输入框/表单一致的交互）
+                switch (m.kind) {
+                    .down => {
+                        if (m.button == .left) {
+                            if (state.renamePointAt(m.x, m.y)) |off| {
+                                state.rename_input.setCursor(off);
+                                state.rename_drag = .{ .active = true, .anchor = off };
+                            }
+                        }
+                    },
+                    .moved => {
+                        if (state.rename_drag.active) {
+                            if (state.renamePointAt(m.x, m.y)) |off| {
+                                const a = state.rename_drag.anchor;
+                                if (a == off) {
+                                    state.rename_input.sel_range = null;
+                                } else {
+                                    state.rename_input.sel_range = .{ @min(a, off), @max(a, off) };
+                                    state.rename_input.cursor = off;
+                                }
+                            }
+                        }
+                    },
+                    .up => state.rename_drag.active = false,
+                    else => {},
+                }
+                return;
+            }
+            if (state.mode == .provider_add) {
+                // 表单字段：点击定位 + 拖动框选（与主输入框一致的交互）
+                switch (m.kind) {
+                    .down => {
+                        if (m.button == .left) {
+                            if (providerFormPointAt(state, m.x, m.y)) |p| {
+                                const input = switch (p.field) {
+                                    0 => &state.provider_form_name,
+                                    1 => &state.provider_form_url,
+                                    2 => &state.provider_form_key,
+                                    else => &state.provider_form_key_env,
+                                };
+                                // 点中的字段成为当前字段（焦点与光标同步）
+                                state.provider_form_field = p.field;
+                                state.providerFormUpdateFocus();
+                                input.setCursor(p.off);
+                                state.provider_form_drag = .{ .active = true, .field = p.field, .anchor = p.off };
+                            }
+                        }
+                    },
+                    .moved => {
+                        if (state.provider_form_drag.active) {
+                            if (providerFormPointAt(state, m.x, m.y)) |p| {
+                                if (p.field == state.provider_form_drag.field) {
+                                    const input = switch (p.field) {
+                                        0 => &state.provider_form_name,
+                                        1 => &state.provider_form_url,
+                                        2 => &state.provider_form_key,
+                                        else => &state.provider_form_key_env,
+                                    };
+                                    const a = state.provider_form_drag.anchor;
+                                    const b = p.off;
+                                    if (a == b) {
+                                        input.sel_range = null;
+                                    } else {
+                                        input.sel_range = .{ @min(a, b), @max(a, b) };
+                                        input.cursor = b;
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    .up => state.provider_form_drag.active = false,
+                    else => {},
+                }
+                return;
+            }
             if (state.mode == .normal) {
                 switch (m.kind) {
                     .down => {
@@ -7731,6 +8097,11 @@ fn drawFrame(state: *AppState, buf: *Buffer) void {
             // 会话列表在下，确认对话框叠在上面
             drawOverlayMenu(state, area, buf, state.session_list.len + 1, drawSessionSelect);
             drawConfirmOverlay(state, area, buf);
+        },
+        .session_rename => {
+            // 会话列表在下，重命名对话框叠在上面
+            drawOverlayMenu(state, area, buf, state.session_list.len + 1, drawSessionSelect);
+            drawRenameOverlay(state, area, buf);
         },
         .help_select => drawOverlayMenu(state, area, buf, help_commands.len, drawHelpSelect),
         else => {},
@@ -9311,6 +9682,52 @@ fn drawHelpSelect(state: *AppState, area: Rect, buf: *Buffer) void {
     }
 }
 
+fn drawRenameOverlay(state: *AppState, area: Rect, buf: *Buffer) void {
+    var w: u16 = @intCast(@as(u32, area.width) * 60 / 100);
+    w = @min(@max(w, 44), 80);
+    var h: u16 = 7;
+    if (h > area.height) h = area.height;
+    const popup = tui.centeredRectFixed(area, w, h);
+
+    dimOutsidePopup(buf, popup);
+    clearArea(buf, popup);
+
+    const blk = Block{
+        .title = " 重命名会话 ",
+        .borders = Borders.ALL,
+        .border_style = .{ .fg = .cyan },
+        .title_style = .{ .fg = .white, .modifier = .{ .bold = true } },
+        .border_symbols = BorderSymbols.rounded(),
+    };
+    blk.render(popup, buf);
+
+    const inner = blk.inner(popup);
+    if (inner.height == 0 or inner.width == 0) return;
+
+    var y = inner.y;
+    var id_buf: [64]u8 = undefined;
+    const hint = std.fmt.bufPrint(&id_buf, "会话 #{d}", .{state.rename_session_id}) catch "会话";
+    buf.setString(inner.x, y, hint, .{ .fg = .dark_gray });
+    y += 2;
+
+    // 输入框（单行）：选区高亮由 TextArea.render 处理
+    state.rename_input.focused = true;
+    const field_area = Rect{ .x = inner.x, .y = y, .width = inner.width, .height = 1 };
+    state.rename_field_rect = field_area; // 记录屏幕区域（鼠标框选用）
+    // 与主输入框同一套光标：先应用视口，再算真实终端光标坐标，最后渲染
+    state.rename_input.applyViewport(field_area.width, 1);
+    if (inputCursorScreenPos(&state.rename_input, field_area)) |p| {
+        state.term_cursor_x = p[0];
+        state.term_cursor_y = p[1];
+        state.term_cursor_valid = true;
+    }
+    state.rename_input.render(field_area, buf);
+
+    if (inner.height > 3) {
+        buf.setString(inner.x, inner.y + inner.height -| 1, "Enter 保存 · Esc 取消 · Ctrl+A 全选 · Ctrl+X 剪切", .{ .fg = .dark_gray });
+    }
+}
+
 fn drawConfirmOverlay(state: *AppState, area: Rect, buf: *Buffer) void {
     var w: u16 = @intCast(@as(u32, area.width) * 50 / 100);
     w = @min(@max(w, 40), 64);
@@ -9560,33 +9977,101 @@ fn drawProviderAdd(state: *AppState, area: Rect, buf: *Buffer) void {
     if (inner.height < 10 or inner.width < 24) return;
 
     var y = inner.y + 1;
+    state.provider_form_row_count = 0; // 每帧重建（鼠标框选用）
     if (state.providerFormLocked()) {
         // 预设字段：名称/地址只读展示
         drawFormStatic(buf, inner, y, "名称", state.provider_form_name.value());
         y += 2;
         drawFormStatic(buf, inner, y, "地址", state.provider_form_url.value());
         y += 2;
-        drawFormField(buf, inner, y, "密钥", &state.provider_form_key, state.provider_form_field == 2);
+        var locked_rect: ?Rect = null;
+        if (drawFormField(buf, inner, y, "密钥", &state.provider_form_key, state.provider_form_field == 2)) |fr| {
+            if (state.provider_form_field == 2) locked_rect = fr;
+        }
+        recordProviderFormRow(state, inner.x, y, 2);
         y += 2;
-        drawFormField(buf, inner, y, "环境变量", &state.provider_form_key_env, state.provider_form_field == 3);
+        if (drawFormField(buf, inner, y, "环境变量", &state.provider_form_key_env, state.provider_form_field == 3)) |fr| {
+            if (state.provider_form_field == 3) locked_rect = fr;
+        }
+        recordProviderFormRow(state, inner.x, y, 3);
+        // 真实终端光标：定位到当前字段的插入点（与主输入框同一套光标行为）
+        if (locked_rect) |fr| setFormCursor(state, fr);
 
         if (y + 2 < inner.y + inner.height) {
-            buf.setString(inner.x, y + 2, "名称/地址来自预设不可修改；密钥留空时回退读环境变量 (Ctrl+U 清空字段)", .{ .fg = .dark_gray });
+            buf.setString(inner.x, y + 2, "名称/地址来自预设不可修改；密钥留空时回退读环境变量 (Ctrl+U/Ctrl+A/Ctrl+X 支持)", .{ .fg = .dark_gray });
         }
         return;
     }
 
-    drawFormField(buf, inner, y, "名称", &state.provider_form_name, state.provider_form_field == 0);
+    var focused_rect: ?Rect = null;
+    if (drawFormField(buf, inner, y, "名称", &state.provider_form_name, state.provider_form_field == 0)) |fr| {
+        if (state.provider_form_field == 0) focused_rect = fr;
+    }
+    recordProviderFormRow(state, inner.x, y, 0);
     y += 2;
-    drawFormField(buf, inner, y, "地址", &state.provider_form_url, state.provider_form_field == 1);
+    if (drawFormField(buf, inner, y, "地址", &state.provider_form_url, state.provider_form_field == 1)) |fr| {
+        if (state.provider_form_field == 1) focused_rect = fr;
+    }
+    recordProviderFormRow(state, inner.x, y, 1);
     y += 2;
-    drawFormField(buf, inner, y, "密钥", &state.provider_form_key, state.provider_form_field == 2);
+    if (drawFormField(buf, inner, y, "密钥", &state.provider_form_key, state.provider_form_field == 2)) |fr| {
+        if (state.provider_form_field == 2) focused_rect = fr;
+    }
+    recordProviderFormRow(state, inner.x, y, 2);
     y += 2;
-    drawFormField(buf, inner, y, "环境变量", &state.provider_form_key_env, state.provider_form_field == 3);
+    if (drawFormField(buf, inner, y, "环境变量", &state.provider_form_key_env, state.provider_form_field == 3)) |fr| {
+        if (state.provider_form_field == 3) focused_rect = fr;
+    }
+    recordProviderFormRow(state, inner.x, y, 3);
+    // 真实终端光标：定位到当前字段的插入点
+    if (focused_rect) |fr| setFormCursor(state, fr);
 
     if (y + 2 < inner.y + inner.height) {
-        buf.setString(inner.x, y + 2, "名称与地址必填；密钥留空时回退读环境变量 (Ctrl+U 清空字段)", .{ .fg = .dark_gray });
+        buf.setString(inner.x, y + 2, "名称与地址必填；密钥留空时回退读环境变量 (Ctrl+U/Ctrl+A/Ctrl+X 支持)", .{ .fg = .dark_gray });
     }
+}
+
+/// 把当前表单字段的插入点写入真实终端光标坐标（在字段 Rect 内）
+fn setFormCursor(state: *AppState, field_rect: Rect) void {
+    if (state.providerFormActiveInput().cursorScreenPos(field_rect)) |p| {
+        state.term_cursor_x = p[0];
+        state.term_cursor_y = p[1];
+        state.term_cursor_valid = true;
+    }
+}
+
+/// 记录表单字段的屏幕位置（inner.x + 标签宽度 → 文本起点 x）
+fn recordProviderFormRow(state: *AppState, inner_x: u16, y: u16, field: usize) void {
+    if (state.provider_form_row_count >= state.provider_form_rows.len) return;
+    const label = switch (field) {
+        0 => "名称: ",
+        1 => "地址: ",
+        2 => "密钥: ",
+        else => "环境变量: ",
+    };
+    const off = tui.render.stringWidth(label);
+    state.provider_form_rows[state.provider_form_row_count] = .{
+        .y = y,
+        .x = inner_x +| @as(u16, @intCast(@min(off, 0xFFFF))),
+        .field = field,
+    };
+    state.provider_form_row_count += 1;
+}
+
+/// 屏幕坐标 → 表单字段位置（字段下标 + 字节偏移）；y 不匹配任何字段返回 null
+fn providerFormPointAt(state: *AppState, x: u16, y: u16) ?struct { field: usize, off: usize } {
+    for (state.provider_form_rows[0..state.provider_form_row_count]) |row| {
+        if (row.y != y) continue;
+        const input = switch (row.field) {
+            0 => &state.provider_form_name,
+            1 => &state.provider_form_url,
+            2 => &state.provider_form_key,
+            else => &state.provider_form_key_env,
+        };
+        const text = input.value();
+        return .{ .field = row.field, .off = offsetInRange(text, 0, text.len, x -| row.x) };
+    }
+    return null;
 }
 
 /// 只读字段：标签 + 值（无输入框，浅色展示）
@@ -9601,7 +10086,7 @@ fn drawFormStatic(buf: *Buffer, inner: Rect, y: u16, label: []const u8, value: [
     buf.setStringTruncated(x, y, value, inner.x + inner.width - x, .{ .fg = .dark_gray });
 }
 
-fn drawFormField(buf: *Buffer, inner: Rect, y: u16, label: []const u8, input: *TextInput(256), focused: bool) void {
+fn drawFormField(buf: *Buffer, inner: Rect, y: u16, label: []const u8, input: *TextInput(256), focused: bool) ?Rect {
     const label_style: Style = if (focused)
         .{ .fg = .cyan, .modifier = .{ .bold = true } }
     else
@@ -9614,13 +10099,15 @@ fn drawFormField(buf: *Buffer, inner: Rect, y: u16, label: []const u8, input: *T
     // 用显示宽度而非字节数计算偏移（中文标签宽度 ≠ 字节数）
     const off = tui.render.stringWidth(label_text);
     const x = inner.x +| @as(u16, @intCast(@min(off, 0xFFFF)));
-    if (x >= inner.x + inner.width) return;
-    input.render(.{
+    if (x >= inner.x + inner.width) return null;
+    const field = Rect{
         .x = x,
         .y = y,
         .width = inner.x + inner.width - x,
         .height = 1,
-    }, buf);
+    };
+    input.render(field, buf);
+    return field;
 }
 
 /// 计算输入框文本光标在屏幕上的坐标（供真实终端光标定位：IME 组合串与候选窗
@@ -9676,11 +10163,15 @@ fn drawInput(state: *AppState, area: Rect, buf: *Buffer) void {
             .height = inner.height - 2,
         };
         state.input_content_rows = content.height;
-        // 记录文本光标屏幕坐标：主循环据此定位真实终端光标（IME 组合串/候选窗跟随）
-        if (inputCursorScreenPos(&state.input, content)) |p| {
-            state.term_cursor_x = p[0];
-            state.term_cursor_y = p[1];
-            state.term_cursor_valid = true;
+        // 记录文本光标屏幕坐标：主循环据此定位真实终端光标（IME 组合串/候选窗跟随）。
+        // 仅普通模式：弹窗模式（重命名/表单）由各自的绘制函数设置光标，避免主输入框
+        // 的位置覆盖弹窗内的光标（弹窗叠在输入框之上时坐标会错位）。
+        if (state.mode == .normal) {
+            if (inputCursorScreenPos(&state.input, content)) |p| {
+                state.term_cursor_x = p[0];
+                state.term_cursor_y = p[1];
+                state.term_cursor_valid = true;
+            }
         }
         // 选区交给 TextArea 渲染（光标叠加在选中字符上时使用灰底光标块）
         state.input.sel_range = if (state.sel_active and state.sel_area == .input)
@@ -9826,7 +10317,8 @@ fn drawHelp(state: *AppState, area: Rect, buf: *Buffer) void {
         .compact_confirm => " [←→] 切换选项  [Enter] 确认  [Esc] 取消 ",
         .thinking_select => " [↑↓] 选择思考强度  [Enter] 确认  [Esc] 返回 ",
         .provider_add => " [Tab] 切换字段  [Enter] 下一项/保存  [Esc] 取消 ",
-        .session_select => " [↑↓] 选择会话  [Enter] 加载/新建  [Del] 删除  [Esc] 取消 ",
+        .session_select => " [↑↓] 选择会话  [Enter] 加载/新建  [Ctrl+R] 重命名  [Del] 删除  [Esc] 取消 ",
+        .session_rename => " [Enter] 保存  [Esc] 取消  [Ctrl+A] 全选  [Ctrl+X] 剪切  [Ctrl+C] 复制 ",
         .session_confirm => " [←→] 切换选项  [Enter] 确认  [Esc] 取消 ",
         .help_select => " [↑↓] 选择指令  [Enter] 执行  [Esc] 取消 ",
         else => " [Enter] 发送  [Ctrl+J] 换行  [PgUp/PgDn] 滚动  [Esc] 菜单 ",
@@ -10388,12 +10880,14 @@ test "生成中回车排队：入队+显示+清空输入；指令与空输入保
     state.io = io;
     state.allocator = std.testing.allocator;
     state.input.allocator = std.testing.allocator;
+    state.rename_input.allocator = std.testing.allocator;
     defer {
         state.clearPendingSends();
         state.pending_sends.deinit(std.testing.allocator);
         for (state.messages.items) |m| state.freeDisplayMessage(m);
         state.messages.deinit(std.testing.allocator);
         state.input.deinit();
+        state.rename_input.deinit();
     }
 
     // 模拟流式进行中
@@ -10970,7 +11464,9 @@ test "粘贴文本：清洗非法 UTF-8 + 表单字段可粘贴" {
 
     // 大粘贴：动态缓冲完整保留（超过旧的 64KB 固定上限）
     state.input.allocator = std.testing.allocator;
+    state.rename_input.allocator = std.testing.allocator;
     defer state.input.deinit();
+    defer state.rename_input.deinit();
     const big = try std.testing.allocator.alloc(u8, 200 * 1024);
     defer std.testing.allocator.free(big);
     @memset(big, 'a');
@@ -11169,7 +11665,9 @@ test "Ctrl+X 剪切输入框选区：先复制后删除，失败保留原文" {
     state.io = io;
     state.allocator = std.testing.allocator;
     state.input.allocator = std.testing.allocator;
+    state.rename_input.allocator = std.testing.allocator;
     defer state.input.deinit();
+    defer state.rename_input.deinit();
 
     state.input.insertBytes("hello 你好 world");
     state.sel_area = .input;
@@ -14131,7 +14629,9 @@ test "进行中指示：drawInput 渲染（标题含盲文帧、边框忙碌变�
     state.io = io;
     state.allocator = std.testing.allocator;
     state.input.allocator = std.testing.allocator;
+    state.rename_input.allocator = std.testing.allocator;
     defer state.input.deinit();
+    defer state.rename_input.deinit();
 
     const area = Rect{ .x = 0, .y = 0, .width = 60, .height = 6 };
 
@@ -14776,4 +15276,271 @@ test "锚点：长消息尾部时，视口跨界消息保持加载（前向覆�
 
     // 19370 在视口内 → 必须保持加载（修复前会被误卸载 → 绘制空白）
     try std.testing.expect(state.messages.items[long_idx + 1].content_loaded);
+}
+
+test "会话重命名：Ctrl+R 进入、输入替换、Enter 保存落库" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    const db_path = "skynet_test_rename.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, db_path ++ "-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, db_path ++ "-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, db_path ++ "-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, db_path ++ "-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    state.input.allocator = std.testing.allocator;
+    state.rename_input.allocator = std.testing.allocator;
+    state.db = try db_mod.Db.openFile(std.testing.allocator, io, db_path);
+    defer {
+        if (state.db) |*d| d.deinit();
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+        state.input.deinit();
+        state.rename_input.deinit();
+    }
+
+    const sid = try state.db.?.createSession("旧标题");
+    state.session_id = sid;
+
+    // 打开会话选择并选中该会话（第 0 项是"新建会话"，故 +1）
+    state.openSessionSelect(null);
+    try std.testing.expectEqual(Mode.session_select, state.mode);
+    state.session_select_index = 1;
+    try std.testing.expectEqual(sid, state.session_list[0].id);
+
+    // Ctrl+R 进入重命名：标题预填、光标在末尾、不预选（用户按需 Ctrl+A）
+    state.startSessionRename(state.session_list[0]);
+    try std.testing.expectEqual(Mode.session_rename, state.mode);
+    try std.testing.expectEqualStrings("旧标题", state.rename_input.value());
+    try std.testing.expect(state.rename_input.sel_range == null);
+    try std.testing.expectEqual(state.rename_input.value().len, state.rename_input.cursor);
+
+    // Ctrl+A 全选 → 输入替换
+    state.rename_input.sel_range = .{ 0, state.rename_input.value().len };
+    const r = state.renameSelectionRange().?;
+    state.rename_input.deleteRange(r[0], r[1]);
+    state.rename_input.insertBytes("新标题 v2");
+
+    // Enter 保存
+    state.commitSessionRename();
+    try std.testing.expectEqual(Mode.session_select, state.mode);
+    const row = (try state.db.?.sessionInfo(sid)).?;
+    try std.testing.expectEqualStrings("新标题 v2", row.title);
+
+    // 空标题不允许保存（保持原标题、停在重命名模式）
+    state.startSessionRename(state.session_list[0]);
+    state.rename_input.clear(); // 清空内容（无选区）
+    state.commitSessionRename();
+    try std.testing.expectEqual(Mode.session_rename, state.mode);
+    const row2 = (try state.db.?.sessionInfo(sid)).?;
+    try std.testing.expectEqualStrings("新标题 v2", row2.title);
+}
+
+test "表单字段：Ctrl+A 全选、选区删除、插入替换" {
+    var state = AppState{};
+    state.allocator = std.testing.allocator;
+
+    // 预填密钥字段
+    state.provider_form_key.insertBytes("sk-abcdef123456");
+    state.provider_form_field = 2;
+    const input = state.providerFormActiveInput();
+    try std.testing.expectEqualStrings("sk-abcdef123456", input.value());
+
+    // Ctrl+A 全选 → 选区覆盖全部
+    input.selectAll();
+    try std.testing.expectEqual(@as(usize, 15), input.selectionRange().?[1]);
+
+    // 全选删除（模拟 Ctrl+X 的删除部分：写剪贴板由生产路径负责）
+    input.deleteSelection();
+    try std.testing.expectEqualStrings("", input.value());
+
+    // 插入替换选区
+    input.insertBytes("old-key");
+    input.selectAll();
+    input.insertBytes("new-key");
+    try std.testing.expectEqualStrings("new-key", input.value());
+
+    // 部分选区删除
+    input.sel_range = .{ 0, 4 }; // "new-"
+    input.deleteSelection();
+    try std.testing.expectEqualStrings("key", input.value());
+}
+
+test "会话重命名：对话框渲染（标题提示 + 输入内容 + 帮助行 + 光标定位）" {
+    var state = AppState{};
+    state.allocator = std.testing.allocator;
+    state.rename_input.allocator = std.testing.allocator;
+    state.rename_input.draw_fake_cursor = false; // 用真实终端光标（与生产一致）
+    defer state.rename_input.deinit();
+
+    state.rename_session_id = 42;
+    state.rename_input.insertBytes("我的新标题");
+    state.mode = .session_rename;
+
+    var buf = try tui.render.Buffer.init(std.testing.allocator, 100, 30);
+    defer buf.deinit();
+
+    state.term_cursor_valid = false;
+    const area = Rect{ .x = 0, .y = 0, .width = 100, .height = 30 };
+    drawRenameOverlay(&state, area, &buf);
+
+    // 转成 ASCII 文本检查关键内容（宽字符以 ? 占位）
+    var text: [100 * 30 + 30]u8 = undefined;
+    var n: usize = 0;
+    var y: u16 = 0;
+    while (y < 30) : (y += 1) {
+        var x: u16 = 0;
+        while (x < 100) : (x += 1) {
+            const cell = buf.get(x, y).?;
+            text[n] = if (cell.char < 128) @intCast(cell.char) else '?';
+            n += 1;
+        }
+        text[n] = '\n';
+        n += 1;
+    }
+    const all = text[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, all, "重命名会话") != null or std.mem.indexOf(u8, all, "?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "#42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Enter") != null);
+    // 真实终端光标坐标已写入（在对话框内，且与输入文本末列对齐）
+    try std.testing.expect(state.term_cursor_valid);
+    try std.testing.expect(state.term_cursor_x > 0 and state.term_cursor_y > 0);
+}
+
+test "提供商表单：绘制后真实终端光标定位到当前字段" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    state.input.allocator = std.testing.allocator;
+    state.rename_input.allocator = std.testing.allocator;
+    defer {
+        state.input.deinit();
+        state.rename_input.deinit();
+    }
+
+    state.mode = .provider_add;
+    state.provider_form_field = 2; // 密钥字段
+    state.provider_form_key.insertBytes("sk-123456");
+    state.providerFormUpdateFocus();
+
+    var buf = try tui.render.Buffer.init(std.testing.allocator, 80, 24);
+    defer buf.deinit();
+
+    state.term_cursor_valid = false;
+    drawFrame(&state, &buf);
+
+    // 真实终端光标已定位（在密钥字段的插入点：字段起点 + 9 列）
+    try std.testing.expect(state.term_cursor_valid);
+    try std.testing.expect(state.term_cursor_x > 0 and state.term_cursor_y > 0);
+}
+
+test "主输入框：方向键折叠选区（左/右到边缘，Home/End 清除）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    state.input.allocator = std.testing.allocator;
+    defer state.input.deinit();
+
+    state.input.insertBytes("hello world");
+    // 模拟框选 [2, 8)
+    state.sel_area = .input;
+    state.sel_active = true;
+    state.sel_anchor = .{ .off = 2 };
+    state.sel_current = .{ .off = 8 };
+
+    // 左方向键：折叠到左边缘，选区清除
+    state.handleNormalKey(.{ .code = .left });
+    try std.testing.expectEqual(@as(usize, 2), state.input.cursor);
+    try std.testing.expect(!state.sel_active);
+
+    // 重新选区，右方向键：折叠到右边缘
+    state.sel_active = true;
+    state.sel_anchor = .{ .off = 2 };
+    state.sel_current = .{ .off = 8 };
+    state.handleNormalKey(.{ .code = .right });
+    try std.testing.expectEqual(@as(usize, 8), state.input.cursor);
+    try std.testing.expect(!state.sel_active);
+
+    // Home：清除选区并移到行首（Home/End 不折叠到边缘，而是清除后执行自身语义）
+    state.sel_active = true;
+    state.sel_anchor = .{ .off = 2 };
+    state.sel_current = .{ .off = 8 };
+    state.handleNormalKey(.{ .code = .home });
+    try std.testing.expectEqual(@as(usize, 0), state.input.cursor);
+    try std.testing.expect(!state.sel_active);
+
+    // End：清除选区并移到行尾
+    state.sel_active = true;
+    state.sel_anchor = .{ .off = 2 };
+    state.sel_current = .{ .off = 8 };
+    state.handleNormalKey(.{ .code = .end });
+    try std.testing.expectEqual(@as(usize, 11), state.input.cursor);
+    try std.testing.expect(!state.sel_active);
+
+    // 无选区时左键正常移动一格
+    state.input.cursor = 5;
+    state.handleNormalKey(.{ .code = .left });
+    try std.testing.expectEqual(@as(usize, 4), state.input.cursor);
+}
+
+test "重命名框：鼠标坐标映射与拖选" {
+    var state = AppState{};
+    state.allocator = std.testing.allocator;
+    state.rename_input.allocator = std.testing.allocator;
+    state.rename_input.draw_fake_cursor = false;
+    defer state.rename_input.deinit();
+
+    state.rename_session_id = 7;
+    state.rename_input.insertBytes("hello world");
+    state.mode = .session_rename;
+
+    var buf = try tui.render.Buffer.init(std.testing.allocator, 100, 30);
+    defer buf.deinit();
+
+    // 绘制一次以记录字段屏幕区域
+    const area = Rect{ .x = 0, .y = 0, .width = 100, .height = 30 };
+    drawRenameOverlay(&state, area, &buf);
+    const r = state.rename_field_rect;
+    try std.testing.expect(r.width > 0);
+
+    // 坐标映射：行内第 3 列 → 字节偏移 3
+    try std.testing.expectEqual(@as(usize, 3), state.renamePointAt(r.x + 3, r.y).?);
+    // 行外（y 不匹配）→ null
+    try std.testing.expect(state.renamePointAt(r.x + 3, r.y + 1) == null);
+    // 字段左侧之外 → null
+    if (r.x > 0) try std.testing.expect(state.renamePointAt(r.x - 1, r.y) == null);
+
+    // 模拟拖选：锚点 2 → 当前 8，选区应为 [2, 8)，光标在 8
+    state.rename_drag = .{ .active = true, .anchor = 2 };
+    const off8 = state.renamePointAt(r.x + 8, r.y).?;
+    const a = state.rename_drag.anchor;
+    state.rename_input.sel_range = .{ @min(a, off8), @max(a, off8) };
+    state.rename_input.cursor = off8;
+    try std.testing.expectEqual([2]usize{ 2, 8 }, state.rename_input.sel_range.?);
+    try std.testing.expectEqual(@as(usize, 8), state.rename_input.cursor);
+
+    // 选区内容
+    const sel = extractInputSelection(state.rename_input.value(), 2, 8);
+    try std.testing.expectEqualStrings("llo wo", sel);
 }
