@@ -207,7 +207,11 @@ fn repairDanglingToolCalls(a: Allocator, messages: []const Message) error{OutOfM
 
 fn messageToValue(a: Allocator, m: Message) error{OutOfMemory}!std.json.Value {
     var obj = std.json.ObjectMap{};
-    try obj.put(a, "role", .{ .string = m.role });
+    // 内部 role（system 通知 / summary）不直接发给网关：
+    // 对话中间出现的 system 消息各网关处理不一致（有的报错、有的忽略）。
+    // 统一转成 user 消息发送——文本自描述（[工作目录已切换...]），语义无歧义。
+    const wire_role: []const u8 = if (std.mem.eql(u8, m.role, "system")) "user" else m.role;
+    try obj.put(a, "role", .{ .string = wire_role });
     if (m.content.len == 0 and m.tool_calls != null) {
         try obj.put(a, "content", .null);
     } else {

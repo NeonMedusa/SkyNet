@@ -36,7 +36,7 @@ pub const tool_defs = [_]ToolDef{
     },
     .{
         .name = "bash",
-        .description = "Execute a shell command in the current working directory and return its output. On Windows this runs PowerShell (pwsh); on other platforms it runs sh. Output is truncated to the last 2000 lines or 50KB. Set timeout_ms to limit execution time.",
+        .description = "Execute a shell command in the session working directory and return its output. Each invocation runs in a fresh shell: `cd` inside a command only affects that single call (use the cd tool for persistent changes). On Windows this runs PowerShell (pwsh); on other platforms it runs sh. Output is truncated to the last 2000 lines or 50KB. Set timeout_ms to limit execution time.",
         .parameters =
         \\{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout_ms":{"type":"integer","description":"Optional timeout in milliseconds"}},"required":["command"]}
         ,
@@ -60,6 +60,13 @@ pub const tool_defs = [_]ToolDef{
         .description = "List directory contents sorted by name, with '/' suffix for directories. Set depth>0 to recurse (paths are then relative, directories keep the '/' suffix). Output is capped at limit entries (default 500) and 50KB.",
         .parameters =
         \\{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default: current directory)"},"limit":{"type":"integer","description":"Maximum number of entries (default 500)"},"depth":{"type":"integer","description":"Recursion depth: 0 = current level only (default); N > 0 = recurse N levels"}}}
+        ,
+    },
+    .{
+        .name = "cd",
+        .description = "Change the session working directory (the base for all relative paths in subsequent tool calls; persists across calls and restarts). The path is resolved relative to the current working directory and must exist. Note: each bash invocation runs in a fresh shell, so `cd` inside a shell command only affects that single call - use this tool to change the working directory persistently.",
+        .parameters =
+        \\{"type":"object","properties":{"path":{"type":"string","description":"Directory to switch to (relative to current working directory, or absolute)"}},"required":["path"]}
         ,
     },
 };

@@ -101,6 +101,8 @@ const Mode = enum {
     session_confirm,
     /// 会话重命名（Ctrl+R 从会话选择进入；输入框 + Enter 保存）
     session_rename,
+    /// 工作目录编辑（/cwd 无参 或 帮助菜单选 cwd 进入；输入框 + Enter 切换）
+    cwd_edit,
     help_select,
 };
 
@@ -114,6 +116,7 @@ const help_commands = [_]HelpCommand{
     .{ .name = "models", .desc = "打开模型/提供商选择菜单" },
     .{ .name = "compact", .desc = "压缩当前会话（/compact [保留token]，默认 20000）" },
     .{ .name = "thinking", .desc = "切换思考强度（/thinking off|low|high|max）" },
+    .{ .name = "cwd", .desc = "查看/切换会话工作目录（/cwd [路径]，无参显示当前）" },
     .{ .name = "exit", .desc = "退出程序" },
 };
 
@@ -142,7 +145,7 @@ fn firstToken(s: []const u8) []const u8 {
 }
 
 fn isKnownCommand(name: []const u8) bool {
-    const known = [_][]const u8{ "help", "h", "?", "models", "sessions", "compact", "thinking", "exit" };
+    const known = [_][]const u8{ "help", "h", "?", "models", "sessions", "compact", "thinking", "cwd", "exit" };
     for (known) |k| {
         if (std.mem.eql(u8, name, k)) return true;
     }
@@ -450,6 +453,15 @@ const max_events_per_frame: usize = 1024;
 /// 生成中可排队等待发送的消息上限（防止连打堆积）
 const max_pending_sends: usize = 32;
 
+/// 排队消息类型：用户消息（作为新回合/工具轮边界注入，会触发生成）
+/// 与系统通知（仅告知，不触发生成）
+const PendingKind = enum { user, notice };
+
+const PendingSend = struct {
+    kind: PendingKind,
+    text: []u8,
+};
+
 /// 输入框标题的"进行中"旋转动画（盲文帧），按当前时间推导，无需额外状态
 const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 const spinner_period_ms: i64 = 90;
@@ -495,7 +507,7 @@ const tool_schemas = blk: {
     break :blk arr;
 };
 
-const StreamEventKind = enum { turn_end, tool_start, tool_end, user_sent, retry_start, toast };
+const StreamEventKind = enum { turn_end, tool_start, tool_end, user_sent, retry_start, toast, work_dir_changed, system_notice };
 
 /// 进行中/压缩的统一强调色（标准橙色 orange）：输入框忙碌边框、压缩通知共用。
 /// 终端不支持 24-bit 色时由终端降级到近似色。
@@ -547,6 +559,8 @@ const StreamJob = struct {
     db_path: [:0]const u8 = "",
     /// 会话的数字 id（worker 实时落库用；0 = 不落库，回退到 finalize 批量写）
     session_id_num: i64 = 0,
+    /// 启动目录快照（工作目录失效时的回退目标；arena 所有）
+    default_cwd: []const u8 = "",
     /// 中途压缩参数快照
     auto_compact_pct: u64 = 0,
     context_window: u64 = 0,
@@ -603,6 +617,13 @@ const AppState = struct {
     session_id: i64 = 0,
     history: std.ArrayListUnmanaged(ai.Message) = .{ .items = &.{}, .capacity = 0 },
 
+    /// ── 会话工作目录（工具 cwd 基准）──
+    /// work_dir 为空 = 用 default_cwd（程序启动目录）。
+    /// 切换/加载会话时从 DB 读取；/cwd 指令与 cd 工具修改。
+    /// default_cwd 是启动时冻结的绝对路径（会话 work_dir 失效时的回退）。
+    work_dir: []u8 = &.{},
+    default_cwd: []u8 = &.{},
+
     // 会话路由标识（按 SkyNet 会话生成，切换会话时更新；发给网关的亲和头）
     session_uuid: [36]u8 = undefined,
     session_uuid_ready: bool = false,
@@ -626,7 +647,11 @@ const AppState = struct {
 
     /// 生成/压缩期间用户提交、等待发送的消息（主线程入队；worker 在工具轮次边界取走注入）
     pending_sends_mutex: Io.Mutex = .init,
-    pending_sends: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 },
+    pending_sends: std.ArrayListUnmanaged(PendingSend) = .{ .items = &.{}, .capacity = 0 },
+    /// 生成中用户切换了工作目录：待 worker 在下一次工具执行前应用。
+    /// 线程安全交换（mutex 保护；worker 取走后置 null）。
+    pending_work_dir_mutex: Io.Mutex = .init,
+    pending_work_dir: ?[]u8 = null,
     /// 生成中用户按 /compact：排队到下一个工具轮间隙执行（与自动压缩同位置同函数）。
     /// worker 在每个轮次边界 swap(false) 取走；若本轮直到结束都没到间隙，
     /// 由 flushPendingSends 在空闲时执行。重复触发只提示不重复入队。
@@ -822,7 +847,7 @@ const AppState = struct {
     /// 会话重命名输入框（Ctrl+R 进入；沿用 TextArea 以支持选/剪切/粘贴）。
     /// 用真实终端光标（draw_fake_cursor = false）：与主输入框同一套光标行为
     /// （方块观感 + 终端原生闪烁）；坐标在 drawRenameOverlay 里写入 term_cursor_*。
-    rename_input: textarea_mod.TextArea = .{
+    dialog_input: textarea_mod.TextArea = .{
         .style = .{ .fg = .white },
         .cursor_style = .{ .fg = .black, .bg = .white },
         .draw_fake_cursor = false,
@@ -830,10 +855,13 @@ const AppState = struct {
     },
     /// 正在重命名的会话 id（0 = 无）
     rename_session_id: i64 = 0,
-    /// 重命名输入框的屏幕区域（每帧由 drawRenameOverlay 记录；鼠标框选用）
-    rename_field_rect: Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
-    /// 重命名框拖选状态（锚点字节偏移；active = false 表示未拖动）
-    rename_drag: struct { active: bool = false, anchor: usize = 0 } = .{},
+    /// 输入对话框的屏幕区域（每帧由 drawRenameOverlay/drawCwdOverlay 记录；鼠标框选用）
+    dialog_field_rect: Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+    /// 输入对话框拖选状态（锚点字节偏移；active = false 表示未拖动）
+    dialog_drag: struct { active: bool = false, anchor: usize = 0 } = .{},
+    /// cwd 编辑对话框的错误信息（非空 = 上次提交失败，红字显示；成功/取消后清空）
+    cwd_edit_error: [256]u8 = undefined,
+    cwd_edit_error_len: usize = 0,
 
     // 帮助菜单状态
     help_select_index: usize = 0,
@@ -856,6 +884,77 @@ const AppState = struct {
     last_key_ms: i64 = 0,
 
     messages: std.ArrayListUnmanaged(Message) = .{ .items = &.{}, .capacity = 0 },
+
+    /// ── 会话工作目录辅助 ──
+    /// 当前会话的有效工作目录（绝对路径）：work_dir 非空用它（有效性由
+    /// healWorkDir 在回合开始/工具执行前校验），否则 default_cwd（启动目录）。
+    /// 绘制热路径无 syscall（有效性用缓存状态）。
+    fn effectiveWorkDir(self: *const AppState) []const u8 {
+        if (self.work_dir.len > 0) return self.work_dir;
+        return self.default_cwd;
+    }
+
+    /// 回合开始 / 工具执行前调用：若 work_dir 已失效（目录被删/不可访问），
+    /// 发系统通知、清空 work_dir 落库（永久回退启动目录），返回 true 表示发生了回退。
+    /// 检测降频：只在回合开始 + 工具执行前，不在绘制热路径。
+    fn healWorkDir(self: *AppState) bool {
+        if (self.work_dir.len == 0) return false;
+        var d = std.Io.Dir.openDirAbsolute(self.io, self.work_dir, .{}) catch {
+            // 失效：通知 + 清空（下次 effectiveWorkDir 自然回退启动目录）
+            self.replaceWorkDir(&.{}) catch {};
+            if (self.db) |*db| db.setSessionWorkDir(self.session_id, "") catch {};
+            var buf: [512]u8 = undefined;
+            const notice = std.fmt.bufPrint(&buf, "[工作目录已失效，跟随启动目录: {s}]", .{self.default_cwd}) catch "[工作目录已失效]";
+            self.emitSystemNotice(notice);
+            return true;
+        };
+        d.close(self.io);
+        return false;
+    }
+
+    /// 设置当前会话工作目录（resolve 成绝对路径、校验存在、落库）；失败返回错误文本
+    fn setWorkDir(self: *AppState, path: []const u8) ?[]const u8 {
+        const trimmed = std.mem.trim(u8, path, " \t\r\n");
+        const base = self.effectiveWorkDir();
+        // 空参数 = 回到默认目录
+        if (trimmed.len == 0) {
+            self.replaceWorkDir(&.{}) catch return "内存不足";
+            if (self.db) |*db| db.setSessionWorkDir(self.session_id, "") catch {};
+            return null;
+        }
+        const abs = std.fs.path.resolve(self.allocator, &.{ base, trimmed }) catch return "路径解析失败";
+        defer self.allocator.free(abs);
+        var d = std.Io.Dir.openDirAbsolute(self.io, abs, .{}) catch return "目录不存在或无法访问";
+        d.close(self.io);
+        self.replaceWorkDir(abs) catch return "内存不足";
+        if (self.db) |*db| db.setSessionWorkDir(self.session_id, self.work_dir) catch {};
+        // 生成中：把新目录交给 worker（下一次工具执行前应用；本回合工具立即可用）
+        if (self.isStreaming()) {
+            const copy = self.allocator.dupe(u8, self.work_dir) catch return null;
+            self.pending_work_dir_mutex.lockUncancelable(self.io);
+            if (self.pending_work_dir) |old_p| self.allocator.free(old_p);
+            self.pending_work_dir = copy;
+            self.pending_work_dir_mutex.unlock(self.io);
+        }
+        return null;
+    }
+
+    fn replaceWorkDir(self: *AppState, path: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, path);
+        if (self.work_dir.len > 0) self.allocator.free(self.work_dir);
+        self.work_dir = copy;
+    }
+
+    /// 加载会话时同步工作目录（从 DB 行读取；空 = 默认）
+    fn loadWorkDirFor(self: *AppState, session_id: i64) void {
+        const db = if (self.db) |*d| d else {
+            self.replaceWorkDir(&.{}) catch {};
+            return;
+        };
+        const info = db.sessionInfo(session_id) catch null;
+        const wd: []const u8 = if (info) |i| i.work_dir else "";
+        self.replaceWorkDir(wd) catch {};
+    }
 
     fn currentProvider(self: *AppState) ?*config_mod.Provider {
         if (self.config.providers.items.len == 0) return null;
@@ -1930,6 +2029,15 @@ const AppState = struct {
                 continue;
             }
 
+            // 系统通知（工作目录切换/回退等）：进历史（发送时转 user）+ 暗淡灰色显示
+            if (std.mem.eql(u8, row.role, "system")) {
+                if (in_tail) {
+                    self.appendHistoryMessage(.{ .role = "system", .content = row.content, .db_id = row.id });
+                }
+                if (with_display) self.addSystemNotice(row.content);
+                continue;
+            }
+
             // user 及其他角色
             if (in_tail) {
                 self.appendHistoryMessage(.{ .role = row.role, .content = row.content, .db_id = row.id });
@@ -2015,6 +2123,7 @@ const AppState = struct {
         self.session_id = session_id;
         // 记录"上次访问"：下次启动时自动恢复该会话
         db.touchSession(session_id) catch {};
+        self.loadWorkDirFor(session_id);
         self.last_seen_msg_id = 0;
         self.last_compaction_id = if (checkpoint) |c| c.id else 0;
         if (rows.len == 0 and checkpoint == null) {
@@ -2053,6 +2162,7 @@ const AppState = struct {
         self.clearPendingSends();
         self.session_id = session_id;
         db.touchSession(session_id) catch {};
+        self.loadWorkDirFor(session_id);
         self.last_seen_msg_id = 0;
         self.last_compaction_id = if (checkpoint) |c| c.id else 0;
 
@@ -2202,6 +2312,19 @@ const AppState = struct {
                 if (in_window and tail_by_id.get(m.id) != null) {
                     const row = tail_by_id.get(m.id).?;
                     self.addLoadedAssistantMessage(row.content, row.reasoning, row.reasoning_ms, m.id);
+                    self.markLastEntry(.text);
+                } else {
+                    self.appendShellEntry(m, .text, false);
+                }
+                continue;
+            }
+
+            // 系统通知（工作目录切换/回退等）
+            if (std.mem.eql(u8, role, "system")) {
+                if (m.disp_bytes == 0) continue;
+                if (in_window and tail_by_id.get(m.id) != null) {
+                    const row = tail_by_id.get(m.id).?;
+                    self.addSystemNotice(row.content);
                     self.markLastEntry(.text);
                 } else {
                     self.appendShellEntry(m, .text, false);
@@ -2511,6 +2634,22 @@ const AppState = struct {
                 self.applyThinking(rest, true);
             } else {
                 self.addMessage("思考强度可选: off / low / high / max", .{ .fg = .red });
+            }
+        } else if (std.mem.eql(u8, name, "cwd")) {
+            const rest = std.mem.trim(u8, command[name.len..], " \t");
+            if (rest.len == 0) {
+                // 无参：打开编辑对话框（预填当前路径；独立输入框，不动主输入框草稿）
+                self.startCwdEdit(null);
+            } else if (self.setWorkDir(rest)) |err_msg| {
+                var buf: [512]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "切换工作目录失败: {s}", .{err_msg}) catch "切换工作目录失败";
+                self.addMessage(msg, .{ .fg = .red });
+            } else {
+                // 成功：系统通知（明文进历史；空闲时立即落库+显示，生成中排队注入）
+                var buf: [512]u8 = undefined;
+                const notice = std.fmt.bufPrint(&buf, "[工作目录已切换到: {s}]", .{self.effectiveWorkDir()}) catch "[工作目录已切换]";
+                self.emitSystemNotice(notice);
+                self.setToast("工作目录已切换");
             }
         } else if (std.mem.eql(u8, name, "exit")) {
             self.running = false;
@@ -3030,6 +3169,10 @@ const AppState = struct {
             self.mode = .compact_confirm;
         } else if (std.mem.eql(u8, name, "thinking")) {
             self.openThinkingSelect(.help_select);
+        } else if (std.mem.eql(u8, name, "cwd")) {
+            // 打开工作目录编辑对话框（独立输入框：不清空主输入框草稿）；
+            // Esc 返回帮助菜单
+            self.startCwdEdit(.help_select);
         } else if (std.mem.eql(u8, name, "exit")) {
             self.running = false;
         } else {
@@ -3141,19 +3284,19 @@ const AppState = struct {
     /// 进入重命名模式：把当前标题填入输入框（全选，方便直接覆盖）
     fn startSessionRename(self: *AppState, s: db_mod.SessionListRow) void {
         self.rename_session_id = s.id;
-        self.rename_input.clear();
-        if (s.title.len > 0) self.rename_input.insertBytes(s.title);
+        self.dialog_input.clear();
+        if (s.title.len > 0) self.dialog_input.insertBytes(s.title);
         // 不预选：光标落在末尾，用户按需 Ctrl+A 或手动选择（与常见重命名交互一致）
-        self.rename_input.sel_range = null;
-        self.rename_input.cursor = self.rename_input.value().len;
-        self.rename_input.follow_cursor = true;
+        self.dialog_input.sel_range = null;
+        self.dialog_input.cursor = self.dialog_input.value().len;
+        self.dialog_input.follow_cursor = true;
         self.mode = .session_rename;
     }
 
     /// 保存重命名（空标题不允许保存，保留原标题并提示）
     fn commitSessionRename(self: *AppState) void {
         const db = if (self.db) |*d| d else return;
-        const title = std.mem.trim(u8, self.rename_input.value(), " \t\r\n");
+        const title = std.mem.trim(u8, self.dialog_input.value(), " \t\r\n");
         if (title.len == 0) {
             self.setToast("标题不能为空");
             return;
@@ -3173,7 +3316,7 @@ const AppState = struct {
 
     fn cancelSessionRename(self: *AppState) void {
         self.rename_session_id = 0;
-        self.rename_input.clear();
+        self.dialog_input.clear();
         self.mode = .session_select;
     }
 
@@ -3186,69 +3329,69 @@ const AppState = struct {
                 if (key.modifiers.ctrl) {
                     switch (c) {
                         'a', 'A', 1 => {
-                            if (self.rename_input.value().len > 0) {
-                                self.rename_input.sel_range = .{ 0, self.rename_input.value().len };
-                                self.rename_input.cursor = self.rename_input.value().len;
+                            if (self.dialog_input.value().len > 0) {
+                                self.dialog_input.sel_range = .{ 0, self.dialog_input.value().len };
+                                self.dialog_input.cursor = self.dialog_input.value().len;
                             }
                         },
-                        'x', 'X', 24 => self.cutRenameSelection(),
-                        'c', 'C' => self.copyRenameSelection(),
+                        'x', 'X', 24 => self.cutDialogSelection(),
+                        'c', 'C' => self.copyDialogSelection(),
                         else => {},
                     }
                     return;
                 }
                 // 有选区：输入即替换选中内容（TextArea 不自动处理，需在此显式删除）
-                if (self.renameSelectionRange()) |r| self.rename_input.deleteRange(r[0], r[1]);
-                if (c >= 0x20) self.rename_input.insertCodepoint(c);
+                if (self.dialogSelectionRange()) |r| self.dialog_input.deleteRange(r[0], r[1]);
+                if (c >= 0x20) self.dialog_input.insertCodepoint(c);
             },
             .backspace => {
-                if (self.renameSelectionRange()) |r| {
-                    self.rename_input.deleteRange(r[0], r[1]);
+                if (self.dialogSelectionRange()) |r| {
+                    self.dialog_input.deleteRange(r[0], r[1]);
                 } else {
-                    self.rename_input.deleteBackward();
+                    self.dialog_input.deleteBackward();
                 }
             },
             .delete => {
-                if (self.renameSelectionRange()) |r| {
-                    self.rename_input.deleteRange(r[0], r[1]);
+                if (self.dialogSelectionRange()) |r| {
+                    self.dialog_input.deleteRange(r[0], r[1]);
                 } else {
-                    self.rename_input.deleteForward();
+                    self.dialog_input.deleteForward();
                 }
             },
             .left => {
-                if (!self.rename_input.collapseSelection(false)) self.rename_input.moveCursorLeft();
+                if (!self.dialog_input.collapseSelection(false)) self.dialog_input.moveCursorLeft();
             },
             .right => {
-                if (!self.rename_input.collapseSelection(true)) self.rename_input.moveCursorRight();
+                if (!self.dialog_input.collapseSelection(true)) self.dialog_input.moveCursorRight();
             },
             .home => {
-                _ = self.rename_input.collapseSelection(false);
-                self.rename_input.moveCursorHome();
+                _ = self.dialog_input.collapseSelection(false);
+                self.dialog_input.moveCursorHome();
             },
             .end => {
-                _ = self.rename_input.collapseSelection(true);
-                self.rename_input.moveCursorEnd();
+                _ = self.dialog_input.collapseSelection(true);
+                self.dialog_input.moveCursorEnd();
             },
             else => {},
         }
     }
 
     /// 重命名框的屏幕坐标 → 字节偏移（含视口滚动）；不在字段内返回 null
-    fn renamePointAt(self: *AppState, x: u16, y: u16) ?usize {
-        const r = self.rename_field_rect;
+    fn dialogPointAt(self: *AppState, x: u16, y: u16) ?usize {
+        const r = self.dialog_field_rect;
         if (r.width == 0 or y != r.y or x < r.x or x >= r.x + r.width) return null;
         const width: usize = r.width;
-        const row_index = self.rename_input.view_start; // 单行视口：显示的第一行
-        const range = self.rename_input.rowByteRange(width, row_index) orelse return null;
-        const text = self.rename_input.value();
+        const row_index = self.dialog_input.view_start; // 单行视口：显示的第一行
+        const range = self.dialog_input.rowByteRange(width, row_index) orelse return null;
+        const text = self.dialog_input.value();
         const off_in_row = offsetInRange(text, range[0], range[1], x - r.x);
         return off_in_row;
     }
 
     /// 重命名输入框的选区范围（两端排序、越界裁剪）；无有效选区返回 null
-    fn renameSelectionRange(self: *const AppState) ?[2]usize {
-        const r = self.rename_input.sel_range orelse return null;
-        const text_len = self.rename_input.value().len;
+    fn dialogSelectionRange(self: *const AppState) ?[2]usize {
+        const r = self.dialog_input.sel_range orelse return null;
+        const text_len = self.dialog_input.value().len;
         const lo = @min(r[0], text_len);
         const hi = @min(r[1], text_len);
         if (hi <= lo) return null;
@@ -3256,9 +3399,9 @@ const AppState = struct {
     }
 
     /// 复制重命名输入框选区（成功后清选区，与主输入框 Ctrl+C 一致）
-    fn copyRenameSelection(self: *AppState) void {
-        const r = self.renameSelectionRange() orelse return;
-        const sel = self.rename_input.value()[r[0]..r[1]];
+    fn copyDialogSelection(self: *AppState) void {
+        const r = self.dialogSelectionRange() orelse return;
+        const sel = self.dialog_input.value()[r[0]..r[1]];
         if (clipboard.setText(self.allocator, sel)) {
             var note_buf: [64]u8 = undefined;
             const note = std.fmt.bufPrint(&note_buf, "已复制 {d} 字符", .{sel.len}) catch "已复制";
@@ -3266,13 +3409,13 @@ const AppState = struct {
         } else {
             self.setToast("复制到剪贴板失败");
         }
-        self.rename_input.sel_range = null;
+        self.dialog_input.sel_range = null;
     }
 
     /// 剪切重命名输入框选区（先写剪贴板，成功后再删除）
-    fn cutRenameSelection(self: *AppState) void {
-        const r = self.renameSelectionRange() orelse return;
-        const sel = self.rename_input.value()[r[0]..r[1]];
+    fn cutDialogSelection(self: *AppState) void {
+        const r = self.dialogSelectionRange() orelse return;
+        const sel = self.dialog_input.value()[r[0]..r[1]];
         if (!clipboard.setText(self.allocator, sel)) {
             self.setToast("剪切到剪贴板失败");
             return;
@@ -3280,7 +3423,122 @@ const AppState = struct {
         var note_buf: [64]u8 = undefined;
         const note = std.fmt.bufPrint(&note_buf, "已剪切 {d} 字符", .{sel.len}) catch "已剪切";
         self.setToast(note);
-        self.rename_input.deleteRange(r[0], r[1]);
+        self.dialog_input.deleteRange(r[0], r[1]);
+    }
+
+    /// ── 工作目录编辑对话框（/cwd 无参 或 帮助菜单选 cwd）──
+    /// 独立输入框（不影响主输入框草稿）；预填 work_dir 本体（空 = 浮动状态）、
+    /// 光标在末尾、不预选；空输入 Enter = 重置为浮动（跟随启动目录）；
+    /// 无效路径 = 留在框内红字报错。
+    fn startCwdEdit(self: *AppState, parent: ?Mode) void {
+        self.menu_parent = parent;
+        self.dialog_input.clear();
+        // 预填 work_dir 本体（而非 effectiveWorkDir）：预填=显式设置过，空=浮动
+        if (self.work_dir.len > 0) self.dialog_input.insertBytes(self.work_dir);
+        self.dialog_input.placeholder = "留空 = 跟随启动目录";
+        self.dialog_input.sel_range = null;
+        self.dialog_input.cursor = self.dialog_input.value().len;
+        self.dialog_input.follow_cursor = true;
+        self.cwd_edit_error_len = 0;
+        self.mode = .cwd_edit;
+    }
+
+    fn setCwdEditError(self: *AppState, msg: []const u8) void {
+        const n = @min(msg.len, self.cwd_edit_error.len);
+        @memcpy(self.cwd_edit_error[0..n], msg[0..n]);
+        self.cwd_edit_error_len = n;
+    }
+
+    /// 提交：空输入 = 重置为浮动（跟随启动目录）；无效路径 = 留在框内报错；
+    /// 成功 = 切换/重置 + 通知 + 关闭
+    fn commitCwdEdit(self: *AppState) void {
+        const raw = std.mem.trim(u8, self.dialog_input.value(), " \t\r\n");
+        if (raw.len == 0) {
+            // 空输入：重置为浮动状态（跟随启动目录）——Enter 永远表示"应用输入框内容"
+            _ = self.setWorkDir("");
+            var buf: [512]u8 = undefined;
+            const notice = std.fmt.bufPrint(&buf, "[工作目录已重置，跟随启动目录: {s}]", .{self.effectiveWorkDir()}) catch "[工作目录已重置]";
+            self.emitSystemNotice(notice);
+            self.setToast("工作目录已重置");
+            self.cancelCwdEdit();
+            return;
+        }
+        if (self.setWorkDir(raw)) |err_msg| {
+            self.setCwdEditError(err_msg);
+            return; // 留在对话框，用户可直接改
+        }
+        var buf: [512]u8 = undefined;
+        const notice = std.fmt.bufPrint(&buf, "[工作目录已切换到: {s}]", .{self.effectiveWorkDir()}) catch "[工作目录已切换]";
+        self.emitSystemNotice(notice);
+        self.setToast("工作目录已切换");
+        self.cancelCwdEdit();
+    }
+
+    fn cancelCwdEdit(self: *AppState) void {
+        self.cwd_edit_error_len = 0;
+        self.dialog_input.clear();
+        const parent = self.menu_parent;
+        self.menu_parent = null;
+        self.mode = parent orelse .normal;
+    }
+
+    fn handleCwdEditKey(self: *AppState, key: tui.KeyEvent) void {
+        switch (key.code) {
+            .enter => self.commitCwdEdit(),
+            .esc => self.cancelCwdEdit(),
+            .char => |c| {
+                if (key.modifiers.ctrl) {
+                    switch (c) {
+                        'a', 'A', 1 => {
+                            if (self.dialog_input.value().len > 0) {
+                                self.dialog_input.sel_range = .{ 0, self.dialog_input.value().len };
+                                self.dialog_input.cursor = self.dialog_input.value().len;
+                            }
+                        },
+                        'x', 'X', 24 => self.cutDialogSelection(),
+                        'c', 'C' => self.copyDialogSelection(),
+                        else => {},
+                    }
+                    return;
+                }
+                if (self.dialogSelectionRange()) |r| self.dialog_input.deleteRange(r[0], r[1]);
+                if (c >= 0x20) {
+                    self.dialog_input.insertCodepoint(c);
+                    self.cwd_edit_error_len = 0; // 编辑后清错误提示
+                }
+            },
+            .backspace => {
+                if (self.dialogSelectionRange()) |r| {
+                    self.dialog_input.deleteRange(r[0], r[1]);
+                } else {
+                    self.dialog_input.deleteBackward();
+                }
+                self.cwd_edit_error_len = 0;
+            },
+            .delete => {
+                if (self.dialogSelectionRange()) |r| {
+                    self.dialog_input.deleteRange(r[0], r[1]);
+                } else {
+                    self.dialog_input.deleteForward();
+                }
+                self.cwd_edit_error_len = 0;
+            },
+            .left => {
+                if (!self.dialog_input.collapseSelection(false)) self.dialog_input.moveCursorLeft();
+            },
+            .right => {
+                if (!self.dialog_input.collapseSelection(true)) self.dialog_input.moveCursorRight();
+            },
+            .home => {
+                _ = self.dialog_input.collapseSelection(false);
+                self.dialog_input.moveCursorHome();
+            },
+            .end => {
+                _ = self.dialog_input.collapseSelection(true);
+                self.dialog_input.moveCursorEnd();
+            },
+            else => {},
+        }
     }
 
     fn handleSessionConfirmKey(self: *AppState, key: tui.KeyEvent) void {
@@ -3410,7 +3668,9 @@ const AppState = struct {
         errdefer job.arena.deinit();
         job.io = self.io;
         const arena = job.arena.allocator();
-        job.cwd = try std.process.currentPathAlloc(self.io, arena);
+        // 工具 cwd = 会话工作目录（空/失效时回退启动目录，见 effectiveWorkDir）
+        job.cwd = try arena.dupe(u8, self.effectiveWorkDir());
+        job.default_cwd = try arena.dupe(u8, self.default_cwd);
         job.model = try arena.dupe(u8, model);
         job.endpoint = try arena.dupe(u8, provider.endpoint);
         job.api_key = try arena.dupe(u8, self.resolvedApiKey(provider));
@@ -3569,6 +3829,9 @@ const AppState = struct {
             return;
         };
 
+        // 回合开始：校验工作目录有效性（目录被删 → 通知 + 回退，一次）
+        _ = self.healWorkDir();
+
         // 记录 user 消息（落库 + 内存历史）
         self.recordMessage("user", question, "", "", "", 0);
         // 回合起始计时（输入框标题的 "生成中 Ns"）
@@ -3606,11 +3869,19 @@ const AppState = struct {
     /// 生成/压缩期间用户提交消息：入队（稍后由 worker 注入或轮尾发出）+ 立即显示。
     /// 调用方负责清空输入框。
     fn queuePendingSend(self: *AppState, text: []const u8) void {
-        if (text.len == 0) return;
-        const owned = self.allocator.dupe(u8, text) catch {
+        self.queuePending(PendingKind.user, text, true) catch {
             self.setToast("排队失败：内存不足");
             return;
         };
+        self.setToast("已排队：将在下一个工具轮次或本轮结束后发送");
+    }
+
+    /// 入队一条消息（用户消息或系统通知）；display=true 时立即上屏。
+    /// 生成中：排队等待注入；空闲：用户消息直接发新回合、通知直接落库显示。
+    fn queuePending(self: *AppState, kind: PendingKind, text: []const u8, display: bool) !void {
+        if (text.len == 0) return;
+        const owned = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned);
         self.pending_sends_mutex.lockUncancelable(self.io);
         if (self.pending_sends.items.len >= max_pending_sends) {
             self.pending_sends_mutex.unlock(self.io);
@@ -3618,21 +3889,50 @@ const AppState = struct {
             self.setToast("排队消息过多（上限 32 条），请稍候");
             return;
         }
-        self.pending_sends.append(self.allocator, owned) catch {
+        self.pending_sends.append(self.allocator, .{ .kind = kind, .text = owned }) catch {
             self.pending_sends_mutex.unlock(self.io);
             self.allocator.free(owned);
-            self.setToast("排队失败：内存不足");
             return;
         };
         self.pending_sends_mutex.unlock(self.io);
 
-        // 立即上屏；真正落库与送达发生在注入（工具轮次边界）或轮尾 flush
-        self.addUserMessage(text);
-        self.setToast("已排队：将在下一个工具轮次或本轮结束后发送");
+        if (display) self.addUserMessage(text);
+    }
+
+    /// 系统通知：不触发生成，立即落库 + 显示（生成中则排队，由工具轮边界/轮尾消费）。
+    /// 用于告知 AI 环境变化（如工作目录切换/回退），明文进历史供后续回合可见。
+    /// 生成中：只入队、不上屏——由 worker 注入时的 .system_notice 事件负责
+    /// 唯一一次上屏（灰色样式），保证"AI 看到的顺序 == 渲染顺序"。
+    fn emitSystemNotice(self: *AppState, text: []const u8) void {
+        if (text.len == 0) return;
+        if (self.isStreaming() or self.isCompacting()) {
+            // 生成中：排队（display=false：不上屏，避免与注入事件重复；
+            // 也避免错误地走 user 样式）
+            self.queuePending(PendingKind.notice, text, false) catch {};
+            return;
+        }
+        // 空闲：立即落库 + 进历史 + 显示（不调 askAI）
+        self.recordMessage("system", text, "", "", "", 0);
+        self.addSystemNotice(text);
+    }
+
+    /// 系统通知的显示（暗淡灰色，与用户/AI 消息区分）
+    fn addSystemNotice(self: *AppState, text: []const u8) void {
+        if (text.len == 0) return;
+        const owned = self.allocator.dupe(u8, text) catch return;
+        self.messages.append(self.allocator, .{
+            .content = owned,
+            .style = .{ .fg = .dark_gray },
+            .entry_kind = .text,
+        }) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        self.follow_tail = true;
     }
 
     /// 取走最早一条排队消息（无则 null；调用方负责释放）
-    fn takeFirstPendingSend(self: *AppState) ?[]u8 {
+    fn takeFirstPendingSend(self: *AppState) ?PendingSend {
         self.pending_sends_mutex.lockUncancelable(self.io);
         defer self.pending_sends_mutex.unlock(self.io);
         if (self.pending_sends.items.len == 0) return null;
@@ -3643,8 +3943,12 @@ const AppState = struct {
     fn clearPendingSends(self: *AppState) void {
         self.pending_sends_mutex.lockUncancelable(self.io);
         defer self.pending_sends_mutex.unlock(self.io);
-        for (self.pending_sends.items) |text| self.allocator.free(text);
+        for (self.pending_sends.items) |p| self.allocator.free(p.text);
         self.pending_sends.clearRetainingCapacity();
+        self.pending_work_dir_mutex.lockUncancelable(self.io);
+        defer self.pending_work_dir_mutex.unlock(self.io);
+        if (self.pending_work_dir) |p| self.allocator.free(p);
+        self.pending_work_dir = null;
     }
 
     /// 一轮结束（正常/取消/失败）或压缩收尾后：若仍有排队消息，取最早一条作为新回合发出。
@@ -3660,9 +3964,22 @@ const AppState = struct {
             self.startCompaction(keep_override);
             if (self.isCompacting()) return; // 压缩期间不再发下一条
         }
-        const text = self.takeFirstPendingSend() orelse return;
-        defer self.allocator.free(text);
-        self.askAI(text);
+        // 先消费队列头部的系统通知（不触发生成，落库+显示后继续取）；
+        // 遇到用户消息则作为新回合发出（只发一条，其余留给下一轮工具边界）
+        while (self.takeFirstPendingSend()) |item| {
+            switch (item.kind) {
+                .notice => {
+                    defer self.allocator.free(item.text);
+                    self.recordMessage("system", item.text, "", "", "", 0);
+                    self.addSystemNotice(item.text);
+                },
+                .user => {
+                    defer self.allocator.free(item.text);
+                    self.askAI(item.text);
+                    return;
+                },
+            }
+        }
     }
 
     /// auto（硬编码）：思考结束后自动折叠正在流式的思考块。
@@ -3770,6 +4087,21 @@ const AppState = struct {
                         self.closeCurrentTurn();
                     },
                     .user_sent => self.setToast("排队消息已送达"),
+                    .system_notice => {
+                        // 系统通知（worker 注入路径）：上屏。
+                        // 落库与进历史已在 worker 侧完成（injectPendingSends → persistTranscriptEntry）
+                        if (ev.text.len > 0) self.addSystemNotice(ev.text);
+                    },
+                    .work_dir_changed => {
+                        // worker 的 cd 工具改了会话工作目录：同步到主线程（显示/后续回合）。
+                        // 空文本 = worker 检测到目录失效并已回退（DB 已清空）：同步清内存，
+                        // 避免帮助栏显示旧路径、下回合 heal 重复检测并重复通知。
+                        if (ev.text.len > 0) {
+                            self.replaceWorkDir(ev.text) catch {};
+                        } else {
+                            self.replaceWorkDir(&.{}) catch {};
+                        }
+                    },
                     .toast => {
                         // worker 侧请求的短提示（如排队压缩无内容可压）
                         if (ev.text.len > 0) self.setToast(ev.text);
@@ -4934,11 +5266,24 @@ const AppState = struct {
                 }
                 const command = self.input.value();
                 if (command.len > 0) {
-                    // 指令：生成中保持忽略（压缩中照常执行，由各指令校验自身状态）
+                    // 指令：生成中默认忽略（压缩中照常执行，由各指令校验自身状态），
+                    // 但**白名单指令**生成中也放行：
+                    //   /cwd  —— 只改会话工作目录 + 排队系统通知，不干扰流式状态
+                    //            （worker 在下一次工具执行前应用新目录）；
+                    //   /help（含 h / ?）—— 只开主菜单，纯 UI，无副作用；
+                    //   其余（/sessions、/models、/exit 等）仍拦截：生成中切换会与
+                    //            worker 的落库/请求状态打架（保险方案）。
                     if (isCommandInput(command)) {
-                        if (!self.isStreaming()) {
+                        const cmd_name = firstToken(command[1..]);
+                        const allowed_while_streaming = std.mem.eql(u8, cmd_name, "cwd") or
+                            std.mem.eql(u8, cmd_name, "help") or
+                            std.mem.eql(u8, cmd_name, "h") or
+                            std.mem.eql(u8, cmd_name, "?");
+                        if (!self.isStreaming() or allowed_while_streaming) {
                             self.handleInput(command);
                             self.input.clear();
+                        } else {
+                            self.setToast("生成中：该指令暂不可用（可先用 Ctrl+Q 中断）");
                         }
                         return;
                     }
@@ -5991,7 +6336,7 @@ fn cliCleanupState(state: *AppState, allocator: Allocator) void {
     state.compact_reasoning_buf.deinit(allocator);
     state.freeModelSelectModels();
     state.input.deinit();
-    state.rename_input.deinit();
+    state.dialog_input.deinit();
 }
 
 /// 应用 CLI 的 provider/model 覆盖；返回 0 成功，否则为退出码
@@ -6033,8 +6378,14 @@ fn cmdCompact(init: std.process.Init, opt: CliOptions) u8 {
     state.io = io;
     state.allocator = allocator;
     state.input.allocator = allocator;
-    state.rename_input.allocator = allocator;
+    state.dialog_input.allocator = allocator;
     state.environ_map = init.environ_map;
+    // 启动目录：会话 work_dir 为空/失效时的回退基准（工具 cwd 的默认值）
+    state.default_cwd = blk: {
+        const z = std.process.currentPathAlloc(io, allocator) catch break :blk allocator.dupe(u8, ".") catch &.{};
+        defer allocator.free(z);
+        break :blk allocator.dupe(u8, z) catch &.{};
+    };
     state.config.loadFile(io, allocator, opt.config_path);
     state.db = cliOpenDb(allocator, io, opt);
     if (state.db == null) {
@@ -6134,8 +6485,14 @@ fn cmdAsk(init: std.process.Init, opt: CliOptions) u8 {
     state.io = io;
     state.allocator = allocator;
     state.input.allocator = allocator;
-    state.rename_input.allocator = allocator;
+    state.dialog_input.allocator = allocator;
     state.environ_map = init.environ_map;
+    // 启动目录：会话 work_dir 为空/失效时的回退基准（工具 cwd 的默认值）
+    state.default_cwd = blk: {
+        const z = std.process.currentPathAlloc(io, allocator) catch break :blk allocator.dupe(u8, ".") catch &.{};
+        defer allocator.free(z);
+        break :blk allocator.dupe(u8, z) catch &.{};
+    };
     state.config.loadFile(io, allocator, opt.config_path);
     state.db = cliOpenDb(allocator, io, opt);
     if (state.db == null) {
@@ -6757,8 +7114,14 @@ pub fn main(init: std.process.Init) !u8 {
     state.io = io;
     state.allocator = allocator;
     state.input.allocator = allocator;
-    state.rename_input.allocator = allocator;
+    state.dialog_input.allocator = allocator;
     state.environ_map = init.environ_map;
+    // 启动目录：会话 work_dir 为空/失效时的回退基准（工具 cwd 的默认值）
+    state.default_cwd = blk: {
+        const z = std.process.currentPathAlloc(io, allocator) catch break :blk allocator.dupe(u8, ".") catch &.{};
+        defer allocator.free(z);
+        break :blk allocator.dupe(u8, z) catch &.{};
+    };
     state.config.load(io, allocator);
     // 模糊宽度策略（①←≤…按 1 列还是 2 列）：必须在首次绘制前应用
     applyAmbiguousWidth(&state);
@@ -6853,6 +7216,8 @@ pub fn main(init: std.process.Init) !u8 {
             freeMessage(state.allocator, msg);
         }
         state.history.deinit(state.allocator);
+        if (state.work_dir.len > 0) state.allocator.free(state.work_dir);
+        if (state.default_cwd.len > 0) state.allocator.free(state.default_cwd);
         for (state.messages.items) |msg| {
             state.freeDisplayMessage(msg);
         }
@@ -6873,7 +7238,7 @@ pub fn main(init: std.process.Init) !u8 {
         state.compact_reasoning_buf.deinit(state.allocator);
         state.freeModelSelectModels();
         state.input.deinit();
-        state.rename_input.deinit();
+        state.dialog_input.deinit();
     }
 
     // 输入框真实光标的显隐（按模式切换，仅在变化时调用终端 API）
@@ -6936,12 +7301,12 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }.render);
 
-        // 输入框真实光标的显隐与形状：带输入焦点的模式（主输入框/重命名框/表单字段）
+        // 输入框真实光标的显隐与形状：带输入焦点的模式（主输入框/重命名框/表单字段/cwd 编辑框）
         // 显示为"闪烁方块"（DECSCUSR 1 q，终端原生渲染：粗方块观感 + 原生闪烁，
         // 且不与 IME 组合串冲突）；其余菜单/弹窗隐藏；仅在状态变化时调用终端 API。
         // 坐标由各绘制函数写入 term_cursor_x/y（后绘制的叠加层覆盖主输入框的值）。
         const want_cursor = state.term_cursor_valid and switch (state.mode) {
-            .normal, .provider_add, .session_rename => true,
+            .normal, .provider_add, .session_rename, .cwd_edit => true,
             else => false,
         };
         if (want_cursor != cursor_visible) {
@@ -6993,6 +7358,7 @@ fn handleTerminalEvent(state: *AppState, terminal: *Terminal, event: tui.Event) 
                 .session_select => state.handleSessionSelectKey(key),
                 .session_confirm => state.handleSessionConfirmKey(key),
                 .session_rename => state.handleSessionRenameKey(key),
+                .cwd_edit => state.handleCwdEditKey(key),
                 .help_select => state.handleHelpSelectKey(key),
                 else => state.handleNormalKey(key),
             }
@@ -7021,40 +7387,41 @@ fn handleTerminalEvent(state: *AppState, terminal: *Terminal, event: tui.Event) 
                         state.setToast("粘贴内容超过字段上限，已截断");
                     }
                 },
-                .session_rename => {
-                    // 重命名输入框：有选区先替换（TextArea 不自动处理）
-                    if (state.renameSelectionRange()) |r| state.rename_input.deleteRange(r[0], r[1]);
-                    _ = insertPastedText(state.allocator, &state.rename_input, text);
+                .session_rename, .cwd_edit => {
+                    // 对话框输入框：有选区先替换（TextArea 不自动处理）
+                    if (state.dialogSelectionRange()) |r| state.dialog_input.deleteRange(r[0], r[1]);
+                    _ = insertPastedText(state.allocator, &state.dialog_input, text);
+                    if (state.mode == .cwd_edit) state.cwd_edit_error_len = 0;
                 },
                 else => {},
             }
         },
         .mouse => |m| {
-            if (state.mode == .session_rename) {
-                // 重命名输入框：点击定位 + 拖动框选（与主输入框/表单一致的交互）
+            if (state.mode == .session_rename or state.mode == .cwd_edit) {
+                // 对话框输入框：点击定位 + 拖动框选（与主输入框/表单一致的交互）
                 switch (m.kind) {
                     .down => {
                         if (m.button == .left) {
-                            if (state.renamePointAt(m.x, m.y)) |off| {
-                                state.rename_input.setCursor(off);
-                                state.rename_drag = .{ .active = true, .anchor = off };
+                            if (state.dialogPointAt(m.x, m.y)) |off| {
+                                state.dialog_input.setCursor(off);
+                                state.dialog_drag = .{ .active = true, .anchor = off };
                             }
                         }
                     },
                     .moved => {
-                        if (state.rename_drag.active) {
-                            if (state.renamePointAt(m.x, m.y)) |off| {
-                                const a = state.rename_drag.anchor;
+                        if (state.dialog_drag.active) {
+                            if (state.dialogPointAt(m.x, m.y)) |off| {
+                                const a = state.dialog_drag.anchor;
                                 if (a == off) {
-                                    state.rename_input.sel_range = null;
+                                    state.dialog_input.sel_range = null;
                                 } else {
-                                    state.rename_input.sel_range = .{ @min(a, off), @max(a, off) };
-                                    state.rename_input.cursor = off;
+                                    state.dialog_input.sel_range = .{ @min(a, off), @max(a, off) };
+                                    state.dialog_input.cursor = off;
                                 }
                             }
                         }
                     },
-                    .up => state.rename_drag.active = false,
+                    .up => state.dialog_drag.active = false,
                     else => {},
                 }
                 return;
@@ -7737,9 +8104,72 @@ fn ensureWorkerDb(job: *StreamJob, slot: *?db_mod.Db) ?*db_mod.Db {
 
 /// 工具轮次边界：把用户排队消息作为 user 消息注入历史（含实时落库与转录记录），
 /// 下一轮请求即可见。先整批取走（减少持锁时间），再逐条注入；失败仅丢弃该条。
+/// 生成中用户切换了工作目录：取走并应用（job.cwd 立即生效；通知由主线程负责）
+fn applyPendingWorkDir(job: *StreamJob) void {
+    const app = job.app;
+    app.pending_work_dir_mutex.lockUncancelable(app.io);
+    const pending = app.pending_work_dir;
+    app.pending_work_dir = null;
+    app.pending_work_dir_mutex.unlock(app.io);
+    if (pending) |p| {
+        defer app.allocator.free(p);
+        // 已在主线程校验存在；此处直接换用（cwd 生命周期到本回合结束）
+        job.cwd = job.arena.allocator().dupe(u8, p) catch return;
+    }
+}
+
+/// 工具执行前校验工作目录有效性：失效则回退 default_cwd（本回合工具继续可用）、
+/// 清空 DB 的 work_dir，并把"失效通知"入队（与排队通知同一套机制）：
+/// 由下一个轮次边界（或轮尾 flush）统一注入历史 + 落库 + 上屏。
+/// 不在工具执行点直接写 history：此刻 assistant(tool_calls) 与 tool 结果之间
+/// 插入消息会破坏工具调用配对（协议要求 tool 结果紧跟 tool_calls）。
+/// 同时推 work_dir_changed（空文本）让主线程清内存，避免下回合重复检测/重复通知。
+fn healWorkerWorkDir(job: *StreamJob) void {
+    if (job.cwd.len == 0) return;
+    var d = std.Io.Dir.openDirAbsolute(job.io, job.cwd, .{}) catch {
+        // 失效：回退启动目录（本回合内工具继续可用）
+        if (job.default_cwd.len > 0) {
+            job.cwd = job.arena.allocator().dupe(u8, job.default_cwd) catch return;
+        }
+        var buf: [512]u8 = undefined;
+        const notice = std.fmt.bufPrint(&buf, "[工作目录已失效，跟随启动目录: {s}]", .{job.default_cwd}) catch "[工作目录已失效]";
+        // 通知入队：由轮次边界/轮尾统一处理（历史+落库+上屏，与 AI 所见顺序一致）
+        queueNoticeFromWorker(job.app, notice);
+        // 主线程内存同步：清 work_dir（否则帮助栏显示旧路径、下回合重复检测）
+        pushStreamEvent(job.app, .work_dir_changed, "", "", "", "", false);
+        // 落库清空（主线程也会在下回合 heal；这里尽力而为）
+        var worker_db: ?db_mod.Db = null;
+        defer if (worker_db) |*w| w.deinit();
+        if (ensureWorkerDb(job, &worker_db)) |wdb| {
+            wdb.setSessionWorkDir(job.session_id_num, "") catch {};
+        }
+        return;
+    };
+    d.close(job.io);
+}
+
+/// worker 侧入队系统通知（不触发生成；由轮次边界或轮尾 flush 消费）。
+/// 与 queuePending 的区别：不碰 UI（worker 不能直接 setToast/addUserMessage），失败静默。
+fn queueNoticeFromWorker(app: *AppState, text: []const u8) void {
+    if (text.len == 0) return;
+    const owned = app.allocator.dupe(u8, text) catch return;
+    app.pending_sends_mutex.lockUncancelable(app.io);
+    if (app.pending_sends.items.len >= max_pending_sends) {
+        app.pending_sends_mutex.unlock(app.io);
+        app.allocator.free(owned);
+        return;
+    }
+    app.pending_sends.append(app.allocator, .{ .kind = .notice, .text = owned }) catch {
+        app.pending_sends_mutex.unlock(app.io);
+        app.allocator.free(owned);
+        return;
+    };
+    app.pending_sends_mutex.unlock(app.io);
+}
+
 fn injectPendingSends(job: *StreamJob, worker_db: *?db_mod.Db) void {
     const app = job.app;
-    var taken: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 };
+    var taken: std.ArrayListUnmanaged(PendingSend) = .{ .items = &.{}, .capacity = 0 };
     defer taken.deinit(app.allocator);
     {
         app.pending_sends_mutex.lockUncancelable(app.io);
@@ -7750,17 +8180,23 @@ fn injectPendingSends(job: *StreamJob, worker_db: *?db_mod.Db) void {
     }
 
     const arena = job.arena.allocator();
-    for (taken.items) |text| {
-        defer app.allocator.free(text);
-        const owned = arena.dupe(u8, text) catch continue;
-        const user_msg = ai.Message{ .role = "user", .content = owned };
-        job.transcript.append(arena, .{ .msg = user_msg }) catch continue;
-        job.history = extendHistory(arena, job.history, &[_]ai.Message{user_msg}) catch continue;
+    for (taken.items) |item| {
+        defer app.allocator.free(item.text);
+        const owned = arena.dupe(u8, item.text) catch continue;
+        const role: []const u8 = if (item.kind == .notice) "system" else "user";
+        const msg = ai.Message{ .role = role, .content = owned };
+        job.transcript.append(arena, .{ .msg = msg }) catch continue;
+        job.history = extendHistory(arena, job.history, &[_]ai.Message{msg}) catch continue;
         // 立即落库（与顺序一致）；失败留给 finalize 的批量兜底
         if (ensureWorkerDb(job, worker_db)) |wdb| {
             persistTranscriptEntry(job, wdb, job.transcript.items.len - 1, job.history.len - 1);
         }
-        pushStreamEvent(app, .user_sent, "", "", "", "", false);
+        if (item.kind == .notice) {
+            // 系统通知：不打断工具循环语义，只让主线程上屏（不显示“排队消息已送达”）
+            pushStreamEvent(app, .system_notice, "", item.text, "", "", false);
+        } else {
+            pushStreamEvent(app, .user_sent, "", "", "", "", false);
+        }
     }
 }
 
@@ -7957,6 +8393,10 @@ fn streamWorker(job: *StreamJob) void {
                 app.setStreamStatus(.canceled);
                 return;
             }
+            // 工具执行前：应用主线程传来的新工作目录（生成中用户 /cwd），
+            // 并校验当前目录有效性（失效 → 通知 + 回退启动目录）
+            applyPendingWorkDir(job);
+            healWorkerWorkDir(job);
             const args_summary = summarizeToolArgs(arena, tc.arguments) catch "";
             pushStreamEvent(app, .tool_start, tc.name, args_summary, tc.arguments, "", false);
             const tool_t0 = std.Io.Timestamp.now(job.io, .awake).toMilliseconds();
@@ -7965,10 +8405,14 @@ fn streamWorker(job: *StreamJob) void {
                 Log.debug(.tools, "执行 {s} args={s}", .{ tc.name, args_head });
             }
 
-            const exec_result = tools_mod.executeWithEnv(arena, job.io, job.cwd, tc.name, tc.arguments, job.environ_map) catch |e| blk: {
-                const msg = std.fmt.allocPrint(arena, "Tool execution failed: {s}", .{@errorName(e)}) catch "Tool execution failed";
-                break :blk tools_mod.Result{ .content = @constCast(msg), .is_error = true };
-            };
+            // cd 工具：不走 tools.zig 执行——它改变会话工作目录（job.cwd + 落库 + 回传主线程）
+            const exec_result = if (std.mem.eql(u8, tc.name, "cd"))
+                execCdTool(job, arena, tc.arguments)
+            else
+                tools_mod.executeWithEnv(arena, job.io, job.cwd, tc.name, tc.arguments, job.environ_map) catch |e| blk: {
+                    const msg = std.fmt.allocPrint(arena, "Tool execution failed: {s}", .{@errorName(e)}) catch "Tool execution failed";
+                    break :blk tools_mod.Result{ .content = @constCast(msg), .is_error = true };
+                };
             Log.info(.tools, "完成 {s}: {d}ms {d}B err={}", .{
                 tc.name,
                 std.Io.Timestamp.now(job.io, .awake).toMilliseconds() - tool_t0,
@@ -7976,12 +8420,22 @@ fn streamWorker(job: *StreamJob) void {
                 exec_result.is_error,
             });
 
-            const result_summary = summarizeToolResult(arena, exec_result) catch "";
+            // 裸 cd 提示：bash 是无状态子进程，单独的 cd 不会持久化。
+            // 只在命令确实是"纯 cd"（无串联/管道/换行）时提示，避免噪音。
+            var exec_result_final = exec_result;
+            if (std.mem.eql(u8, tc.name, "bash") and !exec_result.is_error) {
+                if (isBareCdCommand(arena, tc.arguments)) {
+                    const hint = "\n[hint] Each bash call runs in a fresh shell; this cd did not persist. Use the cd tool to change the session working directory.";
+                    const joined = std.fmt.allocPrint(arena, "{s}{s}", .{ exec_result.content, hint }) catch exec_result.content;
+                    exec_result_final = .{ .content = joined, .is_error = false, .display = exec_result.display };
+                }
+            }
+            const result_summary = summarizeToolResult(arena, exec_result_final) catch "";
             // 块内容：edit → diff 展示文本；bash → 原始输出
-            const payload: []const u8 = if (exec_result.display) |d|
+            const payload: []const u8 = if (exec_result_final.display) |d|
                 d
             else if (std.mem.eql(u8, tc.name, "bash"))
-                exec_result.content
+                exec_result_final.content
             else
                 "";
 
@@ -7989,12 +8443,12 @@ fn streamWorker(job: *StreamJob) void {
             job.tool_meta.append(arena, .{
                 .id = tc.id,
                 .name = tc.name,
-                .display = if (exec_result.display) |d| d else "",
-                .is_error = exec_result.is_error,
+                .display = if (exec_result_final.display) |d| d else "",
+                .is_error = exec_result_final.is_error,
             }) catch {};
 
             // 工具输出可能含非法 UTF-8（如 GBK 文件内容），先清洗再入历史
-            const safe_content = sanitizeDup(arena, exec_result.content) catch exec_result.content;
+            const safe_content = sanitizeDup(arena, exec_result_final.content) catch exec_result_final.content;
             const tool_msg = ai.Message{
                 .role = "tool",
                 .content = safe_content,
@@ -8009,11 +8463,56 @@ fn streamWorker(job: *StreamJob) void {
                 persistTranscriptEntry(job, wdb, job.transcript.items.len - 1, job.history.len - 1);
                 tool_db_id = job.transcript.items[job.transcript.items.len - 1].msg.db_id;
             }
-            pushStreamEventDb(app, .tool_end, tc.name, result_summary, tc.arguments, payload, exec_result.is_error, tool_db_id);
+            pushStreamEventDb(app, .tool_end, tc.name, result_summary, tc.arguments, payload, exec_result_final.is_error, tool_db_id);
         }
 
         waitDrained(app);
     }
+}
+
+/// 判断 bash 命令是否为"纯 cd"（无串联/管道/重定向/换行；即意图大概率是持久切换）
+fn isBareCdCommand(arena: Allocator, args_json: []const u8) bool {
+    const cmd = extractJsonString(arena, args_json, "command") orelse return false;
+    const trimmed = std.mem.trim(u8, cmd, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "cd ") and !std.mem.eql(u8, trimmed, "cd")) return false;
+    // 含串联/管道/重定向/换行 → 不是纯 cd
+    for (trimmed) |c| {
+        if (c == '&' or c == ';' or c == '|' or c == '>' or c == '<' or c == '\n') return false;
+    }
+    return true;
+}
+
+/// cd 工具（worker 内执行）：把会话工作目录切到指定路径。
+/// 解析基于当前 job.cwd（相对路径）、校验目录存在，成功后：
+/// ① job.cwd 立即更新（后续工具调用生效）；② 落库到 session.work_dir；
+/// ③ 推 work_dir_changed 事件回传主线程（状态栏/后续回合生效）。
+fn execCdTool(job: *StreamJob, arena: Allocator, args_json: []const u8) tools_mod.Result {
+    const path = extractJsonString(arena, args_json, "path") orelse
+        return .{ .content = tryDup(arena, "Missing required parameter: path"), .is_error = true };
+    const trimmed = std.mem.trim(u8, path, " \t\r\n");
+    if (trimmed.len == 0) {
+        return .{ .content = tryDup(arena, "Missing required parameter: path"), .is_error = true };
+    }
+    const abs = std.fs.path.resolve(arena, &.{ job.cwd, trimmed }) catch
+        return .{ .content = tryDup(arena, "Failed to resolve path"), .is_error = true };
+    // 校验：必须是已存在的目录
+    var d = std.Io.Dir.openDirAbsolute(job.io, abs, .{}) catch
+        return .{ .content = std.fmt.allocPrint(arena, "Directory not found: {s}", .{abs}) catch tryDup(arena, "Directory not found"), .is_error = true };
+    d.close(job.io);
+    job.cwd = abs;
+    // 落库（worker 自建连接；失败静默——内存已切换，重启后回退启动目录）
+    var worker_db: ?db_mod.Db = null;
+    defer if (worker_db) |*w| w.deinit();
+    if (ensureWorkerDb(job, &worker_db)) |wdb| {
+        wdb.setSessionWorkDir(job.session_id_num, abs) catch {};
+    }
+    pushStreamEvent(job.app, .work_dir_changed, "", abs, "", "", false);
+    return .{ .content = std.fmt.allocPrint(arena, "Working directory changed to: {s}", .{abs}) catch tryDup(arena, "ok"), .is_error = false };
+}
+
+/// 把字面量复制成 arena 上的可变切片（Result.content 是 []u8）
+fn tryDup(arena: Allocator, s: []const u8) []u8 {
+    return arena.dupe(u8, s) catch @constCast(s);
 }
 
 fn onStreamDelta(ctx: *anyopaque, kind: ai.DeltaKind, delta: []const u8) void {
@@ -8102,6 +8601,11 @@ fn drawFrame(state: *AppState, buf: *Buffer) void {
             // 会话列表在下，重命名对话框叠在上面
             drawOverlayMenu(state, area, buf, state.session_list.len + 1, drawSessionSelect);
             drawRenameOverlay(state, area, buf);
+        },
+        .cwd_edit => {
+            // 帮助菜单在下（从菜单进入时），编辑对话框叠在上面
+            if (state.menu_parent != null) drawOverlayMenu(state, area, buf, help_commands.len, drawHelpSelect);
+            drawCwdOverlay(state, area, buf);
         },
         .help_select => drawOverlayMenu(state, area, buf, help_commands.len, drawHelpSelect),
         else => {},
@@ -9711,20 +10215,76 @@ fn drawRenameOverlay(state: *AppState, area: Rect, buf: *Buffer) void {
     y += 2;
 
     // 输入框（单行）：选区高亮由 TextArea.render 处理
-    state.rename_input.focused = true;
+    state.dialog_input.focused = true;
     const field_area = Rect{ .x = inner.x, .y = y, .width = inner.width, .height = 1 };
-    state.rename_field_rect = field_area; // 记录屏幕区域（鼠标框选用）
+    state.dialog_field_rect = field_area; // 记录屏幕区域（鼠标框选用）
     // 与主输入框同一套光标：先应用视口，再算真实终端光标坐标，最后渲染
-    state.rename_input.applyViewport(field_area.width, 1);
-    if (inputCursorScreenPos(&state.rename_input, field_area)) |p| {
+    state.dialog_input.applyViewport(field_area.width, 1);
+    if (inputCursorScreenPos(&state.dialog_input, field_area)) |p| {
         state.term_cursor_x = p[0];
         state.term_cursor_y = p[1];
         state.term_cursor_valid = true;
     }
-    state.rename_input.render(field_area, buf);
+    state.dialog_input.render(field_area, buf);
 
     if (inner.height > 3) {
         buf.setString(inner.x, inner.y + inner.height -| 1, "Enter 保存 · Esc 取消 · Ctrl+A 全选 · Ctrl+X 剪切", .{ .fg = .dark_gray });
+    }
+}
+
+fn drawCwdOverlay(state: *AppState, area: Rect, buf: *Buffer) void {
+    var w: u16 = @intCast(@as(u32, area.width) * 60 / 100);
+    w = @min(@max(w, 44), 80);
+    var h: u16 = 8;
+    if (h > area.height) h = area.height;
+    const popup = tui.centeredRectFixed(area, w, h);
+
+    dimOutsidePopup(buf, popup);
+    clearArea(buf, popup);
+
+    const blk = Block{
+        .title = " 切换工作目录 ",
+        .borders = Borders.ALL,
+        .border_style = .{ .fg = .cyan },
+        .title_style = .{ .fg = .white, .modifier = .{ .bold = true } },
+        .border_symbols = BorderSymbols.rounded(),
+    };
+    blk.render(popup, buf);
+
+    const inner = blk.inner(popup);
+    if (inner.height == 0 or inner.width == 0) return;
+
+    var y = inner.y;
+    // 当前目录（参考值；输入框里是要切换到的目标）
+    var cur_buf: [1024]u8 = undefined;
+    const cur = if (state.work_dir.len > 0)
+        (std.fmt.bufPrint(&cur_buf, "当前: {s}", .{state.work_dir}) catch "当前目录")
+    else
+        "当前: 未设置（跟随启动目录）";
+    buf.setStringTruncated(inner.x, y, cur, inner.width, .{ .fg = .dark_gray });
+    y += 2;
+
+    // 输入框（单行）：选区高亮由 TextArea.render 处理
+    state.dialog_input.focused = true;
+    const field_area = Rect{ .x = inner.x, .y = y, .width = inner.width, .height = 1 };
+    state.dialog_field_rect = field_area; // 记录屏幕区域（鼠标框选用）
+    // 与主输入框同一套光标：先应用视口，再算真实终端光标坐标，最后渲染
+    state.dialog_input.applyViewport(field_area.width, 1);
+    if (inputCursorScreenPos(&state.dialog_input, field_area)) |p| {
+        state.term_cursor_x = p[0];
+        state.term_cursor_y = p[1];
+        state.term_cursor_valid = true;
+    }
+    state.dialog_input.render(field_area, buf);
+
+    // 错误行（提交失败时红字；否则帮助行）
+    if (inner.height > 4) {
+        if (state.cwd_edit_error_len > 0) {
+            var ebuf: [288]u8 = undefined;
+            const emsg = std.fmt.bufPrint(&ebuf, "✗ {s}", .{state.cwd_edit_error[0..state.cwd_edit_error_len]}) catch "✗ 无效路径";
+            buf.setStringTruncated(inner.x, inner.y + 4, emsg, inner.width, .{ .fg = .red });
+        }
+        buf.setString(inner.x, inner.y + inner.height -| 1, "Enter 应用 · Esc 取消 · 清空输入=跟随启动目录", .{ .fg = .dark_gray });
     }
 }
 
@@ -10299,7 +10859,9 @@ fn drawStatusSegment(buf: *Buffer, x: u16, end_x: u16, y: u16, text: []const u8,
 }
 
 fn drawHelp(state: *AppState, area: Rect, buf: *Buffer) void {
-    // 仅普通模式下替换为"进行中"提示（菜单打开时仍显示菜单自身的按键说明）
+    const y = area.y + area.height - 1;
+
+    // 右端：操作提示（按模式；菜单打开时显示菜单自身的按键说明）
     var busy_buf: [96]u8 = undefined;
     const busy_hint: []const u8 = if (state.mode != .normal)
         ""
@@ -10323,10 +10885,64 @@ fn drawHelp(state: *AppState, area: Rect, buf: *Buffer) void {
         .help_select => " [↑↓] 选择指令  [Enter] 执行  [Esc] 取消 ",
         else => " [Enter] 发送  [Ctrl+J] 换行  [PgUp/PgDn] 滚动  [Esc] 菜单 ",
     };
-    const y = area.y + area.height - 1;
     const help_width = tui.render.stringWidth(help);
-    const x = area.x + (area.width -| @as(u16, @intCast(help_width))) / 2;
-    buf.setString(x, y, help, .{ .fg = .dark_gray });
+    const help_x = area.x + (area.width -| @as(u16, @intCast(help_width)));
+    buf.setString(help_x, y, help, .{ .fg = .dark_gray });
+
+    // 左端：当前会话工作目录（任何模式下都显示；左起 1 列缩进，与提示保持 2 列间隔；超长中部截断）
+    const wd = state.effectiveWorkDir();
+    if (wd.len == 0) return;
+    const left_pad: usize = 1;
+    const budget: usize = if (help_x > area.x + left_pad + 2)
+        @as(usize, help_x - area.x - left_pad - 2)
+    else
+        0;
+    var dir_buf: [1024]u8 = undefined;
+    const shown = truncatePathMiddle(&dir_buf, wd, budget);
+    if (shown.len > 0) buf.setString(area.x + @as(u16, @intCast(left_pad)), y, shown, .{ .fg = .dark_gray });
+}
+
+/// 路径中部截断：宽度足够时原样返回；超长时保留首尾、中间用 "…" 连接
+/// （首尾各分一半宽度，尾部略多）。空间不足返回空串。
+fn truncatePathMiddle(buf: []u8, path: []const u8, budget: usize) []const u8 {
+    if (path.len == 0) return "";
+    const full_w = tui.render.stringWidth(path);
+    if (full_w <= budget) return path;
+    const ell = "…";
+    const ell_w = tui.render.stringWidth(ell);
+    if (budget <= ell_w + 4) return ""; // 空间太小：省略显示
+    const avail = budget - ell_w;
+    const head_budget = avail / 2;
+    const tail_budget = avail - head_budget;
+    // 头部：从前往后累计显示宽度（按码点切分）
+    var head_end: usize = 0;
+    {
+        var w: usize = 0;
+        while (head_end < path.len) {
+            var e = head_end + 1;
+            while (e < path.len and (path[e] & 0xC0) == 0x80) e += 1; // 续字节
+            const cw = tui.render.stringWidth(path[head_end..e]);
+            if (w + cw > head_budget) break;
+            w += cw;
+            head_end = e;
+        }
+    }
+    // 尾部：从后往前累计
+    var tail_start: usize = path.len;
+    {
+        var w: usize = 0;
+        while (tail_start > 0) {
+            var s = tail_start - 1;
+            while (s > 0 and (path[s] & 0xC0) == 0x80) s -= 1; // 回退到码点起点
+            const cw = tui.render.stringWidth(path[s..tail_start]);
+            if (w + cw > tail_budget) break;
+            w += cw;
+            tail_start = s;
+        }
+    }
+    // 首尾需有实际内容且不重叠
+    if (head_end == 0 or tail_start >= path.len or head_end >= tail_start) return "";
+    return std.fmt.bufPrint(buf, "{s}{s}{s}", .{ path[0..head_end], ell, path[tail_start..] }) catch "";
 }
 
 test {
@@ -10880,14 +11496,14 @@ test "生成中回车排队：入队+显示+清空输入；指令与空输入保
     state.io = io;
     state.allocator = std.testing.allocator;
     state.input.allocator = std.testing.allocator;
-    state.rename_input.allocator = std.testing.allocator;
+    state.dialog_input.allocator = std.testing.allocator;
     defer {
         state.clearPendingSends();
         state.pending_sends.deinit(std.testing.allocator);
         for (state.messages.items) |m| state.freeDisplayMessage(m);
         state.messages.deinit(std.testing.allocator);
         state.input.deinit();
-        state.rename_input.deinit();
+        state.dialog_input.deinit();
     }
 
     // 模拟流式进行中
@@ -10899,18 +11515,20 @@ test "生成中回车排队：入队+显示+清空输入；指令与空输入保
     state.last_key_ms = 0;
     state.handleNormalKey(.{ .code = .enter });
     try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len);
-    try std.testing.expectEqualStrings("生成中插一句", state.pending_sends.items[0]);
+    try std.testing.expectEqualStrings("生成中插一句", state.pending_sends.items[0].text);
+    try std.testing.expectEqual(PendingKind.user, state.pending_sends.items[0].kind);
     try std.testing.expectEqual(@as(usize, 0), state.input.value().len);
     try std.testing.expectEqual(@as(usize, 1), state.messages.items.len);
     try std.testing.expect(state.messages.items[0].user);
     try std.testing.expectEqualStrings("生成中插一句", state.messages.items[0].content);
 
-    // 指令：生成中保持忽略（不排队、不清空输入）
-    state.input.insertBytes("/help");
+    // 指令：生成中默认拦截（不排队、不清空输入）；/help 与 /cwd 已加入白名单，
+    // 这里用仍被拦截的 /sessions 验证保险语义
+    state.input.insertBytes("/sessions");
     state.last_key_ms = 0;
     state.handleNormalKey(.{ .code = .enter });
     try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len);
-    try std.testing.expectEqualStrings("/help", state.input.value());
+    try std.testing.expectEqualStrings("/sessions", state.input.value());
 
     // 空输入：无动作
     state.input.clear();
@@ -10923,8 +11541,9 @@ test "生成中回车排队：入队+显示+清空输入；指令与空输入保
     state.last_key_ms = 0;
     state.handleNormalKey(.{ .code = .enter });
     try std.testing.expectEqual(@as(usize, 2), state.pending_sends.items.len);
-    try std.testing.expectEqualStrings("生成中插一句", state.pending_sends.items[0]);
-    try std.testing.expectEqualStrings("第二条", state.pending_sends.items[1]);
+    try std.testing.expectEqualStrings("生成中插一句", state.pending_sends.items[0].text);
+    try std.testing.expectEqual(PendingKind.user, state.pending_sends.items[0].kind);
+    try std.testing.expectEqualStrings("第二条", state.pending_sends.items[1].text);
 }
 
 test "排队消息：FIFO 取用/清空；flush 在无提供商或生成中时不取走" {
@@ -10959,11 +11578,11 @@ test "排队消息：FIFO 取用/清空；flush 在无提供商或生成中时�
 
     // FIFO 取用
     const first = state.takeFirstPendingSend().?;
-    defer std.testing.allocator.free(first);
-    try std.testing.expectEqualStrings("第一条", first);
+    defer std.testing.allocator.free(first.text);
+    try std.testing.expectEqualStrings("第一条", first.text);
     const second = state.takeFirstPendingSend().?;
-    defer std.testing.allocator.free(second);
-    try std.testing.expectEqualStrings("第二条", second);
+    defer std.testing.allocator.free(second.text);
+    try std.testing.expectEqualStrings("第二条", second.text);
     try std.testing.expect(state.takeFirstPendingSend() == null);
 
     // clear 释放全部
@@ -11464,9 +12083,9 @@ test "粘贴文本：清洗非法 UTF-8 + 表单字段可粘贴" {
 
     // 大粘贴：动态缓冲完整保留（超过旧的 64KB 固定上限）
     state.input.allocator = std.testing.allocator;
-    state.rename_input.allocator = std.testing.allocator;
+    state.dialog_input.allocator = std.testing.allocator;
     defer state.input.deinit();
-    defer state.rename_input.deinit();
+    defer state.dialog_input.deinit();
     const big = try std.testing.allocator.alloc(u8, 200 * 1024);
     defer std.testing.allocator.free(big);
     @memset(big, 'a');
@@ -11665,9 +12284,9 @@ test "Ctrl+X 剪切输入框选区：先复制后删除，失败保留原文" {
     state.io = io;
     state.allocator = std.testing.allocator;
     state.input.allocator = std.testing.allocator;
-    state.rename_input.allocator = std.testing.allocator;
+    state.dialog_input.allocator = std.testing.allocator;
     defer state.input.deinit();
-    defer state.rename_input.deinit();
+    defer state.dialog_input.deinit();
 
     state.input.insertBytes("hello 你好 world");
     state.sel_area = .input;
@@ -14629,9 +15248,9 @@ test "进行中指示：drawInput 渲染（标题含盲文帧、边框忙碌变�
     state.io = io;
     state.allocator = std.testing.allocator;
     state.input.allocator = std.testing.allocator;
-    state.rename_input.allocator = std.testing.allocator;
+    state.dialog_input.allocator = std.testing.allocator;
     defer state.input.deinit();
-    defer state.rename_input.deinit();
+    defer state.dialog_input.deinit();
 
     const area = Rect{ .x = 0, .y = 0, .width = 60, .height = 6 };
 
@@ -14862,6 +15481,7 @@ test "进行中指示：帮助栏切换（含 Ctrl+Q / 排队提示；菜单不�
         renderRowText(&buf, &line);
         const text = std.mem.trimEnd(u8, &line, " ");
         // renderRowText 会把中文置换为 '?'，故用 ASCII 判别串
+        try std.testing.expect(std.mem.indexOf(u8, text, "[Ctrl+J]") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "[Enter]") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "Ctrl+Q") == null);
     }
@@ -15298,7 +15918,7 @@ test "会话重命名：Ctrl+R 进入、输入替换、Enter 保存落库" {
     state.io = io;
     state.allocator = std.testing.allocator;
     state.input.allocator = std.testing.allocator;
-    state.rename_input.allocator = std.testing.allocator;
+    state.dialog_input.allocator = std.testing.allocator;
     state.db = try db_mod.Db.openFile(std.testing.allocator, io, db_path);
     defer {
         if (state.db) |*d| d.deinit();
@@ -15307,7 +15927,7 @@ test "会话重命名：Ctrl+R 进入、输入替换、Enter 保存落库" {
         for (state.messages.items) |m| state.freeDisplayMessage(m);
         state.messages.deinit(std.testing.allocator);
         state.input.deinit();
-        state.rename_input.deinit();
+        state.dialog_input.deinit();
     }
 
     const sid = try state.db.?.createSession("旧标题");
@@ -15322,15 +15942,15 @@ test "会话重命名：Ctrl+R 进入、输入替换、Enter 保存落库" {
     // Ctrl+R 进入重命名：标题预填、光标在末尾、不预选（用户按需 Ctrl+A）
     state.startSessionRename(state.session_list[0]);
     try std.testing.expectEqual(Mode.session_rename, state.mode);
-    try std.testing.expectEqualStrings("旧标题", state.rename_input.value());
-    try std.testing.expect(state.rename_input.sel_range == null);
-    try std.testing.expectEqual(state.rename_input.value().len, state.rename_input.cursor);
+    try std.testing.expectEqualStrings("旧标题", state.dialog_input.value());
+    try std.testing.expect(state.dialog_input.sel_range == null);
+    try std.testing.expectEqual(state.dialog_input.value().len, state.dialog_input.cursor);
 
     // Ctrl+A 全选 → 输入替换
-    state.rename_input.sel_range = .{ 0, state.rename_input.value().len };
-    const r = state.renameSelectionRange().?;
-    state.rename_input.deleteRange(r[0], r[1]);
-    state.rename_input.insertBytes("新标题 v2");
+    state.dialog_input.sel_range = .{ 0, state.dialog_input.value().len };
+    const r = state.dialogSelectionRange().?;
+    state.dialog_input.deleteRange(r[0], r[1]);
+    state.dialog_input.insertBytes("新标题 v2");
 
     // Enter 保存
     state.commitSessionRename();
@@ -15340,7 +15960,7 @@ test "会话重命名：Ctrl+R 进入、输入替换、Enter 保存落库" {
 
     // 空标题不允许保存（保持原标题、停在重命名模式）
     state.startSessionRename(state.session_list[0]);
-    state.rename_input.clear(); // 清空内容（无选区）
+    state.dialog_input.clear(); // 清空内容（无选区）
     state.commitSessionRename();
     try std.testing.expectEqual(Mode.session_rename, state.mode);
     const row2 = (try state.db.?.sessionInfo(sid)).?;
@@ -15380,12 +16000,12 @@ test "表单字段：Ctrl+A 全选、选区删除、插入替换" {
 test "会话重命名：对话框渲染（标题提示 + 输入内容 + 帮助行 + 光标定位）" {
     var state = AppState{};
     state.allocator = std.testing.allocator;
-    state.rename_input.allocator = std.testing.allocator;
-    state.rename_input.draw_fake_cursor = false; // 用真实终端光标（与生产一致）
-    defer state.rename_input.deinit();
+    state.dialog_input.allocator = std.testing.allocator;
+    state.dialog_input.draw_fake_cursor = false; // 用真实终端光标（与生产一致）
+    defer state.dialog_input.deinit();
 
     state.rename_session_id = 42;
-    state.rename_input.insertBytes("我的新标题");
+    state.dialog_input.insertBytes("我的新标题");
     state.mode = .session_rename;
 
     var buf = try tui.render.Buffer.init(std.testing.allocator, 100, 30);
@@ -15428,10 +16048,10 @@ test "提供商表单：绘制后真实终端光标定位到当前字段" {
     state.io = io;
     state.allocator = std.testing.allocator;
     state.input.allocator = std.testing.allocator;
-    state.rename_input.allocator = std.testing.allocator;
+    state.dialog_input.allocator = std.testing.allocator;
     defer {
         state.input.deinit();
-        state.rename_input.deinit();
+        state.dialog_input.deinit();
     }
 
     state.mode = .provider_add;
@@ -15507,12 +16127,12 @@ test "主输入框：方向键折叠选区（左/右到边缘，Home/End 清除�
 test "重命名框：鼠标坐标映射与拖选" {
     var state = AppState{};
     state.allocator = std.testing.allocator;
-    state.rename_input.allocator = std.testing.allocator;
-    state.rename_input.draw_fake_cursor = false;
-    defer state.rename_input.deinit();
+    state.dialog_input.allocator = std.testing.allocator;
+    state.dialog_input.draw_fake_cursor = false;
+    defer state.dialog_input.deinit();
 
     state.rename_session_id = 7;
-    state.rename_input.insertBytes("hello world");
+    state.dialog_input.insertBytes("hello world");
     state.mode = .session_rename;
 
     var buf = try tui.render.Buffer.init(std.testing.allocator, 100, 30);
@@ -15521,26 +16141,717 @@ test "重命名框：鼠标坐标映射与拖选" {
     // 绘制一次以记录字段屏幕区域
     const area = Rect{ .x = 0, .y = 0, .width = 100, .height = 30 };
     drawRenameOverlay(&state, area, &buf);
-    const r = state.rename_field_rect;
+    const r = state.dialog_field_rect;
     try std.testing.expect(r.width > 0);
 
     // 坐标映射：行内第 3 列 → 字节偏移 3
-    try std.testing.expectEqual(@as(usize, 3), state.renamePointAt(r.x + 3, r.y).?);
+    try std.testing.expectEqual(@as(usize, 3), state.dialogPointAt(r.x + 3, r.y).?);
     // 行外（y 不匹配）→ null
-    try std.testing.expect(state.renamePointAt(r.x + 3, r.y + 1) == null);
+    try std.testing.expect(state.dialogPointAt(r.x + 3, r.y + 1) == null);
     // 字段左侧之外 → null
-    if (r.x > 0) try std.testing.expect(state.renamePointAt(r.x - 1, r.y) == null);
+    if (r.x > 0) try std.testing.expect(state.dialogPointAt(r.x - 1, r.y) == null);
 
     // 模拟拖选：锚点 2 → 当前 8，选区应为 [2, 8)，光标在 8
-    state.rename_drag = .{ .active = true, .anchor = 2 };
-    const off8 = state.renamePointAt(r.x + 8, r.y).?;
-    const a = state.rename_drag.anchor;
-    state.rename_input.sel_range = .{ @min(a, off8), @max(a, off8) };
-    state.rename_input.cursor = off8;
-    try std.testing.expectEqual([2]usize{ 2, 8 }, state.rename_input.sel_range.?);
-    try std.testing.expectEqual(@as(usize, 8), state.rename_input.cursor);
+    state.dialog_drag = .{ .active = true, .anchor = 2 };
+    const off8 = state.dialogPointAt(r.x + 8, r.y).?;
+    const a = state.dialog_drag.anchor;
+    state.dialog_input.sel_range = .{ @min(a, off8), @max(a, off8) };
+    state.dialog_input.cursor = off8;
+    try std.testing.expectEqual([2]usize{ 2, 8 }, state.dialog_input.sel_range.?);
+    try std.testing.expectEqual(@as(usize, 8), state.dialog_input.cursor);
 
     // 选区内容
-    const sel = extractInputSelection(state.rename_input.value(), 2, 8);
+    const sel = extractInputSelection(state.dialog_input.value(), 2, 8);
     try std.testing.expectEqualStrings("llo wo", sel);
+}
+
+test "会话工作目录：/cwd 切换、校验、落库、回退" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    const db_path = "skynet_test_workdir.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, db_path ++ "-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, db_path ++ "-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, db_path ++ "-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, db_path ++ "-shm") catch {};
+    }
+
+    // 准备一个真实子目录用于切换
+    std.Io.Dir.cwd().createDirPath(io, "skynet_test_wd_target") catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, "skynet_test_wd_target") catch {};
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.input.allocator = alloc;
+    state.dialog_input.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer {
+        if (state.db) |*d| d.deinit();
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.input.deinit();
+        state.dialog_input.deinit();
+        if (state.work_dir.len > 0) alloc.free(state.work_dir);
+        if (state.default_cwd.len > 0) alloc.free(state.default_cwd);
+    }
+    const sid = try state.db.?.createSession("wd-test");
+    state.session_id = sid;
+    {
+        const z = try std.process.currentPathAlloc(io, alloc);
+        defer alloc.free(z);
+        state.default_cwd = try alloc.dupe(u8, z);
+    }
+
+    // 初始：work_dir 为空 → 有效目录 = 启动目录
+    try std.testing.expectEqualStrings(state.default_cwd, state.effectiveWorkDir());
+
+    // 切到不存在的目录 → 报错、保持不变
+    try std.testing.expect(state.setWorkDir("skynet_no_such_dir_xyz") != null);
+    try std.testing.expectEqualStrings(state.default_cwd, state.effectiveWorkDir());
+
+    // 切到真实子目录 → 成功、绝对路径、落库
+    try std.testing.expect(state.setWorkDir("skynet_test_wd_target") == null);
+    try std.testing.expect(std.mem.endsWith(u8, state.effectiveWorkDir(), "skynet_test_wd_target"));
+    {
+        const info = (try state.db.?.sessionInfo(sid)).?;
+        try std.testing.expect(std.mem.endsWith(u8, info.work_dir, "skynet_test_wd_target"));
+    }
+
+    // 加载会话时恢复 work_dir（模拟重启：清内存 → loadWorkDirFor）
+    state.replaceWorkDir(&.{}) catch {};
+    try std.testing.expectEqualStrings(state.default_cwd, state.effectiveWorkDir());
+    state.loadWorkDirFor(sid);
+    try std.testing.expect(std.mem.endsWith(u8, state.effectiveWorkDir(), "skynet_test_wd_target"));
+
+    // 空参数 → 回到默认（落库清空）
+    try std.testing.expect(state.setWorkDir("") == null);
+    try std.testing.expectEqualStrings(state.default_cwd, state.effectiveWorkDir());
+    {
+        const info = (try state.db.?.sessionInfo(sid)).?;
+        try std.testing.expectEqualStrings("", info.work_dir);
+    }
+
+    // 目录被删后回退：切进去再删目录 → healWorkDir 检测失效并回退（+ 清库 + 通知）
+    try std.testing.expect(state.setWorkDir("skynet_test_wd_target") == null);
+    std.Io.Dir.cwd().deleteTree(io, "skynet_test_wd_target") catch {};
+    try std.testing.expect(state.healWorkDir()); // 检测到失效并回退
+    try std.testing.expectEqualStrings(state.default_cwd, state.effectiveWorkDir());
+    {
+        const info = (try state.db.?.sessionInfo(sid)).?;
+        try std.testing.expectEqualStrings("", info.work_dir); // 已清库
+    }
+    // 系统通知已发（显示 + 历史 + 落库）
+    var found_notice = false;
+    for (state.messages.items) |m| {
+        if (std.mem.indexOf(u8, m.content, "工作目录已失效") != null) found_notice = true;
+    }
+    try std.testing.expect(found_notice);
+    // 再次 heal：无 work_dir → 不再重复通知
+    try std.testing.expect(!state.healWorkDir());
+}
+
+test "cd 工具：切目录（job.cwd/落库/事件）与错误路径" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    const db_path = "skynet_test_cdtool.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, db_path ++ "-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, db_path ++ "-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, db_path ++ "-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, db_path ++ "-shm") catch {};
+    }
+    std.Io.Dir.cwd().createDirPath(io, "skynet_test_cd_target") catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, "skynet_test_cd_target") catch {};
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.input.allocator = alloc;
+    state.dialog_input.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer {
+        if (state.db) |*d| d.deinit();
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.input.deinit();
+        state.dialog_input.deinit();
+        state.clearStreamEventsLocked();
+        if (state.work_dir.len > 0) alloc.free(state.work_dir);
+        if (state.default_cwd.len > 0) alloc.free(state.default_cwd);
+    }
+    const sid = try state.db.?.createSession("cd-tool-test");
+    state.session_id = sid;
+
+    // 构造一个最小 job（execCdTool 需要 job.cwd/io/session_id_num/app）
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var job = StreamJob{
+        .app = &state,
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .io = io,
+        .cwd = "",
+        .model = "",
+        .endpoint = "",
+        .api_key = "",
+        .provider_name = "",
+        .history = &.{},
+    };
+    defer job.arena.deinit();
+    const job_arena = job.arena.allocator();
+    {
+        const z = try std.process.currentPathAlloc(io, job_arena);
+        job.cwd = try job_arena.dupe(u8, z);
+    }
+    job.session_id_num = sid;
+    job.db_path = try job_arena.dupeZ(u8, db_path); // ensureWorkerDb 需要真实路径
+
+    // 1) 正常切换：相对路径 → 绝对路径、job.cwd 更新、落库
+    {
+        const r = execCdTool(&job, job_arena, "{\"path\":\"skynet_test_cd_target\"}");
+        defer job_arena.free(r.content);
+        try std.testing.expect(!r.is_error);
+        try std.testing.expect(std.mem.endsWith(u8, job.cwd, "skynet_test_cd_target"));
+        const info = (try state.db.?.sessionInfo(sid)).?;
+        try std.testing.expect(std.mem.endsWith(u8, info.work_dir, "skynet_test_cd_target"));
+        // work_dir_changed 事件已入队（pumpStream 消费后更新主线程 work_dir）
+        state.pumpStream();
+        try std.testing.expect(std.mem.endsWith(u8, state.effectiveWorkDir(), "skynet_test_cd_target"));
+    }
+
+    // 2) 不存在的目录 → 报错、job.cwd 不变
+    {
+        const before = job.cwd;
+        const r = execCdTool(&job, job_arena, "{\"path\":\"no_such_dir_zzz\"}");
+        defer job_arena.free(r.content);
+        try std.testing.expect(r.is_error);
+        try std.testing.expectEqualStrings(before, job.cwd);
+    }
+
+    // 3) 缺参数 → 报错
+    {
+        const r = execCdTool(&job, job_arena, "{}");
+        defer job_arena.free(r.content);
+        try std.testing.expect(r.is_error);
+    }
+
+    // 4) 裸 cd 判定
+    try std.testing.expect(isBareCdCommand(job_arena, "{\"command\":\"cd src\"}"));
+    try std.testing.expect(isBareCdCommand(job_arena, "{\"command\":\"cd\"}"));
+    try std.testing.expect(!isBareCdCommand(job_arena, "{\"command\":\"cd src && ls\"}"));
+    try std.testing.expect(!isBareCdCommand(job_arena, "{\"command\":\"ls\"}"));
+}
+
+test "路径中部截断：保留首尾、宽度自适应、UTF-8 安全" {
+    var buf: [256]u8 = undefined;
+    // 宽度足够：原样返回
+    try std.testing.expectEqualStrings("/a/b", truncatePathMiddle(&buf, "/a/b", 20));
+    // 超长：保留首尾、中间省略号
+    const p = "C:\\Users\\32182\\Develop\\SkyNet";
+    const out = truncatePathMiddle(&buf, p, 20);
+    try std.testing.expect(std.mem.indexOf(u8, out, "…") != null);
+    try std.testing.expect(std.mem.startsWith(u8, out, "C:\\"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "SkyNet"));
+    try std.testing.expect(tui.render.stringWidth(out) <= 20);
+    // 空间太小：省略
+    try std.testing.expectEqualStrings("", truncatePathMiddle(&buf, p, 4));
+    // 中文路径（宽字符）：不切断码点、宽度不超预算
+    const cn = "C:\\项目\\超长的中文目录名称\\子目录\\最终目录";
+    const out2 = truncatePathMiddle(&buf, cn, 24);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out2));
+    try std.testing.expect(tui.render.stringWidth(out2) <= 24);
+    try std.testing.expect(std.mem.startsWith(u8, out2, "C:\\"));
+    try std.testing.expect(std.mem.endsWith(u8, out2, "目录"));
+}
+
+test "帮助栏：任何模式下都显示 cwd（含菜单模式）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    state.default_cwd = try std.testing.allocator.dupe(u8, "C:\\work\\proj");
+    defer std.testing.allocator.free(state.default_cwd);
+
+    var line: [160]u8 = undefined;
+
+    // normal：显示 cwd
+    {
+        var buf = try tui.render.Buffer.init(std.testing.allocator, 160, 1);
+        defer buf.deinit();
+        drawHelp(&state, .{ .x = 0, .y = 0, .width = 160, .height = 1 }, &buf);
+        renderRowText(&buf, &line);
+        try std.testing.expect(std.mem.indexOf(u8, &line, "C:\\work\\proj") != null);
+    }
+
+    // 菜单模式（session_select）：cwd 仍显示（此前会消失）
+    {
+        state.mode = .session_select;
+        var buf = try tui.render.Buffer.init(std.testing.allocator, 160, 1);
+        defer buf.deinit();
+        drawHelp(&state, .{ .x = 0, .y = 0, .width = 160, .height = 1 }, &buf);
+        renderRowText(&buf, &line);
+        try std.testing.expect(std.mem.indexOf(u8, &line, "C:\\work\\proj") != null);
+        // 右端仍是菜单自身的提示
+        try std.testing.expect(std.mem.indexOf(u8, &line, "重命名") != null or std.mem.indexOf(u8, &line, "Ctrl+R") != null);
+        state.mode = .normal;
+    }
+
+    // 窄窗口：cwd 与右侧提示不重叠（cwd 截断或省略）
+    {
+        var buf = try tui.render.Buffer.init(std.testing.allocator, 60, 1);
+        defer buf.deinit();
+        drawHelp(&state, .{ .x = 0, .y = 0, .width = 60, .height = 1 }, &buf);
+        // 逐格转文本（只取实际宽度 60，避免读到未初始化字节）
+        var narrow: [60]u8 = undefined;
+        for (0..60) |i| {
+            const cell = buf.get(@intCast(i), 0).?;
+            narrow[i] = if (cell.char < 128) @intCast(cell.char) else '?';
+        }
+        const text = std.mem.trimEnd(u8, &narrow, " ");
+        try std.testing.expect(std.mem.indexOf(u8, text, "[Esc]") != null); // 右侧提示完整
+        try std.testing.expect(tui.render.stringWidth(text) <= 60);
+        // cwd 被截断（含省略号）或不显示，但绝不与右侧重叠
+        if (std.mem.indexOf(u8, text, "C:") != null) {
+            const esc_pos = std.mem.indexOf(u8, text, "[Esc]").?;
+            try std.testing.expect(std.mem.indexOf(u8, text[0..esc_pos], "proj") == null or std.mem.indexOf(u8, text[0..esc_pos], "…") != null);
+        }
+    }
+}
+
+test "系统通知：空闲立即落库显示；发送时转 user" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    const db_path = "skynet_test_sysnotice.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, db_path ++ "-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, db_path ++ "-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, db_path ++ "-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, db_path ++ "-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.input.allocator = alloc;
+    state.dialog_input.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer {
+        if (state.db) |*d| d.deinit();
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.input.deinit();
+        state.dialog_input.deinit();
+        state.clearPendingSends();
+        state.pending_sends.deinit(alloc);
+    }
+    const sid = try state.db.?.createSession("sysnotice-test");
+    state.session_id = sid;
+
+    // 1) 空闲：emitSystemNotice → 落库（role=system）+ 进历史 + 显示（不触发 askAI）
+    state.emitSystemNotice("[工作目录已切换到: C:\\x]");
+    try std.testing.expectEqual(@as(usize, 1), state.history.items.len);
+    try std.testing.expectEqualStrings("system", state.history.items[0].role);
+    try std.testing.expectEqualStrings("[工作目录已切换到: C:\\x]", state.history.items[0].content);
+    try std.testing.expect(state.history.items[0].db_id > 0);
+    try std.testing.expectEqual(@as(usize, 1), state.messages.items.len);
+    try std.testing.expect(!state.messages.items[0].user); // 非用户消息
+    {
+        const rows = try state.db.?.loadMessages(sid);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqualStrings("system", rows[0].role);
+    }
+
+    // 2) 发送时 system 转 user（网关兼容）
+    const body = try ai.buildRequestBody(alloc, "m", state.history.items, &.{}, "s", .{});
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") == null);
+
+    // 3) 生成中：排队（kind=notice，不触发新回合）
+    state.setStreamStatus(.running);
+    state.emitSystemNotice("[工作目录已切换到: C:\\y]");
+    try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len);
+    try std.testing.expectEqual(PendingKind.notice, state.pending_sends.items[0].kind);
+    state.setStreamStatus(.idle);
+
+    // 4) 队列顺序与 kind：notice 在 user 之前按序保存（flush 消费逻辑依赖此顺序）
+    state.queuePendingSend("你好");
+    try std.testing.expectEqual(@as(usize, 2), state.pending_sends.items.len);
+    try std.testing.expectEqual(PendingKind.notice, state.pending_sends.items[0].kind);
+    try std.testing.expectEqual(PendingKind.user, state.pending_sends.items[1].kind);
+    // 手动模拟 flush 的 notice 消费（不依赖 provider 配置）
+    {
+        const item = state.takeFirstPendingSend().?;
+        defer alloc.free(item.text);
+        try std.testing.expectEqual(PendingKind.notice, item.kind);
+        state.recordMessage("system", item.text, "", "", "", 0);
+        state.addSystemNotice(item.text);
+    }
+    var sys_count: usize = 0;
+    for (state.history.items) |m| {
+        if (std.mem.eql(u8, m.role, "system")) sys_count += 1;
+    }
+    try std.testing.expect(sys_count >= 2);
+    try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len); // user 仍在队列
+}
+
+test "生成中白名单：/cwd 放行（排队通知+预置 pending_work_dir）；/help 仍拦截" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    // 准备一个真实目录用于切换
+    std.Io.Dir.cwd().createDirPath(io, "skynet_test_cwd_wl") catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, "skynet_test_cwd_wl") catch {};
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.input.allocator = alloc;
+    state.dialog_input.allocator = alloc;
+    defer {
+        state.clearPendingSends();
+        state.pending_sends.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.input.deinit();
+        state.dialog_input.deinit();
+        if (state.work_dir.len > 0) alloc.free(state.work_dir);
+        if (state.default_cwd.len > 0) alloc.free(state.default_cwd);
+    }
+    {
+        const z = try std.process.currentPathAlloc(io, alloc);
+        defer alloc.free(z);
+        state.default_cwd = try alloc.dupe(u8, z);
+    }
+
+    state.setStreamStatus(.running);
+
+    // /cwd <dir>：生成中放行 → 输入框清空 + pending_work_dir 设置 + 通知排队
+    state.input.insertBytes("/cwd skynet_test_cwd_wl");
+    state.last_key_ms = 0;
+    state.handleNormalKey(.{ .code = .enter });
+    try std.testing.expectEqual(@as(usize, 0), state.input.value().len); // 已执行并清空
+    try std.testing.expect(state.work_dir.len > 0); // 目录已切换
+    try std.testing.expect(std.mem.endsWith(u8, state.work_dir, "skynet_test_cwd_wl"));
+    // 生成中：通知排队（kind=notice）
+    try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len);
+    try std.testing.expectEqual(PendingKind.notice, state.pending_sends.items[0].kind);
+    // 生成中：pending_work_dir 已设（worker 下次工具执行前应用）
+    try std.testing.expect(state.pending_work_dir != null);
+
+    // /sessions：生成中仍拦截 → 输入框内容保留 + 无新排队
+    state.input.insertBytes("/sessions");
+    state.last_key_ms = 0;
+    state.handleNormalKey(.{ .code = .enter });
+    try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len); // 未新增
+    try std.testing.expectEqualStrings("/sessions", state.input.value()); // 保留未清空
+
+    // /help（含别名 h / ?）：生成中放行 → 输入框清空 + 进入主菜单
+    // 注：handleCommand 直接改 mode；handleNormalKey 是 normal 模式的分发入口
+    state.input.clear(); // 上一步 /sessions 被拦截后内容仍在输入框
+    state.input.insertBytes("/help");
+    state.last_key_ms = 0;
+    state.handleNormalKey(.{ .code = .enter });
+    try std.testing.expectEqual(@as(usize, 0), state.input.value().len); // 已执行并清空
+    try std.testing.expectEqual(Mode.help_select, state.mode);
+    state.mode = .normal;
+
+    // /?（别名）：同样放行
+    state.input.clear();
+    state.input.insertBytes("/?");
+    state.last_key_ms = 0;
+    state.handleNormalKey(.{ .code = .enter });
+    try std.testing.expectEqual(@as(usize, 0), state.input.value().len);
+    try std.testing.expectEqual(Mode.help_select, state.mode);
+    state.mode = .normal;
+}
+
+test "生成中 /cwd：通知恰好显示一次（不重复上屏），样式为 system" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    std.Io.Dir.cwd().createDirPath(io, "skynet_test_dd2") catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, "skynet_test_dd2") catch {};
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.input.allocator = alloc;
+    state.dialog_input.allocator = alloc;
+    defer {
+        state.clearPendingSends();
+        state.pending_sends.deinit(alloc);
+        state.clearStreamEventsLocked();
+        state.stream_events.deinit(alloc);
+        state.stream_buf.deinit(alloc);
+        state.stream_reasoning_buf.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.input.deinit();
+        state.dialog_input.deinit();
+        if (state.work_dir.len > 0) alloc.free(state.work_dir);
+        if (state.default_cwd.len > 0) alloc.free(state.default_cwd);
+    }
+    {
+        const z = try std.process.currentPathAlloc(io, alloc);
+        defer alloc.free(z);
+        state.default_cwd = try alloc.dupe(u8, z);
+    }
+
+    // 生成中执行 /cwd：排队但不上屏（修复点）
+    state.setStreamStatus(.running);
+    state.input.insertBytes("/cwd skynet_test_dd2");
+    state.last_key_ms = 0;
+    state.handleNormalKey(.{ .code = .enter });
+    try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len);
+
+    // 排队阶段：显示区不应出现通知（避免与注入事件重复）
+    for (state.messages.items) |m| {
+        try std.testing.expect(std.mem.indexOf(u8, m.content, "工作目录已切换") == null);
+    }
+
+    // 模拟 worker 在工具轮边界注入：push .system_notice 事件 + pump
+    pushStreamEvent(&state, .system_notice, "", state.pending_sends.items[0].text, "", "", false);
+    state.pumpStream();
+
+    // 恰好一次显示，且是 system 样式（非 user 绿条）
+    var count: usize = 0;
+    for (state.messages.items) |m| {
+        if (std.mem.indexOf(u8, m.content, "工作目录已切换") != null) {
+            count += 1;
+            try std.testing.expect(!m.user); // 非 user 样式
+            try std.testing.expectEqualStrings("[工作目录已切换到: ", m.content[0.."[工作目录已切换到: ".len]);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "cwd 对话框：预填/提交/无效路径留框/空输入关闭/菜单父级返回" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    std.Io.Dir.cwd().createDirPath(io, "skynet_test_cwd_dlg") catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, "skynet_test_cwd_dlg") catch {};
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.input.allocator = alloc;
+    state.dialog_input.allocator = alloc;
+    defer {
+        state.clearPendingSends();
+        state.pending_sends.deinit(alloc);
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.input.deinit();
+        state.dialog_input.deinit();
+        if (state.work_dir.len > 0) alloc.free(state.work_dir);
+        if (state.default_cwd.len > 0) alloc.free(state.default_cwd);
+    }
+    {
+        const z = try std.process.currentPathAlloc(io, alloc);
+        defer alloc.free(z);
+        state.default_cwd = try alloc.dupe(u8, z);
+    }
+
+    // 1) 打开（模拟 /cwd 无参）：预填 work_dir 本体（初始未设置 → 为空）、光标末尾、不预选
+    state.startCwdEdit(null);
+    try std.testing.expectEqual(Mode.cwd_edit, state.mode);
+    try std.testing.expectEqualStrings("", state.dialog_input.value()); // work_dir 本体为空
+    try std.testing.expect(state.dialog_input.sel_range == null);
+    try std.testing.expectEqual(state.dialog_input.value().len, state.dialog_input.cursor);
+
+    // 2) 无效路径：留框 + 错误信息
+    state.dialog_input.clear();
+    state.dialog_input.insertBytes("no_such_dir_zzz");
+    state.commitCwdEdit();
+    try std.testing.expectEqual(Mode.cwd_edit, state.mode); // 未关闭
+    try std.testing.expect(state.cwd_edit_error_len > 0);
+
+    // 3) 编辑后错误清除
+    state.handleCwdEditKey(.{ .code = .{ .char = 'x' } });
+    try std.testing.expectEqual(@as(usize, 0), state.cwd_edit_error_len);
+
+    // 4) 有效路径：切换 + 关闭 + 通知（空闲立即落库显示）
+    state.dialog_input.clear();
+    state.dialog_input.insertBytes("skynet_test_cwd_dlg");
+    state.commitCwdEdit();
+    try std.testing.expectEqual(Mode.normal, state.mode);
+    try std.testing.expect(std.mem.endsWith(u8, state.effectiveWorkDir(), "skynet_test_cwd_dlg"));
+    var notice_shown = false;
+    for (state.messages.items) |m| {
+        if (std.mem.indexOf(u8, m.content, "工作目录已切换到") != null) notice_shown = true;
+    }
+    try std.testing.expect(notice_shown);
+
+    // 5) 空输入：重置为浮动（跟随启动目录）——方案 B 语义
+    state.startCwdEdit(null);
+    // 预填应为 work_dir 本体（此时是显式设置的路径）
+    try std.testing.expect(std.mem.endsWith(u8, state.dialog_input.value(), "skynet_test_cwd_dlg"));
+    state.dialog_input.clear();
+    state.commitCwdEdit();
+    try std.testing.expectEqual(Mode.normal, state.mode);
+    try std.testing.expectEqualStrings(state.default_cwd, state.effectiveWorkDir()); // 浮动：回启动目录
+    try std.testing.expectEqual(@as(usize, 0), state.work_dir.len); // 已清空
+
+    // 6) 从帮助菜单进入：Esc 返回 help_select
+    state.startCwdEdit(.help_select);
+    try std.testing.expectEqual(Mode.cwd_edit, state.mode);
+    state.handleCwdEditKey(.{ .code = .esc });
+    try std.testing.expectEqual(Mode.help_select, state.mode);
+    state.mode = .normal;
+
+    // 7) 主输入框草稿不受影响（对话框独立）
+    state.input.insertBytes("我的草稿");
+    state.startCwdEdit(null);
+    state.cancelCwdEdit();
+    try std.testing.expectEqualStrings("我的草稿", state.input.value());
+}
+
+test "worker 目录失效：通知入队 + 事件清内存 + DB 清空（下个边界统一送达）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    const db_path = "skynet_test_healw.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, db_path ++ "-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, db_path ++ "-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, db_path ++ "-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, db_path ++ "-shm") catch {};
+    }
+    std.Io.Dir.cwd().createDirPath(io, "skynet_test_healw_dir") catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, "skynet_test_healw_dir") catch {};
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.input.allocator = alloc;
+    state.dialog_input.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer {
+        if (state.db) |*d| d.deinit();
+        state.clearPendingSends();
+        state.pending_sends.deinit(alloc);
+        state.clearStreamEventsLocked();
+        state.stream_events.deinit(alloc);
+        state.stream_buf.deinit(alloc);
+        state.stream_reasoning_buf.deinit(alloc);
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.input.deinit();
+        state.dialog_input.deinit();
+        if (state.work_dir.len > 0) alloc.free(state.work_dir);
+        if (state.default_cwd.len > 0) alloc.free(state.default_cwd);
+    }
+    const sid = try state.db.?.createSession("healw-test");
+    state.session_id = sid;
+    state.default_cwd = blk: {
+        const z = try std.process.currentPathAlloc(io, alloc);
+        defer alloc.free(z);
+        break :blk try alloc.dupe(u8, z);
+    };
+    // 会话先切到目标目录（落库），模拟"用户切完后删除目录"
+    try state.db.?.setSessionWorkDir(sid, "C:\\no_such_heal_dir");
+
+    // 构造 job：cwd 指向已不存在的目录
+    var job = StreamJob{
+        .app = &state,
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .io = io,
+        .cwd = "",
+        .model = "",
+        .endpoint = "",
+        .api_key = "",
+        .provider_name = "",
+        .history = &.{},
+    };
+    defer job.arena.deinit();
+    const ja = job.arena.allocator();
+    job.cwd = try ja.dupe(u8, "C:\\no_such_heal_dir");
+    job.default_cwd = try ja.dupe(u8, state.default_cwd);
+    job.db_path = try ja.dupeZ(u8, db_path);
+    job.session_id_num = sid;
+
+    // 执行：应回退 cwd、入队通知、推 work_dir_changed（空文本）、清 DB
+    healWorkerWorkDir(&job);
+    try std.testing.expectEqualStrings(state.default_cwd, job.cwd);
+    // 通知已入队（kind=notice），不在 worker 直接写历史
+    try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len);
+    try std.testing.expectEqual(PendingKind.notice, state.pending_sends.items[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, state.pending_sends.items[0].text, "失效") != null);
+    try std.testing.expectEqual(@as(usize, 0), state.history.items.len); // 未直接写历史
+    // DB 已清空
+    try std.testing.expectEqualStrings("", (try state.db.?.sessionInfo(sid)).?.work_dir);
+    // 事件：work_dir_changed（空文本）→ pump 后主线程内存清空
+    state.pumpStream();
+    try std.testing.expectEqual(@as(usize, 0), state.work_dir.len);
+    // 再次 heal：cwd 已是有效目录 → 无操作、无重复入队
+    healWorkerWorkDir(&job);
+    try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len);
+}
+
+test "cwd 对话框：预填 work_dir 本体（浮动为空 / 已设置为路径）" {
+    var state = AppState{};
+    state.allocator = std.testing.allocator;
+    state.dialog_input.allocator = std.testing.allocator;
+    defer state.dialog_input.deinit();
+    state.default_cwd = try std.testing.allocator.dupe(u8, "C:\\start_dir");
+    defer std.testing.allocator.free(state.default_cwd);
+
+    // 浮动状态（work_dir 为空）：输入框应为空（而非预填启动目录）
+    state.startCwdEdit(null);
+    try std.testing.expectEqualStrings("", state.dialog_input.value());
+    try std.testing.expectEqualStrings("留空 = 跟随启动目录", state.dialog_input.placeholder);
+
+    // 已设置状态：预填 work_dir 本体
+    state.work_dir = try std.testing.allocator.dupe(u8, "C:\\my\\proj");
+    defer std.testing.allocator.free(state.work_dir);
+    state.startCwdEdit(null);
+    try std.testing.expectEqualStrings("C:\\my\\proj", state.dialog_input.value());
 }

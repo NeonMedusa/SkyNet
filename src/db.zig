@@ -78,6 +78,8 @@ pub const SessionInfo = struct {
     title: []const u8 = "",
     created_at: i64 = 0,
     last_active_at: i64 = 0,
+    /// 会话工作目录（空 = 用程序启动目录）。工具的 cwd 基准。
+    work_dir: []const u8 = "",
 };
 
 pub const SessionListRow = struct {
@@ -230,7 +232,8 @@ pub const Db = struct {
         \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
         \\  title TEXT NOT NULL DEFAULT '',
         \\  created_at INTEGER NOT NULL,
-        \\  last_active_at INTEGER NOT NULL
+        \\  last_active_at INTEGER NOT NULL,
+        \\  work_dir TEXT NOT NULL DEFAULT ''
         \\);
         \\CREATE TABLE IF NOT EXISTS "message" (
         \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -289,7 +292,8 @@ pub const Db = struct {
     /// 版本历史：
     /// - v8：`message.folded`——工具输出折叠仅面向 AI（content 始终存全文）
     /// - v9：`message.disp_*` / `has_reasoning`——懒加载显示的元数据 + 覆盖索引
-    pub const schema_version: i64 = 9;
+    /// - v10：`session.work_dir`——会话工作目录（工具 cwd 基准；空 = 启动目录）
+    pub const schema_version: i64 = 10;
 
     /// 有迁移路径的最低旧版本：低于它一律拒绝（闸门提示备份后新建）。
     /// 目前有 v7→v8→v9 两步；将来每加一步迁移函数就把这里前移。
@@ -362,6 +366,7 @@ pub const Db = struct {
     const migrations = [_]struct { from: i64, run: MigrationFn }{
         .{ .from = 7, .run = migrateV7ToV8 },
         .{ .from = 8, .run = migrateV8ToV9 },
+        .{ .from = 9, .run = migrateV9ToV10 },
     };
 
     /// 备份 + 逐级迁移（v{current} → v{schema_version}）。
@@ -552,6 +557,14 @@ pub const Db = struct {
         self.sess.deinit();
     }
 
+    /// v9 → v10：会话工作目录列（工具 cwd 基准；空 = 程序启动目录）。
+    /// 纯加列，无需回填（空串即默认语义）。
+    fn migrateV9ToV10(sess: *fr.Session) !void {
+        try sess.conn.execAll(
+            "ALTER TABLE \"session\" ADD COLUMN work_dir TEXT NOT NULL DEFAULT '';",
+        );
+    }
+
     fn now(self: *Db) i64 {
         return std.Io.Timestamp.now(self.io, .real).toSeconds();
     }
@@ -570,7 +583,7 @@ pub const Db = struct {
     /// 会话 id 更大但可能很久未用，会导致启动时恢复错会话）
     pub fn latestSession(self: *Db) !?SessionInfo {
         const rows = try self.sess.raw(
-            "SELECT id, title, created_at, last_active_at FROM \"session\"",
+            "SELECT id, title, created_at, last_active_at, work_dir FROM \"session\"",
             .{},
         ).orderBy("last_active_at DESC, id DESC").limit(1).fetchAll(SessionInfo);
         if (rows.len == 0) return null;
@@ -595,7 +608,7 @@ pub const Db = struct {
     /// 单个会话信息（不存在返回 null）
     pub fn sessionInfo(self: *Db, session_id: i64) !?SessionInfo {
         const rows = try self.sess.raw(
-            "SELECT id, title, created_at, last_active_at FROM \"session\" WHERE id = ?",
+            "SELECT id, title, created_at, last_active_at, work_dir FROM \"session\" WHERE id = ?",
             .{session_id},
         ).fetchAll(SessionInfo);
         if (rows.len == 0) return null;
@@ -947,6 +960,14 @@ pub const Db = struct {
         try self.sess.exec(
             "UPDATE \"session\" SET title = ? WHERE id = ?",
             .{ title, session_id },
+        );
+    }
+
+    /// 设置会话工作目录（空串 = 回到启动目录语义）
+    pub fn setSessionWorkDir(self: *Db, session_id: i64, work_dir: []const u8) !void {
+        try self.sess.exec(
+            "UPDATE \"session\" SET work_dir = ? WHERE id = ?",
+            .{ work_dir, session_id },
         );
     }
 };
@@ -1304,11 +1325,21 @@ test "db: v7 → v8 迁移（加 folded 列 + 还原 stub 为全文 + 备份）"
     {
         var db = try Db.openFile(testing.allocator, io, path);
         defer db.deinit();
-        // 版本号与 schema 同事务写入：迁移链 v7 → v8 → v9
+        // 版本号与 schema 同事务写入：迁移链 v7 → v8 → v9 → v10
         {
             const Ver = struct { user_version: i64 = 0 };
             const ver = try db.sess.raw("SELECT user_version FROM pragma_user_version", .{}).fetchAll(Ver);
-            try testing.expectEqual(@as(i64, 9), ver[0].user_version);
+            try testing.expectEqual(@as(i64, 10), ver[0].user_version);
+        }
+        // v10：session.work_dir 列已添加（默认空串）
+        {
+            const Col = struct { name: []const u8 = "" };
+            const cols = try db.sess.raw("SELECT name FROM pragma_table_info('session')", .{}).fetchAll(Col);
+            var has_work_dir = false;
+            for (cols) |c| {
+                if (std.mem.eql(u8, c.name, "work_dir")) has_work_dir = true;
+            }
+            try testing.expect(has_work_dir);
         }
         // tool_full 列已被彻底移除（不留冗余副本）
         {
