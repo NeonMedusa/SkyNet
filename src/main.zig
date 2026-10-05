@@ -507,7 +507,7 @@ const tool_schemas = blk: {
     break :blk arr;
 };
 
-const StreamEventKind = enum { turn_end, tool_start, tool_end, user_sent, retry_start, toast, work_dir_changed, system_notice };
+const StreamEventKind = enum { turn_end, tool_start, tool_end, user_sent, retry_start, toast, work_dir_changed, system_notice, usage_update };
 
 /// 进行中/压缩的统一强调色（标准橙色 orange）：输入框忙碌边框、压缩通知共用。
 /// 终端不支持 24-bit 色时由终端降级到近似色。
@@ -522,6 +522,8 @@ const StreamEvent = struct {
     /// 块内容（bash 输出 / edit diff 文本）
     payload: []u8 = &.{},
     is_error: bool = false,
+    /// 服务端真实 usage（usage_update 事件：每轮请求即时刷新上下文占用）
+    usage: ai.Usage = .{},
     /// 关联的数据库行 id（窗口化：回填到显示消息，使其滚出视口后可卸载/重载）
     db_id: i64 = 0,
 };
@@ -565,7 +567,8 @@ const StreamJob = struct {
     auto_compact_pct: u64 = 0,
     context_window: u64 = 0,
     keep_recent_tokens: usize = 0,
-    /// usage 锚点（0 = 无）：job.history 前 anchor_len 条 ≈ anchor_tokens 个 token
+    /// usage 锚点（0 = 无）：job.history 前 anchor_len 条 ≈ anchor_tokens 个 token。
+    /// 每轮请求成功后刷新（真实 input + 当前位置）；回合开始时从主线程拷入。
     anchor_len: usize = 0,
     anchor_tokens: u64 = 0,
     /// 本回合是否发生过中途压缩（finalize 后需按 checkpoint 重建主线程历史）
@@ -658,7 +661,8 @@ const AppState = struct {
     compact_queued: std.atomic.Value(bool) = .init(false),
     /// 排队压缩的保留窗口覆盖（/compact N；0 = 用配置值）
     compact_queued_keep: std.atomic.Value(usize) = .init(0),
-    /// 最近一次请求的 token 用量；无真实数据时为历史估算值（见 usage_estimated）
+    /// 最近一次请求的 token 用量（显示源：加载时由 seedUsageFromDb 播种服务端真实值，
+    /// 生成中由 usage_update 事件每轮刷新）
     last_usage: ai.Usage = .{},
     /// 本轮最后一个请求的用量（上下文占用显示：工具循环的多轮请求不累计）
     context_usage: ai.Usage = .{},
@@ -1264,8 +1268,8 @@ const AppState = struct {
         return if (model.len > 0) modelContextWindow(model) else 131_072;
     }
 
-    /// 估算当前请求 token。有真实 usage 锚点（上一轮服务端计数）时用「锚点 token + 其后增量」，
-    /// 否则退化为纯 chars/4 估算（会低估中文密集内容；启动第一轮/重建历史后如此）。
+    /// 估算当前请求 token（仅用于压缩决策/确认框展示；状态栏显示用服务端真实值）。
+    /// 有锚点时 = 锚点 token + 其后增量估算；否则 chars/4 纯估算。
     fn estimateRequestTokens(self: *AppState) usize {
         if (self.usage_anchor_len) |anchor_len| {
             if (anchor_len <= self.history.items.len and self.usage_anchor_tokens > 0) {
@@ -1277,14 +1281,48 @@ const AppState = struct {
         return estimateTokens(historyRequestBytesSlice(self.history.items) + toolsSchemaBytes());
     }
 
-    /// 无真实 usage 时用历史估算填充上下文占用（启动/加载/压缩后即可显示）
-    fn refreshEstimatedUsage(self: *AppState) void {
-        self.last_usage = .{ .input_tokens = self.estimateRequestTokens() };
-        self.context_usage = self.last_usage;
-        self.usage_estimated = true;
-        // 估算值替换真实 usage → 锚点失效（history 常在本函数前被重建）
+    /// 用数据库里最后一条真实 usage 播种上下文占用（加载/切换会话后调用）：
+    /// - 显示：直接使用服务端最后一次回传的真实值（input/output/cached 原样，无估算）；
+    /// - 压缩决策：同时设锚点（真实值 + 其后增量估算，内部使用，不进显示）。
+    /// 无数据（新会话/行已被压缩出历史）时归零（状态栏显示 0%）。
+    fn seedUsageFromDb(self: *AppState) void {
+        // 先归零：切到无数据会话时不能残留上一个会话的值
+        self.last_usage = .{};
+        self.context_usage = .{};
         self.usage_anchor_len = null;
         self.usage_anchor_tokens = 0;
+        self.usage_estimated = true; // 尚未有"本轮"真实数据（CLI 契约用）
+
+        const db = if (self.db) |*d| d else return;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const row = (db.lastUsageRow(scratch.allocator(), self.session_id) catch return) orelse return;
+        const in_tokens: u64 = @intCast(row.input_tokens);
+        const out_tokens: u64 = @intCast(row.output_tokens);
+        if (in_tokens == 0) return;
+
+        // 显示：服务端真实值原样（不做任何估算）
+        self.last_usage = .{
+            .input_tokens = in_tokens,
+            .cached_tokens = @intCast(row.cached_tokens),
+            .output_tokens = out_tokens,
+        };
+        self.context_usage = self.last_usage;
+
+        // 压缩决策锚点：在 history 里定位该行；其后增量走估算（与 estimateRequestTokens 同口径）。
+        // 定位不到（已被压缩出历史）则不设锚点（压缩回退纯估算）。
+        for (self.history.items, 0..) |m, i| {
+            if (m.db_id == row.db_id) {
+                self.usage_anchor_len = i + 1;
+                self.usage_anchor_tokens = in_tokens + out_tokens;
+                break;
+            }
+        }
+    }
+
+    /// 启动兜底：无需处理（新设计下无估算；无数据即 0%，由 seedUsageFromDb 归零）
+    fn ensureUsageDisplayed(self: *AppState) void {
+        _ = self;
     }
 
     /// 接近窗口阈值时自动压缩（在发起新一轮请求前调用）
@@ -2050,8 +2088,8 @@ const AppState = struct {
         // 恢复长会话时先批量折叠较早的工具输出，避免第一轮就把整段历史发给模型
         _ = self.maybeFoldOldToolOutputs();
 
-        // 加载会话后立即用历史估算上下文占用（无需等一轮对话）
-        self.refreshEstimatedUsage();
+        // 加载会话后应用服务端最后一次真实 usage（无数据即 0%）
+        self.seedUsageFromDb();
     }
 
     /// 从数据库恢复的 AI 回复（Markdown + 思考块，思考块默认折叠）
@@ -2127,9 +2165,9 @@ const AppState = struct {
         self.last_seen_msg_id = 0;
         self.last_compaction_id = if (checkpoint) |c| c.id else 0;
         if (rows.len == 0 and checkpoint == null) {
-            // 空会话：历史 = 当前提示词（与新建一致），并刷新估算显示
+            // 空会话：历史 = 当前提示词；无 usage 数据 → 上下文占用归零
             self.appendHistory("system", system_prompt);
-            self.refreshEstimatedUsage();
+            self.seedUsageFromDb();
             return;
         }
         self.applyLoadedMessagesWithCheckpoint(rows, checkpoint, compactions, true, true);
@@ -2168,7 +2206,7 @@ const AppState = struct {
 
         if (meta.len == 0 and checkpoint == null) {
             self.appendHistory("system", system_prompt);
-            self.refreshEstimatedUsage();
+            self.seedUsageFromDb();
             return;
         }
 
@@ -2596,7 +2634,8 @@ const AppState = struct {
         self.session_id = sid;
         // 政策A：DB 不记录 system 行（提示词属于程序；加载/重建时统一前置当前值）
         self.appendHistory("system", system_prompt);
-        self.refreshEstimatedUsage();
+        // 新会话：无 usage 数据 → 上下文占用归零（对话后由服务端真实值替换）
+        self.seedUsageFromDb();
     }
 
     fn handleInput(self: *AppState, input: []const u8) void {
@@ -4087,6 +4126,14 @@ const AppState = struct {
                         self.closeCurrentTurn();
                     },
                     .user_sent => self.setToast("排队消息已送达"),
+                    .usage_update => {
+                        // 服务端每轮真实用量：即时刷新上下文占用与缓存命中率
+                        if (ev.usage.input_tokens > 0) {
+                            self.last_usage = ev.usage;
+                            self.context_usage = ev.usage;
+                            self.usage_estimated = false;
+                        }
+                    },
                     .system_notice => {
                         // 系统通知（worker 注入路径）：上屏。
                         // 落库与进历史已在 worker 侧完成（injectPendingSends → persistTranscriptEntry）
@@ -4404,11 +4451,8 @@ const AppState = struct {
 
         if (self.stream_job) |job| {
             const compacted_midturn = job.compacted_midturn;
-            self.last_usage = .{
-                .input_tokens = job.usage_input,
-                .output_tokens = job.usage_output,
-                .cached_tokens = job.usage_cached,
-            };
+            // 注意：上下文占用/缓存显示已由每轮 usage_update 事件实时刷新（round_usage），
+            // 这里不再用累计值覆盖（累计是多轮求和，会虚高）。
             Log.info(.stream, "回合结束 status={s} in={d} out={d} cached={d} compacted={} err={s}", .{
                 @tagName(self.streamStatus()),
                 job.usage_input,
@@ -4417,9 +4461,13 @@ const AppState = struct {
                 compacted_midturn,
                 if (err) |e| @errorName(e) else "-",
             });
-            // 上下文占用只取最后一轮请求：多轮工具循环累计会虚高（如 35 轮 → 1.1M）
-            self.context_usage = job.round_usage;
-            self.usage_estimated = false; // 真实用量
+            // 上下文占用/缓存：保留最后一轮的真实值（usage_update 已写入）；
+            // 仅兜底：若整个回合没收到过任何真实值（如首轮即失败），保持原样（0%）
+            if (job.round_usage.input_tokens > 0) {
+                self.last_usage = job.round_usage;
+                self.context_usage = job.round_usage;
+                self.usage_estimated = false; // 本轮真实用量（CLI 契约）
+            }
             // usage 锚点：本轮最后一轮真实 usage + 其后增量，供下次估算使用。
             // 只认正常结束的回合：取消/失败时 history 可能含部分内容，用旧 usage 当锚点会低估
             const anchor_tokens: u64 = job.round_usage.input_tokens + job.round_usage.output_tokens;
@@ -7152,8 +7200,8 @@ pub fn main(init: std.process.Init) !u8 {
         // 数据库不可用时退化为纯内存模式
         state.appendHistory("system", system_prompt);
     }
-    // 启动即显示上下文估算（加载路径里也会刷新）
-    state.refreshEstimatedUsage();
+    // 启动兜底：新设计下无估算（无数据即 0%，由 seedUsageFromDb 归零），此处无需处理
+    state.ensureUsageDisplayed();
     Log.info(.startup, "TUI 启动 db={s} session={d} provider={s} model={s}", .{
         if (state.db != null) "ok" else "memory",
         state.session_id,
@@ -7962,6 +8010,16 @@ fn summarizeToolResult(arena: Allocator, result: tools_mod.Result) error{OutOfMe
     return toolResultSummary(arena, result.content, result.is_error);
 }
 
+/// 推一个 usage 事件（worker 每轮拿到服务端真实用量后调用；线程安全）
+fn pushUsageEvent(app: *AppState, usage: ai.Usage) void {
+    app.stream_mutex.lockUncancelable(app.io);
+    defer app.stream_mutex.unlock(app.io);
+    app.stream_events.append(app.allocator, .{
+        .kind = .usage_update,
+        .usage = usage,
+    }) catch {};
+}
+
 /// 事件入队（线程安全）
 fn pushStreamEvent(
     app: *AppState,
@@ -8297,6 +8355,15 @@ fn streamWorker(job: *StreamJob) void {
                 job.usage_output += client.usage.output_tokens;
                 job.usage_cached += client.usage.cached_tokens;
                 job.round_usage = client.usage;
+                // 每轮刷新锚点：此刻 job.history 就是刚发出的请求前缀，
+                // 用真实 input 作为锚点 token（其后增量 = 本轮回复/工具结果，走估算）。
+                // 比"回合开始时设一次"更准：误差被压到单轮增量级别。
+                if (client.usage.input_tokens > 0) {
+                    job.anchor_len = job.history.len;
+                    job.anchor_tokens = client.usage.input_tokens;
+                }
+                // 每轮请求即时刷新主线程的上下文占用/缓存命中（不必等回合结束）
+                pushUsageEvent(app, client.usage);
                 break :attempt_loop;
             } else |err| {
                 if (!streamErrorRetryable(err) or attempt >= stream_retry_max or
@@ -10780,16 +10847,16 @@ fn drawInputStatus(state: *AppState, area: Rect, buf: *Buffer) void {
     if (state.currentProvider()) |p| provider_name = p.name;
 
     if (model.len > 0) {
-        // 最左：上下文占用（已用/窗口 + 百分比，按压力着色）
+        // 最左：上下文占用（已用/窗口 + 百分比，按压力着色）。
+        // 无数据（新会话）时显示 0%；数据来源 = 服务端最近一次真实回传
         const used_tokens = state.context_usage.input_tokens + state.context_usage.output_tokens;
-        if (used_tokens > 0) {
+        {
             const ctx = modelContextWindow(model);
             const pct = contextUsagePercent(used_tokens, ctx);
             var b0: [24]u8 = undefined;
             var b1: [24]u8 = undefined;
             var sb: [96]u8 = undefined;
-            const size_text = std.fmt.bufPrint(&sb, " {s}{s}/{s} ", .{
-                if (state.usage_estimated) "~" else "",
+            const size_text = std.fmt.bufPrint(&sb, " {s}/{s} ", .{
                 formatCount(&b0, used_tokens),
                 formatCount(&b1, ctx),
             }) catch "";
@@ -10818,16 +10885,19 @@ fn drawInputStatus(state: *AppState, area: Rect, buf: *Buffer) void {
                 x = drawStatusSegment(buf, x, end_x, area.y, text, .{ .fg = .yellow });
             }
         }
-        if (state.context_usage.cached_tokens > 0 and state.context_usage.input_tokens > 0) {
-            var cb0: [24]u8 = undefined;
-            var cb1: [24]u8 = undefined;
-            var sb: [64]u8 = undefined;
-            const text = std.fmt.bufPrint(&sb, " · 缓存 {s}/{s} ", .{
-                formatCount(&cb0, state.context_usage.cached_tokens),
-                formatCount(&cb1, state.context_usage.input_tokens),
-            }) catch "";
-            if (text.len > 0) {
-                x = drawStatusSegment(buf, x, end_x, area.y, text, .{ .fg = .dark_gray });
+        if (state.context_usage.input_tokens > 0) {
+            // 有数据（服务端真实回传）：缓存命中 + 命中率
+            if (state.context_usage.cached_tokens > 0) {
+                var cb0: [24]u8 = undefined;
+                var cb1: [24]u8 = undefined;
+                var sb: [64]u8 = undefined;
+                const text = std.fmt.bufPrint(&sb, " · 缓存 {s}/{s} ", .{
+                    formatCount(&cb0, state.context_usage.cached_tokens),
+                    formatCount(&cb1, state.context_usage.input_tokens),
+                }) catch "";
+                if (text.len > 0) {
+                    x = drawStatusSegment(buf, x, end_x, area.y, text, .{ .fg = .dark_gray });
+                }
             }
             // 命中率：高命中绿色、中等黄色、低命中红色（与上下文占用同风格）
             const hit = cacheHitPercent(state.context_usage.cached_tokens, state.context_usage.input_tokens);
@@ -10837,10 +10907,9 @@ fn drawInputStatus(state: *AppState, area: Rect, buf: *Buffer) void {
                 const hit_color: tui.style.Color = if (hit >= 80) .green else if (hit >= 50) .yellow else .red;
                 _ = drawStatusSegment(buf, x, end_x, area.y, hit_text, .{ .fg = hit_color });
             }
-        } else if (state.usage_estimated) {
-            // 尚无真实 usage（重启/新建会话后）：显示占位而非整块消失，
-            // 避免"缓存命中率去哪了"的困惑；发一条消息后由真实值替换
-            _ = drawStatusSegment(buf, x, end_x, area.y, " · 缓存 — 暂无数据 ", .{ .fg = .dark_gray });
+        } else {
+            // 无数据（新会话/未发过消息）：命中率 0%（数据仅来自服务端真实回传）
+            _ = drawStatusSegment(buf, x, end_x, area.y, " · 缓存 0% ", .{ .fg = .dark_gray });
         }
     } else if (provider_name.len > 0) {
         var sb: [192]u8 = undefined;
@@ -13958,12 +14027,6 @@ test "usage 锚点：估算 = 真实 usage + 其后增量；历史重建后失�
     try std.testing.expect(state.usage_anchor_len == null);
     try std.testing.expectEqual(@as(u64, 0), state.usage_anchor_tokens);
 
-    // refreshEstimatedUsage 同样清空锚点（估算值不再是真实前缀的代表）
-    state.usage_anchor_len = 3;
-    state.usage_anchor_tokens = 12_345;
-    state.refreshEstimatedUsage();
-    try std.testing.expect(state.usage_anchor_len == null);
-
     // worker 侧：job 锚点优先于纯估算（工具循环中途压缩的阈值判定）
     var threaded: std.Io.Threaded = undefined;
     threaded = .init(std.testing.allocator, .{});
@@ -13995,6 +14058,16 @@ test "usage 锚点：估算 = 真实 usage + 其后增量；历史重建后失�
     // 锚点越界（历史被截断）→ 回退纯估算（不为 5100+）
     job.anchor_len = 5;
     try std.testing.expect(estimateJobRequestTokens(&job) != 5_100);
+
+    // 每轮刷新后的形态：锚点指向全部历史（刚发完请求）→ 估算 = 真实值本身（增量 0）
+    job.anchor_len = job.history.len;
+    job.anchor_tokens = 900_000;
+    try std.testing.expectEqual(@as(usize, 900_000), estimateJobRequestTokens(&job));
+    // 本轮回复/工具结果追加后：估算 = 900k + 新增估算（误差仅限单轮增量）
+    job.history = try extendHistory(job.arena.allocator(), job.history, &[_]ai.Message{
+        .{ .role = "assistant", .content = "x" ** 400 }, // 400B ≈ 100 tokens
+    });
+    try std.testing.expectEqual(@as(usize, 900_100), estimateJobRequestTokens(&job));
 }
 
 test "usage 锚点：只认正常结束的回合，取消不设锚点" {
@@ -14575,23 +14648,23 @@ test "上下文估算：加载会话后即有占用（无需先对话）" {
         state.compact_reasoning_buf.deinit(alloc);
     }
 
-    // 新会话（加载路径）即有非零估算，且标记为估算、无缓存数据
+    // 新会话（无 usage 数据）→ 上下文占用归零（不再显示估算值）
     state.newSession();
-    try std.testing.expect(state.last_usage.input_tokens > 0);
-    try std.testing.expectEqual(state.last_usage.input_tokens, state.context_usage.input_tokens);
-    try std.testing.expect(state.usage_estimated);
+    try std.testing.expectEqual(@as(u64, 0), state.last_usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 0), state.context_usage.input_tokens);
+    try std.testing.expect(state.usage_estimated); // 尚无"本轮"真实数据（CLI 契约）
     try std.testing.expectEqual(@as(u64, 0), state.last_usage.cached_tokens);
 
-    // 真实 usage 到来后不再是估算
+    // 真实 usage 到来（模拟 usage_update 事件路径）
     state.last_usage = .{ .input_tokens = 500, .cached_tokens = 400, .output_tokens = 20 };
+    state.context_usage = state.last_usage;
     state.usage_estimated = false;
     try std.testing.expect(!state.usage_estimated);
 
-    // 重新加载会话 → 回到估算值（切换/重载场景）
+    // 重新加载空会话 → 归零（无 usage 行可播种）
     const sid = state.session_id;
     state.loadSessionContent(sid);
-    try std.testing.expect(state.usage_estimated);
-    try std.testing.expect(state.last_usage.input_tokens > 0);
+    try std.testing.expectEqual(@as(u64, 0), state.last_usage.input_tokens);
 }
 
 test "会话路由标识：按会话 id 确定性派生" {
@@ -15097,15 +15170,15 @@ test "状态栏：缓存命中率百分比与着色" {
     try std.testing.expect(std.mem.endsWith(u8, text3, " 20.0k/104.9k 19%"));
     try std.testing.expect(buf3.get(@intCast(std.mem.indexOf(u8, text3, "19%").?), 0).?.fg.eql(tui.style.Color.red));
 
-    // 估算态（重启/新建会话，无真实 usage）：显示占位而非整块消失
-    state.context_usage = .{ .input_tokens = 104_900 };
+    // 无数据（新会话/未发过消息，input=0）：显示"缓存 0%"而非整块消失
+    state.context_usage = .{};
     state.usage_estimated = true;
     var buf4 = try tui.render.Buffer.init(std.testing.allocator, 200, 1);
     defer buf4.deinit();
     drawInputStatus(&state, .{ .x = 0, .y = 0, .width = 200, .height = 1 }, &buf4);
     // 直接读原始 cell（绕过 renderRowText 的 ASCII 置换）验证占位文本。
     // 整行远超 tail_buf，故从右往左收集再反转，只保留尾部。
-    const expected_tail = " · 缓存 — 暂无数据 ";
+    const expected_tail = " · 缓存 0% ";
     var tail_buf: [256]u8 = undefined;
     var tail_len: usize = 0;
     var col: usize = 200;
@@ -15129,7 +15202,7 @@ test "状态栏：缓存命中率百分比与着色" {
     const raw4 = tail_buf[0..tail_len];
     try std.testing.expect(std.mem.endsWith(u8, raw4, std.mem.trimEnd(u8, expected_tail, " ")));
 
-    // 有真实 usage 但缓存为 0（全 miss）：不显示占位，正常走命中率分支
+    // 有服务端数据但缓存为 0（全 miss）：正常走命中率分支（0%）
     state.context_usage = .{ .input_tokens = 104_900, .cached_tokens = 0 };
     state.usage_estimated = false;
     var buf5 = try tui.render.Buffer.init(std.testing.allocator, 160, 1);
@@ -15138,6 +15211,7 @@ test "状态栏：缓存命中率百分比与着色" {
     renderRowText(&buf5, &line);
     const text5 = std.mem.trimEnd(u8, &line, " ");
     try std.testing.expect(std.mem.indexOf(u8, text5, "缓存 —") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text5, "0%") != null);
 }
 
 test "进行中指示：spinner 帧按时间推导" {
@@ -16854,4 +16928,160 @@ test "cwd 对话框：预填 work_dir 本体（浮动为空 / 已设置为路径
     defer std.testing.allocator.free(state.work_dir);
     state.startCwdEdit(null);
     try std.testing.expectEqualStrings("C:\\my\\proj", state.dialog_input.value());
+}
+
+test "usage 播种：加载后用最后一条真实 usage 替代纯估算（含增量/边界）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    const db_path = "skynet_test_seedusage.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, db_path ++ "-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, db_path ++ "-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, db_path ++ "-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, db_path ++ "-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.input.allocator = alloc;
+    state.dialog_input.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer {
+        if (state.db) |*d| d.deinit();
+        state.clearPendingSends();
+        state.pending_sends.deinit(alloc);
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.input.deinit();
+        state.dialog_input.deinit();
+        if (state.work_dir.len > 0) alloc.free(state.work_dir);
+        if (state.default_cwd.len > 0) alloc.free(state.default_cwd);
+    }
+    const sid = try state.db.?.createSession("seed-test");
+    state.session_id = sid;
+    state.default_cwd = blk: {
+        const z = try std.process.currentPathAlloc(io, alloc);
+        defer alloc.free(z);
+        break :blk try alloc.dupe(u8, z);
+    };
+
+    // 构造：user + assistant（带真实 usage）+ user（锚点后的增量）
+    _ = try state.db.?.insertMessage(.{ .session_id = sid, .role = "user", .content = "第一问" });
+    _ = try state.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "assistant",
+        .content = "第一答",
+        .input_tokens = 100_000,
+        .cached_tokens = 99_000,
+        .output_tokens = 500,
+    });
+    _ = try state.db.?.insertMessage(.{ .session_id = sid, .role = "user", .content = "x" ** 400 }); // 400B ≈ 100 tokens
+
+    // 加载（走完整加载路径 → seedUsageFromDb 应用真实值）
+    state.loadSessionContent(sid);
+
+    // 播种生效：显示 = 服务端真实值原样（无估算）；锚点 = input + output（供压缩决策）
+    try std.testing.expectEqual(@as(u64, 100_000), state.context_usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 99_000), state.context_usage.cached_tokens);
+    try std.testing.expectEqual(@as(u64, 500), state.context_usage.output_tokens);
+    try std.testing.expectEqual(@as(usize, 3), state.usage_anchor_len.?); // 锚点行 idx=1 + 1
+    try std.testing.expectEqual(@as(u64, 100_500), state.usage_anchor_tokens);
+    // 尚未有"本轮"真实数据（CLI 契约）：估算标志保持 true
+    try std.testing.expect(state.usage_estimated);
+
+    // 边界 1：锚点行不在 history（模拟被压缩掉）→ 无锚点（压缩决策回退纯估算）；
+    // 但显示仍用真实值（显示与锚点解耦）
+    for (state.history.items) |m| freeMessage(alloc, m);
+    state.history.clearRetainingCapacity();
+    state.appendHistory("system", "sys"); // 无 db_id 的裸历史
+    state.seedUsageFromDb();
+    try std.testing.expect(state.usage_anchor_len == null);
+    try std.testing.expectEqual(@as(u64, 100_000), state.context_usage.input_tokens); // 显示不受影响
+
+    // 边界 2：会话无任何 usage 行 → 归零
+    const sid2 = try state.db.?.createSession("no-usage");
+    state.session_id = sid2;
+    _ = try state.db.?.insertMessage(.{ .session_id = sid2, .role = "user", .content = "hi" });
+    state.loadSessionContent(sid2);
+    try std.testing.expect(state.usage_anchor_len == null);
+    try std.testing.expectEqual(@as(u64, 0), state.context_usage.input_tokens);
+}
+
+test "启动兜底：ensureUsageDisplayed 不覆盖播种值（回归）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const alloc = std.testing.allocator;
+
+    const db_path = "skynet_test_seedstartup.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, db_path ++ "-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, db_path ++ "-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, db_path ++ "-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, db_path ++ "-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.input.allocator = alloc;
+    state.dialog_input.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer {
+        if (state.db) |*d| d.deinit();
+        state.clearPendingSends();
+        state.pending_sends.deinit(alloc);
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.input.deinit();
+        state.dialog_input.deinit();
+        if (state.work_dir.len > 0) alloc.free(state.work_dir);
+        if (state.default_cwd.len > 0) alloc.free(state.default_cwd);
+    }
+    const sid = try state.db.?.createSession("startup-seed");
+    state.default_cwd = blk: {
+        const z = try std.process.currentPathAlloc(io, alloc);
+        defer alloc.free(z);
+        break :blk try alloc.dupe(u8, z);
+    };
+    _ = try state.db.?.insertMessage(.{ .session_id = sid, .role = "user", .content = "问" });
+    _ = try state.db.?.insertMessage(.{
+        .session_id = sid,
+        .role = "assistant",
+        .content = "答",
+        .input_tokens = 100_000,
+        .cached_tokens = 99_000,
+        .output_tokens = 500,
+    });
+
+    // 模拟启动序列：loadSessionContent（含播种）→ ensureUsageDisplayed（无操作）
+    state.loadSessionContent(sid);
+    const seeded_cached = state.context_usage.cached_tokens;
+    const seeded_in = state.context_usage.input_tokens;
+    try std.testing.expectEqual(@as(u64, 99_000), seeded_cached);
+    try std.testing.expectEqual(@as(u64, 100_000), seeded_in);
+
+    state.ensureUsageDisplayed(); // 不覆盖（新设计下无操作）
+    try std.testing.expectEqual(seeded_cached, state.context_usage.cached_tokens);
+    try std.testing.expectEqual(seeded_in, state.context_usage.input_tokens);
+
+    // 切到无数据会话：归零（不残留上一会话的值）
+    const sid2 = try state.db.?.createSession("empty");
+    state.loadSessionContent(sid2);
+    try std.testing.expectEqual(@as(u64, 0), state.context_usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 0), state.context_usage.cached_tokens);
 }

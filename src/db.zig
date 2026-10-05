@@ -615,6 +615,28 @@ pub const Db = struct {
         return rows[0];
     }
 
+    /// 最后一条带真实 usage 的 assistant 行（上下文占用播种用；
+    /// 走 db_query 临时 arena，加载时调用一次，结果由调用方在 history 里按 db_id 定位）。
+    /// 返回 null = 该会话从未有过真实 usage（新建/全部被压缩出历史）。
+    pub fn lastUsageRow(self: *Db, allocator: Allocator, session_id: i64) !?struct { db_id: i64, input_tokens: i64, cached_tokens: i64, output_tokens: i64 } {
+        const Row = struct { id: i64 = 0, input_tokens: i64 = 0, cached_tokens: i64 = 0, output_tokens: i64 = 0 };
+        const rows = try db_query.queryAll1(
+            &self.sess,
+            allocator,
+            Row,
+            "SELECT id, input_tokens, cached_tokens, output_tokens FROM \"message\" " ++
+                "WHERE session_id = ? AND role = 'assistant' AND input_tokens > 0 ORDER BY id DESC LIMIT 1",
+            session_id,
+        );
+        if (rows.len == 0) return null;
+        return .{
+            .db_id = rows[0].id,
+            .input_tokens = rows[0].input_tokens,
+            .cached_tokens = rows[0].cached_tokens,
+            .output_tokens = rows[0].output_tokens,
+        };
+    }
+
     /// SQLite data_version：其他连接提交后会变化（用于发现外部写入）
     pub fn dataVersion(self: *Db) !i64 {
         // 走 db_query 路径（临时 arena）：本函数被主循环每 500ms 轮询一次，
