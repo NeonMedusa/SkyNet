@@ -450,6 +450,24 @@ pub fn sanitizeUtf8(allocator: Allocator, data: []const u8) error{OutOfMemory}![
     return out.toOwnedSlice(allocator);
 }
 
+/// Socket 句柄 → usize（Windows = 指针，POSIX = 整数；供跨线程原子槽存储）
+pub fn handleToUsize(h: std.Io.net.Socket.Handle) usize {
+    return switch (@typeInfo(std.Io.net.Socket.Handle)) {
+        .pointer => @intFromPtr(h),
+        .int => @intCast(h),
+        else => 0,
+    };
+}
+
+/// usize → Socket 句柄（失败返回 null）
+pub fn handleFromUsize(v: usize) ?std.Io.net.Socket.Handle {
+    return switch (@typeInfo(std.Io.net.Socket.Handle)) {
+        .pointer => @ptrFromInt(v),
+        .int => @intCast(v),
+        else => null,
+    };
+}
+
 pub const AI = struct {
     config: OpenAIConfig,
     allocator: Allocator,
@@ -460,6 +478,21 @@ pub const AI = struct {
     error_body: ?[]u8 = null,
     /// 最近一次请求的 token 用量（含缓存命中）
     usage: Usage = .{},
+
+    /// ── 空闲看门狗（长读超时兜底）──
+    /// TCP 半开连接（服务端不发也不关）会让阻塞读永久挂住；此处暴露 socket
+    /// 句柄与最后收到数据的时间戳，供宿主侧超时后用 netShutdown(.both) 唤醒
+    /// 阻塞的读（唤醒后走截断检测 → 重试）。槽位由宿主注入（null = 不启用）。
+    /// 约定：handle 为 0 = 无进行中请求；last_data_ms 为 0 = 尚未记录。
+    /// 发布/清除在 mutex 内进行，与宿主的“取句柄+shutdown”互斥；且清除先于
+    /// 连接关闭（defer 顺序保证），宿主不会对已被系统复用的句柄号开枪。
+    watch_slot: ?struct {
+        handle: *std.atomic.Value(usize),
+        last_data_ms: *std.atomic.Value(i64),
+        /// 宿主已对该连接发起过 shutdown 唤醒（用于区分截断与普通网络错误）
+        woken: *std.atomic.Value(bool),
+        mutex: *Io.Mutex,
+    } = null,
 
     /// ── HTTP 客户端（长生命周期，跨请求复用）──
     /// std.http.Client 自带 LRU 连接池（同 host:port 复用，默认 32 条）与懒加载
@@ -476,6 +509,46 @@ pub const AI = struct {
             .allocator = allocator,
             .io = io,
         };
+    }
+
+    /// 看门狗：记录当前连接句柄（同时以当前时间初始化打点：首字节前的等待
+    /// 同样计入空闲——服务端接受了请求但永不响应也能被唤醒）
+    fn watchSetHandle(self: *AI, handle: usize) void {
+        const slot = self.watch_slot orelse return;
+        slot.mutex.lockUncancelable(self.io);
+        defer slot.mutex.unlock(self.io);
+        // 先写时间戳再写 handle（读者看到非 0 handle 时时间戳已就绪）
+        slot.last_data_ms.store(std.Io.Timestamp.now(self.io, .awake).toMilliseconds(), .release);
+        // 新连接：清掉上一轮的唤醒标记
+        slot.woken.store(false, .release);
+        slot.handle.store(handle, .release);
+    }
+
+    /// 看门狗：收到数据时打点（仅原子写；handle 非 0 才打）
+    fn watchMarkData(self: *AI) void {
+        const slot = self.watch_slot orelse return;
+        if (slot.handle.load(.acquire) == 0) return;
+        slot.last_data_ms.store(std.Io.Timestamp.now(self.io, .awake).toMilliseconds(), .release);
+    }
+
+    /// 看门狗：清除（请求结束；先于连接关闭，见 watch_slot 注释）
+    fn watchClear(self: *AI) void {
+        const slot = self.watch_slot orelse return;
+        slot.mutex.lockUncancelable(self.io);
+        defer slot.mutex.unlock(self.io);
+        slot.handle.store(0, .release);
+    }
+
+    /// 看门狗：本次连接是否被宿主唤醒过（读失败时区分截断与普通网络错误）
+    fn watchWasWoken(self: *AI) bool {
+        const slot = self.watch_slot orelse return false;
+        return slot.woken.load(.acquire);
+    }
+
+    /// 看门狗：发布/刷新当前请求的连接句柄（重定向换连接后需刷新）
+    fn watchPublishConnection(self: *AI, connection: ?*http.Client.Connection) void {
+        const conn = connection orelse return;
+        self.watchSetHandle(handleToUsize(conn.stream_reader.stream.socket.handle));
     }
 
     /// 销毁懒初始化的 HTTP 客户端与代理 arena（AI 不再使用时调用）
@@ -661,10 +734,25 @@ pub const AI = struct {
         }) catch return error.NetworkError;
         defer request.deinit();
 
-        request.sendBodyComplete(body_json) catch return error.NetworkError;
+        // 看门狗：连接一建立就暴露句柄——覆盖“等响应头”与“读正文”两个阻塞点
+        // （TCP 半开时两者都会永久挂起；defer 顺序保证 watchClear 先于连接关闭）
+        self.watchPublishConnection(request.connection);
+        defer self.watchClear();
+
+        request.sendBodyComplete(body_json) catch {
+            if (cancel.load(.acquire)) return error.Canceled;
+            if (self.watchWasWoken()) return error.StreamTruncated;
+            return error.NetworkError;
+        };
 
         var redirect_buf: [4096]u8 = undefined;
-        var response = request.receiveHead(&redirect_buf) catch return error.NetworkError;
+        var response = request.receiveHead(&redirect_buf) catch {
+            if (cancel.load(.acquire)) return error.Canceled;
+            if (self.watchWasWoken()) return error.StreamTruncated;
+            return error.NetworkError;
+        };
+        // 重定向可能换了连接：刷新句柄
+        self.watchPublishConnection(request.connection);
 
         const status = response.head.status;
         if (status.class() != .success) {
@@ -707,8 +795,15 @@ pub const AI = struct {
         var read_buf: [4096]u8 = undefined;
         while (!parser.finished) {
             if (cancel.load(.acquire)) return error.Canceled;
-            const n = reader.readSliceShort(&read_buf) catch return error.NetworkError;
+            const n = reader.readSliceShort(&read_buf) catch {
+                // 唤醒来源区分：用户取消优先；宿主看门狗唤醒 → 按截断（可重试）；
+                // 否则普通网络错误
+                if (cancel.load(.acquire)) return error.Canceled;
+                if (self.watchWasWoken()) return error.StreamTruncated;
+                return error.NetworkError;
+            };
             if (n == 0) break;
+            self.watchMarkData();
             try parser.feed(read_buf[0..n], ctx, on_delta);
         }
         // 对端关闭连接（EOF）且流未经 [DONE]/finish_reason 正常终止 → 判定为截断。
@@ -779,11 +874,18 @@ pub const AI = struct {
         }) catch return error.NetworkError;
         defer request.deinit();
 
+        // 看门狗：连接建立即暴露句柄（覆盖“等响应头/读正文”两个阻塞点；
+        // 半开时宿主可唤醒阻塞读 → 请求以网络错误收尾，不永久挂起）
+        self.watchPublishConnection(request.connection);
+        defer self.watchClear();
+
         // GET 请求使用 sendBodiless
         request.sendBodiless() catch return error.NetworkError;
 
         var redirect_buf: [4096]u8 = undefined;
         var response = request.receiveHead(&redirect_buf) catch return error.NetworkError;
+        // 重定向可能换了连接：刷新句柄
+        self.watchPublishConnection(request.connection);
 
         const status = response.head.status;
         if (status == .unauthorized) return error.InvalidApiKey;

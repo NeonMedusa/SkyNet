@@ -490,9 +490,17 @@ fn inputBoxTitle(state: *AppState, buf: []u8) []const u8 {
 
 // ── 断连自动重试（对齐 pi / opencode 的做法：整请求重发，非续传）──
 /// 最大重试次数（初次尝试之外）；只重试网络错误与流截断，取消/确定性错误不重试
-const stream_retry_max: u32 = 2;
+const stream_retry_max: u32 = 3;
 /// 基础退避毫秒数（指数增长 + 抖动；测试可调小以加速）
 var stream_retry_base_delay_ms: u64 = 2000;
+
+/// ── 空闲看门狗（长读超时兜底）──
+/// TCP 半开连接（服务端不发也不关）会让阻塞读永久挂住；超过此秒数没收到
+/// 任何字节就 netShutdown(.both) 唤醒阻塞读（→ 截断检测 → 重试/收尾）。
+/// 覆盖全部长阻塞网络路径：流式主请求、手动 /compact（异步）、工具轮中途
+/// 压缩（主循环泵）、同步压缩（专用看门狗线程）与模型列表拉取（专用槽位+线程）。
+/// 正常思考期静默远短于此（实测最长 153s 的是异常流）；0 = 关闭看门狗。
+var stream_idle_timeout_ms: i64 = 180_000;
 
 // ── 旧工具输出折叠（控制上下文占用）──
 // 折叠/压缩的纯计算在 context.zig（保护窗口、批量阈值、区间选择等）
@@ -640,6 +648,22 @@ const AppState = struct {
     stream_thread: ?std.Thread = null,
     stream_job: ?*StreamJob = null,
     stream_mutex: Io.Mutex = .init,
+    /// 看门狗槽位（交给 worker 的 AI 实例；见 ai.AI.watch_slot）
+    stream_watch_handle: std.atomic.Value(usize) = .init(0),
+    stream_watch_last_data_ms: std.atomic.Value(i64) = .init(0),
+    /// 发布/清除句柄与唤醒互斥（防句柄复用误伤；见 ai.AI.watch_slot）
+    stream_watch_mutex: Io.Mutex = .init,
+    /// 宿主已对当前连接发起过 shutdown 唤醒（区分截断/取消/网络错误）
+    stream_watch_woken: std.atomic.Value(bool) = .init(false),
+    /// 看门狗成功唤醒次数（测试断言用）
+    stream_watch_wakes: std.atomic.Value(usize) = .init(0),
+    /// 模型列表拉取专用看门狗槽位（菜单可在生成/压缩中打开，与流式请求
+    /// 可能并存——共用槽会互相覆盖句柄，故独立一套）
+    models_watch_handle: std.atomic.Value(usize) = .init(0),
+    models_watch_last_data_ms: std.atomic.Value(i64) = .init(0),
+    models_watch_mutex: Io.Mutex = .init,
+    models_watch_woken: std.atomic.Value(bool) = .init(false),
+    models_watch_wakes: std.atomic.Value(usize) = .init(0),
     stream_buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
     stream_consume_pos: usize = 0,
     stream_reasoning_buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
@@ -712,6 +736,9 @@ const AppState = struct {
     compact_live_failed: bool = false,
     /// true = 本轮被取消（Ctrl+Q）导致压缩中断：不展示失败提示，直接移除气泡
     compact_live_aborted: bool = false,
+    /// 压缩重试代号 / 主线程已确认代号（重试前丢弃失败尝试的显示；见 pumpCompaction）
+    compact_retry_gen: std.atomic.Value(usize) = .init(0),
+    compact_retry_ack: std.atomic.Value(usize) = .init(0),
     /// 压缩提示标题消息下标 / 正在流式的摘要正文消息下标
     compact_head_idx: ?usize = null,
     compact_msg_idx: ?usize = null,
@@ -1377,6 +1404,14 @@ const AppState = struct {
             .keep_tokens = if (keep_tokens_override > 0) keep_tokens_override else self.keep_recent_tokens,
         };
         self.compact_cancel.store(false, .release);
+        // 同步压缩阻塞主线程：主循环无法泵看门狗 → 临时起专用看门狗线程
+        // （半开连接时超时唤醒；请求结束/异常均经 defer 停止并 join）
+        var wd_stop = std.atomic.Value(bool).init(false);
+        const wd_thread = std.Thread.spawn(.{}, syncWatchdogLoop, .{ self, &wd_stop, WatchSlotKind.stream }) catch null;
+        defer {
+            wd_stop.store(true, .release);
+            if (wd_thread) |t| t.join();
+        }
         compactionExecute(&plan);
 
         outcome.compacted = plan.compacted;
@@ -2950,6 +2985,18 @@ const AppState = struct {
         if (async_status == 0 and
             !self.compact_live_running.load(.acquire) and
             !self.compact_live_pending.load(.acquire)) return;
+        // 压缩重试握手：丢弃失败尝试的气泡与缓冲，并回 ack（worker 等它后再重发）
+        const retry_gen = self.compact_retry_gen.load(.acquire);
+        if (retry_gen != self.compact_retry_ack.load(.acquire)) {
+            self.removeCompactDisplay();
+            self.compact_mutex.lockUncancelable(self.io);
+            self.compact_buf.clearRetainingCapacity();
+            self.compact_consume_pos = 0;
+            self.compact_reasoning_buf.clearRetainingCapacity();
+            self.compact_consume_reasoning_pos = 0;
+            self.compact_mutex.unlock(self.io);
+            self.compact_retry_ack.store(retry_gen, .release);
+        }
         var delta: ?[]u8 = null;
         var reasoning: ?[]u8 = null;
         self.compact_mutex.lockUncancelable(self.io);
@@ -3142,6 +3189,9 @@ const AppState = struct {
         self.compact_plan = null;
         defer plan.deinit();
 
+        // 先补齐缓冲里尚未消费的增量（与中途压缩收尾对齐；避免末段被截）
+        self.drainCompactBuffersInline();
+
         if (plan.err) |e| {
             if (std.mem.eql(u8, e, "已取消")) {
                 if (self.compact_head_idx) |idx| {
@@ -3152,6 +3202,10 @@ const AppState = struct {
                 const text = std.fmt.bufPrint(&buf, "▣ 压缩失败: {s}", .{e}) catch "▣ 压缩失败";
                 if (self.compact_head_idx) |idx| {
                     self.replaceDisplayMessage(idx, text, .{ .fg = .red });
+                } else {
+                    // 失败发生在任何输出之前（无气泡）：单独一行提示
+                    // （对齐中途压缩路径；此前该情况会静默无提示）
+                    self.addMessage(text, .{ .fg = .red });
                 }
                 const detail = plan.err_detail_buf[0..plan.err_detail_len];
                 if (detail.len > 0) {
@@ -3684,9 +3738,84 @@ const AppState = struct {
     fn cancelStream(self: *AppState) void {
         if (self.isCompacting()) {
             self.compact_cancel.store(true, .release);
+            // 半开连接时阻塞读不会返回，主动唤醒（否则取消要等看门狗超时）
+            self.wakeBlockedRead();
             return;
         }
-        if (self.isStreaming()) self.stream_cancel.store(true, .release);
+        if (self.isStreaming()) {
+            self.stream_cancel.store(true, .release);
+            // 半开连接时阻塞读不会返回，主动 shutdown 唤醒（否则取消要等到超时）
+            self.wakeBlockedRead();
+        }
+    }
+
+    /// 用 netShutdown(.both) 唤醒阻塞的流式读（半开连接场景）。
+    /// 被唤醒的读会返回 0/错误 → 走现有截断检测/取消路径。
+    /// 用 .both 而非 .recv：Windows 上 AFD 的 receive-only 断开不会完成挂起的读
+    /// （实测 .recv 永久挂起、.both 毫秒级唤醒）。
+    /// 锁内取句柄+shutdown：与 worker 的发布/清除互斥，杜绝句柄被系统复用后误伤。
+    fn wakeBlockedRead(self: *AppState) void {
+        self.wakeSlot(&self.stream_watch_handle, &self.stream_watch_woken, &self.stream_watch_mutex, &self.stream_watch_wakes);
+    }
+
+    /// 通用槽位唤醒（锁内取句柄 + shutdown；woken 先行置位供错误归类）
+    fn wakeSlot(
+        self: *AppState,
+        handle: *std.atomic.Value(usize),
+        woken: *std.atomic.Value(bool),
+        mutex: *Io.Mutex,
+        wakes: *std.atomic.Value(usize),
+    ) void {
+        mutex.lockUncancelable(self.io);
+        defer mutex.unlock(self.io);
+        const h = handle.load(.acquire);
+        if (h == 0) return;
+        const sock = ai.handleFromUsize(h) orelse return;
+        // 先置唤醒标记再 shutdown：worker 读返回后据此归类（截断/取消而非网络错误）
+        woken.store(true, .release);
+        self.io.vtable.netShutdown(self.io.userdata, sock, .both) catch return;
+        _ = wakes.fetchAdd(1, .release);
+    }
+
+    /// 通用空闲看门狗检查：槽位有活跃请求且超阈值无字节到达 → 唤醒阻塞读。
+    /// 无场景守卫（槽位为空时自身早退）；供主循环与专用看门狗线程共用。
+    /// 阈值 = stream_idle_timeout_ms（0 = 关闭；测试可注入小值）。
+    fn watchdogCheckSlot(
+        self: *AppState,
+        handle: *std.atomic.Value(usize),
+        last_data: *std.atomic.Value(i64),
+        woken: *std.atomic.Value(bool),
+        mutex: *Io.Mutex,
+        wakes: *std.atomic.Value(usize),
+    ) void {
+        if (stream_idle_timeout_ms <= 0) return;
+        const h = handle.load(.acquire);
+        if (h == 0) return;
+        const last = last_data.load(.acquire);
+        if (last == 0) return;
+        const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        if (now - last < stream_idle_timeout_ms) return;
+        Log.warn(.api, "空闲超时（{d}s 无数据），唤醒阻塞读", .{@divTrunc(now - last, 1000)});
+        self.wakeSlot(handle, woken, mutex, wakes);
+        // 重置打点：唤醒后若读仍未返回（极端情况），下个周期再试，避免风暴
+        last_data.store(now, .release);
+    }
+
+    /// 流式/压缩槽位检查（主循环与压缩同步线程用）
+    fn watchdogCheck(self: *AppState) void {
+        self.watchdogCheckSlot(&self.stream_watch_handle, &self.stream_watch_last_data_ms, &self.stream_watch_woken, &self.stream_watch_mutex, &self.stream_watch_wakes);
+    }
+
+    /// 模型列表槽位检查（专用线程用）
+    fn watchdogCheckModels(self: *AppState) void {
+        self.watchdogCheckSlot(&self.models_watch_handle, &self.models_watch_last_data_ms, &self.models_watch_woken, &self.models_watch_mutex, &self.models_watch_wakes);
+    }
+
+    /// 主循环每帧调用：流式 / 手动压缩（异步）/ 工具轮中途压缩进行中才检查。
+    /// （同步压缩阻塞主线程、主循环停摆，由 runCompaction 的专用看门狗线程覆盖）
+    fn streamWatchdog(self: *AppState) void {
+        if (!self.isStreaming() and !self.isCompacting() and !self.compact_live_running.load(.acquire)) return;
+        self.watchdogCheck();
     }
 
     /// API Key：配置文件优先，为空时按 provider 指定的环境变量回退（Pi 风格）
@@ -3707,8 +3836,14 @@ const AppState = struct {
         errdefer job.arena.deinit();
         job.io = self.io;
         const arena = job.arena.allocator();
-        // 工具 cwd = 会话工作目录（空/失效时回退启动目录，见 effectiveWorkDir）
-        job.cwd = try arena.dupe(u8, self.effectiveWorkDir());
+        // 工具 cwd = 会话工作目录（空/失效时回退启动目录，见 effectiveWorkDir）。
+        // 两者都空时（如测试里未设 default_cwd 的裸 AppState）回退进程当前目录，
+        // 否则 job.cwd 为空串会让工具在相对路径上断言崩溃（openDirAbsolute）。
+        const eff_cwd = self.effectiveWorkDir();
+        job.cwd = if (eff_cwd.len > 0)
+            try arena.dupe(u8, eff_cwd)
+        else
+            std.process.currentPathAlloc(self.io, arena) catch try arena.dupe(u8, ".");
         job.default_cwd = try arena.dupe(u8, self.default_cwd);
         job.model = try arena.dupe(u8, model);
         job.endpoint = try arena.dupe(u8, provider.endpoint);
@@ -4638,9 +4773,25 @@ const AppState = struct {
             .behavior = config_mod.behavior(&p),
         });
         client.environ_map = self.environ_map;
+        // 看门狗槽位：模型列表专用（菜单可在生成/压缩中打开，与流式请求可能并存；
+        // 共用槽会互相覆盖句柄，故独立一套）
+        client.watch_slot = .{
+            .handle = &self.models_watch_handle,
+            .last_data_ms = &self.models_watch_last_data_ms,
+            .woken = &self.models_watch_woken,
+            .mutex = &self.models_watch_mutex,
+        };
         defer client.deinitClient();
 
         self.freeModelSelectModels();
+
+        // 同步请求阻塞主线程：起专用看门狗线程（半开时超时唤醒；结束即 join）
+        var wd_stop = std.atomic.Value(bool).init(false);
+        const wd_thread = std.Thread.spawn(.{}, syncWatchdogLoop, .{ self, &wd_stop, WatchSlotKind.models }) catch null;
+        defer {
+            wd_stop.store(true, .release);
+            if (wd_thread) |t| t.join();
+        }
 
         const all_models = client.listModels() catch |err| {
             var err_buf: [256]u8 = undefined;
@@ -5841,6 +5992,13 @@ fn compactionExecute(plan: *CompactionPlan) void {
         .behavior = beh,
     });
     client.environ_map = plan.environ_map;
+    // 看门狗槽位：手动压缩（异步 worker）与同步压缩共用（与流式请求时间上互斥）
+    client.watch_slot = .{
+        .handle = &app.stream_watch_handle,
+        .last_data_ms = &app.stream_watch_last_data_ms,
+        .woken = &app.stream_watch_woken,
+        .mutex = &app.stream_watch_mutex,
+    };
     defer client.deinitClient();
 
     const msgs = [_]ai.Message{
@@ -5853,16 +6011,46 @@ fn compactionExecute(plan: *CompactionPlan) void {
         .stream_app = if (plan.async) app else null,
     };
     defer collector.deinit();
-    client.streamMessage(&msgs, &.{}, &app.compact_cancel, &collector, SummaryCollector.cb, null) catch |e| {
-        plan.err = if (e == error.Canceled) "已取消" else @errorName(e);
-        if (client.takeErrorBody()) |body| {
-            defer app.allocator.free(body);
-            const n = @min(body.len, plan.err_detail_buf.len);
-            @memcpy(plan.err_detail_buf[0..n], body[0..n]);
-            plan.err_detail_len = n;
-        }
-        return;
-    };
+    // 断连自动重试（与主流请求同一策略：网络错误/流截断/服务端瞬时故障，
+    // 上限 stream_retry_max 次；重试丢弃失败尝试的摘要产出与流式气泡）
+    var attempt: u32 = 0;
+    while (true) {
+        client.streamMessage(&msgs, &.{}, &app.compact_cancel, &collector, SummaryCollector.cb, null) catch |e| {
+            if (!streamErrorRetryable(e) or attempt >= stream_retry_max or app.compact_cancel.load(.acquire)) {
+                plan.err = if (e == error.Canceled) "已取消" else @errorName(e);
+                if (client.takeErrorBody()) |body| {
+                    defer app.allocator.free(body);
+                    const n = @min(body.len, plan.err_detail_buf.len);
+                    @memcpy(plan.err_detail_buf[0..n], body[0..n]);
+                    plan.err_detail_len = n;
+                }
+                return;
+            }
+            // 重试：丢弃本次尝试的产出（错误体仅终态展示需要，提前释放避免泄漏）
+            if (client.takeErrorBody()) |body| app.allocator.free(body);
+            collector.list.clearRetainingCapacity();
+            collector.reasoning.clearRetainingCapacity();
+            collector.reasoning_start_ms = 0;
+            collector.reasoning_end_ms = 0;
+            // 异步路径：请求主线程丢弃气泡与缓冲（握手）后再重发
+            if (plan.async and !compactRetryHandshake(app, &app.compact_cancel)) {
+                plan.err = "已取消";
+                return;
+            }
+            attempt += 1;
+            var retry_seed: [8]u8 = undefined;
+            std.Io.random(plan.io, &retry_seed);
+            const jitter = @as(f32, @floatFromInt(std.mem.readInt(u64, &retry_seed, .little) % 1000)) / 1000.0;
+            const delay_ms = streamRetryDelayMs(attempt, jitter);
+            Log.warn(.retry, "压缩重试 {d}/{d}: {s}，等待 {d}ms", .{ attempt, stream_retry_max, @errorName(e), delay_ms });
+            if (!cancelableSleep(app, delay_ms, &app.compact_cancel)) {
+                plan.err = "已取消";
+                return;
+            }
+            continue;
+        };
+        break;
+    }
     if (collector.list.items.len == 0) {
         plan.err = "摘要为空";
         return;
@@ -5996,6 +6184,13 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
         .behavior = beh,
     });
     client.environ_map = job.environ_map;
+    // 看门狗槽位：中途压缩在流 worker 内执行（主循环泵看门狗即可覆盖）
+    client.watch_slot = .{
+        .handle = &job.app.stream_watch_handle,
+        .last_data_ms = &job.app.stream_watch_last_data_ms,
+        .woken = &job.app.stream_watch_woken,
+        .mutex = &job.app.stream_watch_mutex,
+    };
     defer client.deinitClient();
 
     const msgs = [_]ai.Message{
@@ -6022,11 +6217,33 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
         job.app.compact_mutex.unlock(job.app.io);
         job.app.compact_live_pending.store(true, .release);
     };
-    client.streamMessage(&msgs, &.{}, cancel, &collector, SummaryCollector.cb, null) catch {
-        // 失败时释放捕获的服务端错误体（该路径不展示详情，仅避免泄漏）
-        if (client.takeErrorBody()) |body| job.app.allocator.free(body);
-        return false;
-    };
+    // 断连自动重试（与主流请求同一策略；重试丢弃失败尝试的摘要与气泡）
+    var attempt: u32 = 0;
+    while (true) {
+        client.streamMessage(&msgs, &.{}, cancel, &collector, SummaryCollector.cb, null) catch |e| {
+            if (!streamErrorRetryable(e) or attempt >= stream_retry_max or cancel.load(.acquire)) {
+                // 失败时释放捕获的服务端错误体（该路径不展示详情，仅避免泄漏）
+                if (client.takeErrorBody()) |body| job.app.allocator.free(body);
+                return false;
+            }
+            if (client.takeErrorBody()) |body| job.app.allocator.free(body);
+            collector.list.clearRetainingCapacity();
+            collector.reasoning.clearRetainingCapacity();
+            collector.reasoning_start_ms = 0;
+            collector.reasoning_end_ms = 0;
+            // 请求主线程丢弃气泡与缓冲（握手）后再重发
+            if (!compactRetryHandshake(job.app, cancel)) return false;
+            attempt += 1;
+            var retry_seed: [8]u8 = undefined;
+            std.Io.random(job.io, &retry_seed);
+            const jitter = @as(f32, @floatFromInt(std.mem.readInt(u64, &retry_seed, .little) % 1000)) / 1000.0;
+            const delay_ms = streamRetryDelayMs(attempt, jitter);
+            Log.warn(.retry, "中途压缩重试 {d}/{d}: {s}，等待 {d}ms", .{ attempt, stream_retry_max, @errorName(e), delay_ms });
+            if (!cancelableSleep(job.app, delay_ms, cancel)) return false;
+            continue;
+        };
+        break;
+    }
     if (collector.list.items.len == 0) return false;
 
     // 保留区首条已落库消息的行 id（实时落库后当前回合消息也有 id）
@@ -6602,6 +6819,10 @@ fn cmdAsk(init: std.process.Init, opt: CliOptions) u8 {
     state.askAI(opt.message);
     while (state.streamStatus() != .idle) {
         state.pumpStream();
+        // 空闲看门狗：半开连接（服务端不发也不关）时唤醒阻塞读
+        state.streamWatchdog();
+        // 异步/中途压缩的流式显示与重试握手（中途压缩重试需主线程清屏回 ack）
+        state.pumpCompaction();
         progress.tick(&state);
         Io.sleep(io, Io.Duration.fromMilliseconds(10), .awake) catch {};
     }
@@ -7295,6 +7516,8 @@ pub fn main(init: std.process.Init) !u8 {
     while (state.running) {
         // 流式回复：取出增量、检测结束
         if (state.streamStatus() != .idle) state.pumpStream();
+        // 空闲看门狗：半开连接（服务端不发也不关）时唤醒阻塞读
+        state.streamWatchdog();
         // 异步压缩：消费摘要增量 / 完成收尾
         state.pumpCompaction();
 
@@ -8274,16 +8497,60 @@ fn streamRetryDelayMs(attempt: u32, jitter: f32) u64 {
     return @intFromFloat(@as(f64, @floatFromInt(base)) * factor);
 }
 
-/// 可取消的退避睡眠（50ms 步进检查 Ctrl+Q）；返回 false 表示期间被取消
-fn streamRetrySleep(app: *AppState, total_ms: u64) bool {
+const WatchSlotKind = enum { stream, models };
+
+/// 同步请求（主线程阻塞）的看门狗循环：轮询指定槽位，超阈值即唤醒阻塞读。
+/// 由 runCompaction / fetchModelsForProvider 在请求期间临时起线程；
+/// stop 置位后 ~50ms 内退出。
+fn syncWatchdogLoop(app: *AppState, stop: *std.atomic.Value(bool), kind: WatchSlotKind) void {
+    while (!stop.load(.acquire)) {
+        switch (kind) {
+            .stream => app.watchdogCheck(),
+            .models => app.watchdogCheckModels(),
+        }
+        Io.sleep(app.io, Io.Duration.fromMilliseconds(50), .awake) catch {};
+    }
+}
+
+/// 可取消的退避睡眠（50ms 步进检查 cancel）；返回 false = 期间被取消
+fn cancelableSleep(app: *AppState, total_ms: u64, cancel: *std.atomic.Value(bool)) bool {
     var remaining = total_ms;
     while (remaining > 0) {
-        if (app.stream_cancel.load(.acquire)) return false;
+        if (cancel.load(.acquire)) return false;
         const step: u64 = @min(remaining, 50);
         Io.sleep(app.io, Io.Duration.fromMilliseconds(@intCast(step)), .awake) catch {};
         remaining -= step;
     }
-    return !app.stream_cancel.load(.acquire);
+    return !cancel.load(.acquire);
+}
+
+/// 压缩重试前握手：请求主线程丢弃失败尝试的流式气泡与缓冲，等其确认（ack）
+/// 后再重发（避免新尝试的增量混进旧气泡）。返回 false = 等待期间被取消。
+fn compactRetryHandshake(app: *AppState, cancel: *std.atomic.Value(bool)) bool {
+    const gen = app.compact_retry_gen.fetchAdd(1, .release) + 1;
+    var waited_ms: u64 = 0;
+    while (app.compact_retry_ack.load(.acquire) != gen) {
+        if (cancel.load(.acquire)) return false;
+        // 主循环停摆兜底（正常每帧都泵）：超时后由 worker 自行清缓冲，降级继续
+        if (waited_ms >= 10_000) {
+            app.compact_mutex.lockUncancelable(app.io);
+            app.compact_buf.clearRetainingCapacity();
+            app.compact_consume_pos = 0;
+            app.compact_reasoning_buf.clearRetainingCapacity();
+            app.compact_consume_reasoning_pos = 0;
+            app.compact_mutex.unlock(app.io);
+            // 自回 ack：主线程后续（若终于跑到泵）不会再清一次，避免丢掉新尝试的增量
+            app.compact_retry_ack.store(gen, .release);
+            return true;
+        }
+        Io.sleep(app.io, Io.Duration.fromMilliseconds(10), .awake) catch {};
+        waited_ms += 10;
+    }
+    return true;
+}
+
+fn streamRetrySleep(app: *AppState, total_ms: u64) bool {
+    return cancelableSleep(app, total_ms, &app.stream_cancel);
 }
 
 fn streamWorker(job: *StreamJob) void {
@@ -8297,6 +8564,13 @@ fn streamWorker(job: *StreamJob) void {
         .behavior = job.behavior,
     });
     client.environ_map = job.environ_map;
+    // 看门狗槽位：worker 暴露 socket 句柄/打点，主线程超时后唤醒阻塞读
+    client.watch_slot = .{
+        .handle = &app.stream_watch_handle,
+        .last_data_ms = &app.stream_watch_last_data_ms,
+        .woken = &app.stream_watch_woken,
+        .mutex = &app.stream_watch_mutex,
+    };
     defer client.deinitClient();
 
     // 实时落库/中途压缩共用一条 worker 连接（主线程连接不跨线程使用）
@@ -10886,18 +11160,18 @@ fn drawInputStatus(state: *AppState, area: Rect, buf: *Buffer) void {
             }
         }
         if (state.context_usage.input_tokens > 0) {
-            // 有数据（服务端真实回传）：缓存命中 + 命中率
-            if (state.context_usage.cached_tokens > 0) {
-                var cb0: [24]u8 = undefined;
-                var cb1: [24]u8 = undefined;
-                var sb: [64]u8 = undefined;
-                const text = std.fmt.bufPrint(&sb, " · 缓存 {s}/{s} ", .{
-                    formatCount(&cb0, state.context_usage.cached_tokens),
-                    formatCount(&cb1, state.context_usage.input_tokens),
-                }) catch "";
-                if (text.len > 0) {
-                    x = drawStatusSegment(buf, x, end_x, area.y, text, .{ .fg = .dark_gray });
-                }
+            // 有数据（服务端真实回传）：缓存命中 + 命中率。
+            // cached=0（全 miss）同样显示完整段（"缓存 0/141.5k 0%"）：明确本次
+            // 整段输入未命中，且避免与前一字段粘连（曾出现 "think:max0%"）。
+            var cb0: [24]u8 = undefined;
+            var cb1: [24]u8 = undefined;
+            var sb: [64]u8 = undefined;
+            const text = std.fmt.bufPrint(&sb, " · 缓存 {s}/{s} ", .{
+                formatCount(&cb0, state.context_usage.cached_tokens),
+                formatCount(&cb1, state.context_usage.input_tokens),
+            }) catch "";
+            if (text.len > 0) {
+                x = drawStatusSegment(buf, x, end_x, area.y, text, .{ .fg = .dark_gray });
             }
             // 命中率：高命中绿色、中等黄色、低命中红色（与上下文占用同风格）
             const hit = cacheHitPercent(state.context_usage.cached_tokens, state.context_usage.input_tokens);
@@ -11158,13 +11432,13 @@ test "集成：响应流被截断（需 mock 18126，中途断开无 [DONE]/fini
         if (std.mem.indexOf(u8, m.content, "请检查: 1)") != null) saw_checklist = true;
         if (std.mem.indexOf(u8, m.content, "AI 请求失败") != null) saw_failed = true;
         if (std.mem.indexOf(u8, m.content, "↻ 连接中断") != null) retry_notes += 1;
-        if (std.mem.indexOf(u8, m.content, "重试（第 2/2 次）") != null) saw_retry_2 = true;
+        if (std.mem.indexOf(u8, m.content, "重试（第 2/3 次）") != null) saw_retry_2 = true;
     }
     try std.testing.expect(saw_truncated);
     try std.testing.expect(!saw_failed); // 截断使用友好文案，不走通用失败格式
     try std.testing.expect(!saw_checklist); // 截断属瞬时问题，不显示配置检查清单
-    // 重试预算：共重试 2 次（提示两条），第二次为最后一次
-    try std.testing.expectEqual(@as(usize, 2), retry_notes);
+    // 重试预算：共重试 3 次（提示三条），第三条为最后一次
+    try std.testing.expectEqual(@as(usize, 3), retry_notes);
     try std.testing.expect(saw_retry_2);
 }
 
@@ -11486,12 +11760,11 @@ test "集成：工具调用循环（需本地 mock 服务器 127.0.0.1:18123）"
     try std.testing.expect(std.mem.indexOf(u8, display.items, "目录里有文件") != null);
     try std.testing.expect(std.mem.indexOf(u8, display.items, "MOCK_ERROR") == null);
 
-    // usage：mock 每轮返回 prompt 100 / cached 80，三轮累计；上下文占用只取最后一轮
-    try std.testing.expect(state.last_usage.input_tokens > 0);
-    try std.testing.expect(state.last_usage.cached_tokens > 0);
-    try std.testing.expect(state.last_usage.cached_tokens <= state.last_usage.input_tokens);
+    // usage：mock 每轮返回 prompt 100 / cached 80；显示保留最后一轮真实值
+    // （89edfa6：不再用回合累计值覆盖——多轮求和会虚高）
+    try std.testing.expectEqual(@as(u64, 100), state.last_usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 80), state.last_usage.cached_tokens);
     try std.testing.expectEqual(@as(u64, 100), state.context_usage.input_tokens);
-    try std.testing.expectEqual(@as(u64, 300), state.last_usage.input_tokens);
     try std.testing.expectEqual(@as(u64, 80), state.context_usage.cached_tokens);
 
     // bash 工具块：标题 + 输出在同一块消息内
@@ -11965,7 +12238,7 @@ test "断连重试：截断后自动重试成功，丢弃失败尝试的部分�
         try display.append(std.testing.allocator, '\n');
     }
     // 重试提示出现；失败尝试的部分思考被丢弃；最终得到完整回答；无终态错误
-    try std.testing.expect(std.mem.indexOf(u8, display.items, "重试（第 1/2 次）") != null);
+    try std.testing.expect(std.mem.indexOf(u8, display.items, "重试（第 1/3 次）") != null);
     try std.testing.expect(std.mem.indexOf(u8, display.items, "会被丢弃") == null);
     try std.testing.expect(std.mem.indexOf(u8, display.items, "重试成功：这是完整回答。") != null);
     try std.testing.expect(std.mem.indexOf(u8, display.items, "响应流未正常结束") == null);
@@ -12053,7 +12326,7 @@ test "断连重试：HTTP 503 属瞬时故障，自动重试（需 mock 18127）
     }
     // 503 被识别为"服务端瞬时故障" → 重试提示出现 → 重试成功 → 无终态错误
     try std.testing.expect(std.mem.indexOf(u8, display.items, "服务端瞬时故障") != null);
-    try std.testing.expect(std.mem.indexOf(u8, display.items, "重试（第 1/2 次）") != null);
+    try std.testing.expect(std.mem.indexOf(u8, display.items, "重试（第 1/3 次）") != null);
     try std.testing.expect(std.mem.indexOf(u8, display.items, "重试成功：这是完整回答。") != null);
     try std.testing.expect(std.mem.indexOf(u8, display.items, "AI 请求失败") == null);
 }
@@ -12103,7 +12376,7 @@ test "断连重试：退避期间 Ctrl+Q 可取消（需 mock 18126）" {
     while (guard < 2000 and !saw_note) : (guard += 1) {
         state.pumpStream();
         for (state.messages.items) |m| {
-            if (std.mem.indexOf(u8, m.content, "重试（第 1/2 次）") != null) saw_note = true;
+            if (std.mem.indexOf(u8, m.content, "重试（第 1/3 次）") != null) saw_note = true;
         }
         Io.sleep(io, Io.Duration.fromMilliseconds(5), .awake) catch {};
     }
@@ -15202,7 +15475,8 @@ test "状态栏：缓存命中率百分比与着色" {
     const raw4 = tail_buf[0..tail_len];
     try std.testing.expect(std.mem.endsWith(u8, raw4, std.mem.trimEnd(u8, expected_tail, " ")));
 
-    // 有服务端数据但缓存为 0（全 miss）：正常走命中率分支（0%）
+    // 有服务端数据但缓存为 0（全 miss）：同样显示完整段"缓存 0/X 0%"（方案 B）
+    // ——明确"本次整段输入未命中"，且避免与前一字段粘连（曾出现 "think:max0%"）
     state.context_usage = .{ .input_tokens = 104_900, .cached_tokens = 0 };
     state.usage_estimated = false;
     var buf5 = try tui.render.Buffer.init(std.testing.allocator, 160, 1);
@@ -15210,8 +15484,10 @@ test "状态栏：缓存命中率百分比与着色" {
     drawInputStatus(&state, .{ .x = 0, .y = 0, .width = 160, .height = 1 }, &buf5);
     renderRowText(&buf5, &line);
     const text5 = std.mem.trimEnd(u8, &line, " ");
-    try std.testing.expect(std.mem.indexOf(u8, text5, "缓存 —") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text5, "0%") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text5, "0/104.9k 0%"));
+    // 用 lastIndexOf："0%" 也是前面上下文段 "10%" 的子串（indexOf 会误中）
+    const hit5_x = std.mem.lastIndexOf(u8, text5, "0%").?;
+    try std.testing.expect(buf5.get(@intCast(hit5_x), 0).?.fg.eql(tui.style.Color.red));
 }
 
 test "进行中指示：spinner 帧按时间推导" {
@@ -17084,4 +17360,464 @@ test "启动兜底：ensureUsageDisplayed 不覆盖播种值（回归）" {
     state.loadSessionContent(sid2);
     try std.testing.expectEqual(@as(u64, 0), state.context_usage.input_tokens);
     try std.testing.expectEqual(@as(u64, 0), state.context_usage.cached_tokens);
+}
+
+test "空闲看门狗：半开连接（不发送不关闭）时唤醒阻塞读（需 mock 18131）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    if (std.Io.Dir.cwd().access(io, "test/mock_halfopen_18131.running", .{})) |_| {} else |_| return error.SkipZigTest;
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    state.input.allocator = std.testing.allocator;
+    defer {
+        state.config.deinit(std.testing.allocator);
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+        state.clearStreamEventsLocked();
+        state.stream_events.deinit(std.testing.allocator);
+        state.stream_buf.deinit(std.testing.allocator);
+        state.stream_reasoning_buf.deinit(std.testing.allocator);
+        state.input.deinit();
+    }
+
+    _ = state.config.appendProvider(std.testing.allocator, .{ .name = "mockhalf", .endpoint = "http://127.0.0.1:18131/v1" });
+    state.config.setCurrentProvider(std.testing.allocator, "mockhalf");
+    state.config.setCurrentModel(std.testing.allocator, "mock-model");
+
+    // 加速退避 + 短看门狗（本测试验证"被唤醒→截断→重试"链路）
+    const saved_delay = stream_retry_base_delay_ms;
+    const saved_timeout = stream_idle_timeout_ms;
+    stream_retry_base_delay_ms = 20;
+    stream_idle_timeout_ms = 500; // 0.5s 无数据即唤醒
+    defer {
+        stream_retry_base_delay_ms = saved_delay;
+        stream_idle_timeout_ms = saved_timeout;
+    }
+
+    state.askAI("触发半开连接");
+
+    // 泵 + 看门狗直到回合结束（上限 20 秒：正常路径应在 1-3 秒内被唤醒并重试耗尽）
+    var guard: usize = 0;
+    while (state.streamStatus() != .idle and guard < 2000) : (guard += 1) {
+        state.pumpStream();
+        state.streamWatchdog();
+        Io.sleep(io, Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(StreamStatus.idle, state.streamStatus());
+
+    // 关键断言 1：看门狗确实开枪并成功唤醒（防"因连接被拒而平凡通过"的假阳性）
+    try std.testing.expect(state.stream_watch_wakes.load(.acquire) > 0);
+    // 关键断言 2：最终回合因截断重试耗尽而收尾（友好截断文案，而非通用失败）
+    var saw_truncated = false;
+    var saw_failed = false;
+    for (state.messages.items) |m| {
+        if (std.mem.indexOf(u8, m.content, "响应流未正常结束") != null) saw_truncated = true;
+        if (std.mem.indexOf(u8, m.content, "AI 请求失败") != null) saw_failed = true;
+    }
+    try std.testing.expect(saw_truncated);
+    try std.testing.expect(!saw_failed);
+}
+
+test "空闲看门狗：卡死时 Ctrl+Q 立即生效（需 mock 18131）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    if (std.Io.Dir.cwd().access(io, "test/mock_halfopen_18131.running", .{})) |_| {} else |_| return error.SkipZigTest;
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    state.input.allocator = std.testing.allocator;
+    defer {
+        state.config.deinit(std.testing.allocator);
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+        state.clearStreamEventsLocked();
+        state.stream_events.deinit(std.testing.allocator);
+        state.stream_buf.deinit(std.testing.allocator);
+        state.stream_reasoning_buf.deinit(std.testing.allocator);
+        state.input.deinit();
+    }
+
+    _ = state.config.appendProvider(std.testing.allocator, .{ .name = "mockhalf", .endpoint = "http://127.0.0.1:18131/v1" });
+    state.config.setCurrentProvider(std.testing.allocator, "mockhalf");
+    state.config.setCurrentModel(std.testing.allocator, "mock-model");
+
+    // 禁用看门狗：卡死只能靠 Ctrl+Q 的唤醒解除（证明取消路径独立生效）
+    const saved_timeout = stream_idle_timeout_ms;
+    stream_idle_timeout_ms = 0;
+    defer stream_idle_timeout_ms = saved_timeout;
+
+    state.askAI("触发半开连接");
+
+    // 等 worker 进入阻塞读（mock 已发部分 SSE；2s 足够）
+    var guard: usize = 0;
+    while (guard < 200) : (guard += 1) {
+        state.pumpStream();
+        Io.sleep(io, Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(StreamStatus.running, state.streamStatus());
+    try std.testing.expectEqual(@as(usize, 0), state.stream_watch_wakes.load(.acquire));
+
+    // Ctrl+Q：应立即唤醒阻塞读并进入取消收尾（而不是等到超时）
+    state.cancelStream();
+    guard = 0;
+    while (state.streamStatus() != .idle and guard < 500) : (guard += 1) {
+        state.pumpStream();
+        Io.sleep(io, Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(StreamStatus.idle, state.streamStatus());
+    try std.testing.expect(state.stream_watch_wakes.load(.acquire) > 0);
+}
+
+test "空闲看门狗：手动压缩（异步）半开卡死时自动收尾（需 mock 18131）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    if (std.Io.Dir.cwd().access(io, "test/mock_halfopen_18131.running", .{})) |_| {} else |_| return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const db_path = "skynet_test_wd_compact_async.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_wd_compact_async.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_wd_compact_async.db-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_wd_compact_async.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_wd_compact_async.db-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.input.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer if (state.db) |*d| d.deinit();
+    defer {
+        state.config.deinit(alloc);
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.clearStreamEventsLocked();
+        state.stream_events.deinit(alloc);
+        state.stream_buf.deinit(alloc);
+        state.compact_buf.deinit(alloc);
+        state.compact_reasoning_buf.deinit(alloc);
+        state.input.deinit();
+    }
+
+    _ = state.config.appendProvider(alloc, .{ .name = "mockhalf", .endpoint = "http://127.0.0.1:18131/v1" });
+    state.config.setCurrentProvider(alloc, "mockhalf");
+    state.config.setCurrentModel(alloc, "mock-model");
+
+    const sid = try state.db.?.createSession("");
+    state.session_id = sid;
+    // 足够长的历史（保证自适应缩小时选得中可压缩区间）
+    const f0 = "G0" ** 4000;
+    _ = state.persistMessage(.{ .role = "user", .content = f0 });
+    const f1 = "G1" ** 4000;
+    _ = state.persistMessage(.{ .role = "assistant", .content = f1 });
+    const f2 = "G2" ** 4000;
+    _ = state.persistMessage(.{ .role = "user", .content = f2 });
+    const f3 = "G3" ** 4000;
+    _ = state.persistMessage(.{ .role = "assistant", .content = f3 });
+    state.loadSessionContent(sid);
+
+    const saved_timeout = stream_idle_timeout_ms;
+    const saved_delay = stream_retry_base_delay_ms;
+    stream_idle_timeout_ms = 500; // 0.5s 无数据即唤醒
+    stream_retry_base_delay_ms = 20; // 加速重试退避（本测试含重试链路）
+    defer {
+        stream_idle_timeout_ms = saved_timeout;
+        stream_retry_base_delay_ms = saved_delay;
+    }
+
+    state.runCompactCommand(0);
+
+    // 泵 + 看门狗直到压缩收尾（上限 30 秒：唤醒→截断→重试耗尽→失败收尾，数秒内）
+    var guard: usize = 0;
+    while (state.compact_status.load(.acquire) != 0 and guard < 3000) : (guard += 1) {
+        state.pumpCompaction();
+        state.streamWatchdog();
+        Io.sleep(io, Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(u8, 0), state.compact_status.load(.acquire));
+    try std.testing.expect(state.stream_watch_wakes.load(.acquire) > 0);
+    // 至少两次尝试（初次 + 至少一次重试；每次尝试都会在超时后被唤醒）
+    try std.testing.expect(state.stream_watch_wakes.load(.acquire) >= 2);
+    // 压缩失败提示（而非永久"正在压缩…"）
+    var saw_fail = false;
+    for (state.messages.items) |m| {
+        if (std.mem.indexOf(u8, m.content, "压缩失败") != null) saw_fail = true;
+    }
+    try std.testing.expect(saw_fail);
+}
+
+test "空闲看门狗：工具轮中途压缩半开卡死时自动收尾（需 mock 18131）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    if (std.Io.Dir.cwd().access(io, "test/mock_halfopen_18131.running", .{})) |_| {} else |_| return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const db_path = "skynet_test_wd_compact_mid.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_wd_compact_mid.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_wd_compact_mid.db-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_wd_compact_mid.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_wd_compact_mid.db-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.input.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer if (state.db) |*d| d.deinit();
+    defer {
+        state.config.deinit(alloc);
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.clearStreamEventsLocked();
+        state.stream_events.deinit(alloc);
+        state.stream_buf.deinit(alloc);
+        state.compact_buf.deinit(alloc);
+        state.compact_reasoning_buf.deinit(alloc);
+        state.input.deinit();
+    }
+
+    _ = state.config.appendProvider(alloc, .{ .name = "mockhalf", .endpoint = "http://127.0.0.1:18131/v1" });
+    state.config.setCurrentProvider(alloc, "mockhalf");
+    state.config.setCurrentModel(alloc, "mock-model");
+
+    const sid = try state.db.?.createSession("");
+    state.session_id = sid;
+
+    const job = try alloc.create(StreamJob);
+    defer {
+        job.arena.deinit();
+        alloc.destroy(job);
+    }
+    job.* = .{
+        .app = &state,
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .io = io,
+        .cwd = ".",
+        .model = "mock-model",
+        .endpoint = "http://127.0.0.1:18131/v1",
+        .api_key = "x",
+        .provider_name = "mockhalf",
+        .db_path = db_path,
+        .session_id_num = sid,
+        .history = &.{},
+        .auto_compact_pct = 0, // 自动压缩关闭：证明是 force（手动排队/中途）在起作用
+        .context_window = 1_000_000,
+        .keep_recent_tokens = 100,
+    };
+    const arena = job.arena.allocator();
+    var hist = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
+    try hist.append(arena, .{ .role = "system", .content = try arena.dupe(u8, system_prompt) });
+    {
+        // 直接落库并构造带 db_id 的历史条目（模拟 worker 已实时落库）
+        const txt_u = try arena.dupe(u8, "AAAA" ** 2000);
+        const row_u = state.persistMessage(.{ .role = "user", .content = txt_u });
+        try hist.append(arena, .{ .role = "user", .content = txt_u, .db_id = row_u });
+        const txt_a = try arena.dupe(u8, "BBBB" ** 2000);
+        const row_a = state.persistMessage(.{ .role = "assistant", .content = txt_a });
+        try hist.append(arena, .{ .role = "assistant", .content = txt_a, .db_id = row_a });
+        const txt_u2 = try arena.dupe(u8, "CCCC" ** 500);
+        const row_u2 = state.persistMessage(.{ .role = "user", .content = txt_u2 });
+        try hist.append(arena, .{ .role = "user", .content = txt_u2, .db_id = row_u2 });
+    }
+    job.history = try hist.toOwnedSlice(arena);
+
+    const saved_timeout = stream_idle_timeout_ms;
+    const saved_delay = stream_retry_base_delay_ms;
+    stream_idle_timeout_ms = 500;
+    stream_retry_base_delay_ms = 20; // 加速重试退避
+    defer {
+        stream_idle_timeout_ms = saved_timeout;
+        stream_retry_base_delay_ms = saved_delay;
+    }
+
+    // compactJobHistory 阻塞执行（生产里跑在 stream worker 内）→ 测试用线程执行，
+    // 主线程泵看门狗（模拟生产的主循环）
+    const Runner = struct {
+        job: *StreamJob,
+        alloc: std.mem.Allocator,
+        io: Io,
+        result: *std.atomic.Value(bool),
+        done: *std.atomic.Value(bool),
+        fn run(ctx: *@This()) void {
+            var db = db_mod.Db.openFile(ctx.alloc, ctx.io, ctx.job.db_path) catch {
+                ctx.done.store(true, .release);
+                return;
+            };
+            defer db.deinit();
+            ctx.result.store(compactJobHistory(ctx.job, &db, true, 0), .release);
+            ctx.done.store(true, .release);
+        }
+    };
+    var result = std.atomic.Value(bool).init(true);
+    var done = std.atomic.Value(bool).init(false);
+    var runner = Runner{ .job = job, .alloc = alloc, .io = io, .result = &result, .done = &done };
+    const th = try std.Thread.spawn(.{}, Runner.run, .{&runner});
+
+    var guard: usize = 0;
+    while (!done.load(.acquire) and guard < 3000) : (guard += 1) {
+        state.pumpCompaction();
+        state.streamWatchdog();
+        Io.sleep(io, Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(done.load(.acquire));
+    if (done.load(.acquire)) th.join();
+    // 半开 → 截断失败（而非挂起/成功）
+    try std.testing.expect(!result.load(.acquire));
+    try std.testing.expect(state.stream_watch_wakes.load(.acquire) > 0);
+    // 至少两次尝试（初次 + 至少一次重试）
+    try std.testing.expect(state.stream_watch_wakes.load(.acquire) >= 2);
+    state.pumpCompaction(); // 收尾显示（失败提示）
+    var saw_fail = false;
+    for (state.messages.items) |m| {
+        if (std.mem.indexOf(u8, m.content, "压缩失败") != null) saw_fail = true;
+    }
+    try std.testing.expect(saw_fail);
+}
+
+test "空闲看门狗：同步压缩（主线程）半开卡死时自动收尾（需 mock 18131）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    if (std.Io.Dir.cwd().access(io, "test/mock_halfopen_18131.running", .{})) |_| {} else |_| return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const db_path = "skynet_test_wd_compact_sync.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_wd_compact_sync.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_wd_compact_sync.db-shm") catch {};
+    defer {
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_wd_compact_sync.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_wd_compact_sync.db-shm") catch {};
+    }
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.input.allocator = alloc;
+    state.db = try db_mod.Db.openFile(alloc, io, db_path);
+    defer if (state.db) |*d| d.deinit();
+    defer {
+        state.config.deinit(alloc);
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.clearStreamEventsLocked();
+        state.stream_events.deinit(alloc);
+        state.stream_buf.deinit(alloc);
+        state.compact_buf.deinit(alloc);
+        state.compact_reasoning_buf.deinit(alloc);
+        state.input.deinit();
+    }
+
+    _ = state.config.appendProvider(alloc, .{ .name = "mockhalf", .endpoint = "http://127.0.0.1:18131/v1" });
+    state.config.setCurrentProvider(alloc, "mockhalf");
+    state.config.setCurrentModel(alloc, "mock-model");
+
+    const sid = try state.db.?.createSession("");
+    state.session_id = sid;
+    state.appendHistory("system", system_prompt);
+    const uid1 = state.persistMessage(.{ .role = "user", .content = "WD 用户问题一" });
+    state.appendHistoryMessage(.{ .role = "user", .content = "WD 用户问题一", .db_id = uid1 });
+    const aid1 = state.persistMessage(.{ .role = "assistant", .content = "WD 回答一" });
+    state.appendHistoryMessage(.{ .role = "assistant", .content = "WD 回答一", .db_id = aid1 });
+    const uid2 = state.persistMessage(.{ .role = "user", .content = "最后的问题" });
+    state.appendHistoryMessage(.{ .role = "user", .content = "最后的问题", .db_id = uid2 });
+    state.keep_recent_tokens = 1; // 保留窗口极小：只保留最后一个 user 及其后
+
+    const saved_timeout = stream_idle_timeout_ms;
+    const saved_delay = stream_retry_base_delay_ms;
+    stream_idle_timeout_ms = 500;
+    stream_retry_base_delay_ms = 20; // 加速重试退避
+    defer {
+        stream_idle_timeout_ms = saved_timeout;
+        stream_retry_base_delay_ms = saved_delay;
+    }
+
+    // runCompaction 直接阻塞主线程（测试线程）执行：内部会临时起专用看门狗线程。
+    // mock 侧 20s 读超时是安全网：万一看门狗失效也不会永久挂住（测试失败而非挂起）。
+    const out = state.runCompaction(0);
+    try std.testing.expect(out.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.err.?, "Truncated") != null);
+    try std.testing.expect(state.stream_watch_wakes.load(.acquire) > 0);
+    // 至少两次尝试（初次 + 至少一次重试）
+    try std.testing.expect(state.stream_watch_wakes.load(.acquire) >= 2);
+}
+
+test "空闲看门狗：模型列表拉取半开卡死时自动收尾（需 mock 18131）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    if (std.Io.Dir.cwd().access(io, "test/mock_halfopen_18131.running", .{})) |_| {} else |_| return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var state = AppState{};
+    state.io = io;
+    state.allocator = alloc;
+    state.input.allocator = alloc;
+    defer {
+        state.config.deinit(alloc);
+        for (state.history.items) |m| freeMessage(alloc, m);
+        state.history.deinit(alloc);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(alloc);
+        state.clearStreamEventsLocked();
+        state.stream_events.deinit(alloc);
+        state.stream_buf.deinit(alloc);
+        state.input.deinit();
+    }
+
+    _ = state.config.appendProvider(alloc, .{ .name = "mockhalf", .endpoint = "http://127.0.0.1:18131/v1" });
+    state.config.setCurrentProvider(alloc, "mockhalf");
+    state.config.setCurrentModel(alloc, "mock-model");
+
+    const saved_timeout = stream_idle_timeout_ms;
+    stream_idle_timeout_ms = 500; // 0.5s 无数据即唤醒
+    defer stream_idle_timeout_ms = saved_timeout;
+
+    // 直接阻塞测试线程执行（内部起专用看门狗线程）；
+    // mock 侧 20s 读超时是安全网：万一看门狗失效也不会永久挂住（测试失败而非挂起）
+    const ok = state.fetchModelsForProvider(0);
+    try std.testing.expect(!ok);
+    try std.testing.expect(state.models_watch_wakes.load(.acquire) > 0);
+    var saw_fail = false;
+    for (state.messages.items) |m| {
+        if (std.mem.indexOf(u8, m.content, "获取模型列表失败") != null) saw_fail = true;
+    }
+    try std.testing.expect(saw_fail);
 }
