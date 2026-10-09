@@ -23,8 +23,8 @@ pub const cli_usage =
     \\  -title <文本>          新会话标题
     \\  -provider <名称>       临时覆盖提供商（不写回 config.json）
     \\  -model <模型id>        临时覆盖模型（不写回 config.json）
-    \\  -db <路径>             数据库文件（默认 skynet.db）
-    \\  -config <路径>         配置文件（默认 config.json）
+    \\  -db <路径>             数据库文件（默认 exe 同目录 data\skynet.db）
+    \\  -config <路径>         配置文件（默认 exe 同目录 data\config.json）
     \\  -n <数量>              messages 只显示最后 N 条
     \\  --json                 以 JSON 输出结果（结构化字段，不含思考/工具原文）
     \\  --quiet                不输出过程信息（stderr）
@@ -48,8 +48,10 @@ pub const CliOptions = struct {
     model: []const u8 = "",
     /// 思考强度 off/low/high/max（仅本次请求，不写回配置）
     thinking: []const u8 = "",
-    db_path: []const u8 = "skynet.db",
-    config_path: []const u8 = "config.json",
+    /// 数据库文件路径（空 = 未指定：由调用方解析为数据目录内 skynet.db）
+    db_path: []const u8 = "",
+    /// 配置文件路径（空 = 未指定：由调用方解析为数据目录内 config.json）
+    config_path: []const u8 = "",
     json: bool = false,
     quiet: bool = false,
     stream: bool = false,
@@ -208,6 +210,9 @@ test "CLI 参数解析" {
     const opt2 = parseCliArgs(&args2).?;
     try std.testing.expectEqual(@as(usize, 5), opt2.limit);
     try std.testing.expect(isCliCommand("stats"));
+    // 未显式指定时路径为空串（由调用方解析为数据目录内默认路径；见 main.zig）
+    try std.testing.expectEqualStrings("", opt2.db_path);
+    try std.testing.expectEqualStrings("", opt2.config_path);
 
     const args3 = [_][]const u8{ "ask", "--max-chars", "120", "--no-tools", "hi" };
     const opt3 = parseCliArgs(&args3).?;

@@ -380,17 +380,22 @@ pub const Config = struct {
     /// 用户宽度覆盖名单（原始字符串，启动时解析；格式见 README）
     width_overrides_wide: []u8 = &.{},
     width_overrides_narrow: []u8 = &.{},
+    /// 配置文件保存路径（loadFile 记录；空 = cwd/config.json）
+    save_path: []u8 = &.{},
 
+    /// 加载配置并记录保存路径（供 save 写回同一位置）
     pub fn load(self: *Config, io: Io, allocator: Allocator) void {
-        self.loadFile(io, allocator, "config.json");
+        self.loadFile(io, allocator, "config.json", true);
     }
 
-    /// 从指定路径加载配置（CLI 的 -config 用）；默认路径缺失时会生成默认配置
-    pub fn loadFile(self: *Config, io: Io, allocator: Allocator, path: []const u8) void {
+    /// 从指定路径加载配置；`generate_if_missing` = 路径缺失时生成默认配置
+    /// （仅对"默认路径"传 true，避免在任意路径下写出 config.json）。
+    /// 路径记录在 save_path，后续 save 写回同一位置（支持绝对路径，如数据目录内配置）。
+    pub fn loadFile(self: *Config, io: Io, allocator: Allocator, path: []const u8, generate_if_missing: bool) void {
+        self.setSavePath(allocator, path);
         const dir = Io.Dir.cwd();
         const content = dir.readFileAlloc(io, path, allocator, .limited(1 << 20)) catch {
-            // 仅默认配置路径缺失时生成默认配置（避免在任意路径下写出 config.json）
-            if (std.mem.eql(u8, path, "config.json")) self.save(io, allocator);
+            if (generate_if_missing) self.save(io, allocator);
             return;
         };
         defer allocator.free(content);
@@ -518,7 +523,13 @@ pub const Config = struct {
         removed.deinit(allocator);
     }
 
+    /// 保存到 loadFile 记录的路径（未加载过时 = cwd/config.json）
     pub fn save(self: *Config, io: Io, allocator: Allocator) void {
+        self.saveTo(io, allocator, if (self.save_path.len > 0) self.save_path else "config.json");
+    }
+
+    /// 保存到指定路径（支持绝对路径）
+    pub fn saveTo(self: *Config, io: Io, allocator: Allocator, path: []const u8) void {
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
 
@@ -585,9 +596,15 @@ pub const Config = struct {
         }) catch return;
 
         const dir = Io.Dir.cwd();
-        const file = dir.createFile(io, "config.json", .{}) catch return;
+        const file = dir.createFile(io, path, .{}) catch return;
         defer file.close(io);
         file.writeStreamingAll(io, out.written()) catch return;
+    }
+
+    fn setSavePath(self: *Config, allocator: Allocator, path: []const u8) void {
+        const copy = allocator.dupe(u8, path) catch return;
+        allocator.free(self.save_path);
+        self.save_path = copy;
     }
 
     pub fn deinit(self: *Config, allocator: Allocator) void {
@@ -608,6 +625,8 @@ pub const Config = struct {
         self.width_overrides_wide = &.{};
         allocator.free(self.width_overrides_narrow);
         self.width_overrides_narrow = &.{};
+        allocator.free(self.save_path);
+        self.save_path = &.{};
     }
 };
 

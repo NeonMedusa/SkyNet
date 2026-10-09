@@ -1,7 +1,7 @@
 //! log.zig — 迷你日志（线程安全，仅写文件）
 //!
 //! 用法：Log.info(.api, "请求 model={s}", .{model});
-//! 文件：logs/<epoch秒>.<毫秒>.txt（每次启动一份，不覆盖历史；保留最近 20 份）
+//! 文件：<数据目录>/logs/<epoch秒>.<毫秒>.txt（每次启动一份，不覆盖历史；保留最近 20 份）
 //! 级别：info（默认）；环境变量 SKYNET_LOG=off|error|warn|info|debug 覆盖
 //!
 //! 设计要点：
@@ -57,15 +57,20 @@ pub fn parseLevel(s: []const u8) ?Level {
     return null;
 }
 
-/// 默认初始化：logs/<epoch>.<ms>.txt；level_str 为 "off" 时完全不启用。
+/// 初始化：`<base_dir>/logs/<epoch>.<ms>.txt`（base_dir 为空时退回 cwd 的 logs/）；
+/// level_str 为 "off" 时完全不启用。
 /// 任何一步失败都静默降级为"无日志"（绝不因日志问题影响主功能）。
-pub fn init(io: Io, allocator: Allocator, level_str: []const u8) void {
+pub fn init(io: Io, allocator: Allocator, level_str: []const u8, base_dir: []const u8) void {
     if (std.mem.eql(u8, level_str, "off")) return;
     if (parseLevel(level_str)) |l| min_level = l;
 
-    const cwd = std.process.currentPathAlloc(io, allocator) catch return;
-    defer allocator.free(cwd);
-    const dir = std.fs.path.join(allocator, &.{ cwd, "logs" }) catch return;
+    const dir = if (base_dir.len > 0)
+        std.fs.path.join(allocator, &.{ base_dir, "logs" }) catch return
+    else blk: {
+        const cwd = std.process.currentPathAlloc(io, allocator) catch return;
+        defer allocator.free(cwd);
+        break :blk std.fs.path.join(allocator, &.{ cwd, "logs" }) catch return;
+    };
     defer allocator.free(dir);
     std.Io.Dir.createDirAbsolute(io, dir, .default_dir) catch {};
 

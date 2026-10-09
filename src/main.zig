@@ -12,6 +12,7 @@ const tools_mod = @import("tools.zig");
 const context_mod = @import("context.zig");
 const cli = @import("cli_args.zig");
 const Log = @import("log.zig");
+const paths = @import("paths.zig");
 const display_mod = @import("display.zig");
 
 // 显示文本纯函数（display.zig）——保留短名，避免大范围改调用点
@@ -5569,8 +5570,40 @@ const cliWriteStdout = cli.cliWriteStdout;
 const cliWriteStderr = cli.cliWriteStderr;
 const parseCliArgs = cli.parseCliArgs;
 const cliJsonWrite = cli.cliJsonWrite;
-fn cliOpenDb(allocator: Allocator, io: Io, opt: CliOptions) ?db_mod.Db {
-    const path = allocator.dupeZ(u8, opt.db_path) catch return null;
+/// CLI 默认路径解析：显式参数优先；否则数据目录（exe 旁 data\）内；再否则 cwd 相对（旧行为）。
+/// 总是返回新分配的内存（调用方负责释放；分配失败返回 null）。
+fn cliResolveDefaultPath(allocator: Allocator, io: Io, explicit: []const u8, sub: []const u8) ?[]u8 {
+    if (explicit.len > 0) return allocator.dupe(u8, explicit) catch null;
+    const data = paths.resolveDataDir(io, allocator) orelse return allocator.dupe(u8, sub) catch null;
+    defer allocator.free(data.path);
+    return paths.join(allocator, data.path, sub) catch null;
+}
+
+test "CLI 默认路径：显式参数原样返回；默认指向 exe 旁数据目录" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    // 显式指定：原样返回（不解析数据目录）
+    const explicit = cliResolveDefaultPath(std.testing.allocator, io, "my.db", "skynet.db").?;
+    defer std.testing.allocator.free(explicit);
+    try std.testing.expectEqualStrings("my.db", explicit);
+
+    // 未指定：数据目录内 skynet.db（测试环境 exe 在 zig-out/bin → ...\data\skynet.db）
+    const resolved = cliResolveDefaultPath(std.testing.allocator, io, "", "skynet.db").?;
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expect(std.mem.endsWith(u8, resolved, "skynet.db"));
+    // 在测试进程下 exe 路径可得 → 应指向 data 子目录；否则退回相对名
+    if (std.mem.indexOf(u8, resolved, "data") != null) {
+        try std.testing.expect(std.fs.path.isAbsolute(resolved));
+    } else {
+        try std.testing.expectEqualStrings("skynet.db", resolved);
+    }
+}
+
+fn cliOpenDb(allocator: Allocator, io: Io, db_path: []const u8) ?db_mod.Db {
+    const path = allocator.dupeZ(u8, db_path) catch return null;
     defer allocator.free(path);
     return db_mod.Db.openFile(allocator, io, path) catch |e| {
         if (e == error.SchemaVersionMismatch) {
@@ -5628,7 +5661,12 @@ fn cliPrintHelp(io: Io, to_stderr: bool) void {
 }
 
 fn cmdSessions(allocator: Allocator, io: Io, opt: CliOptions) u8 {
-    var db = cliOpenDb(allocator, io, opt) orelse {
+    const db_path = cliResolveDefaultPath(allocator, io, opt.db_path, "skynet.db") orelse {
+        cliWriteStderr(io, "内存不足\n");
+        return 4;
+    };
+    defer allocator.free(db_path);
+    var db = cliOpenDb(allocator, io, db_path) orelse {
         cliWriteStderr(io, "无法打开数据库\n");
         return 4;
     };
@@ -5677,7 +5715,12 @@ fn cmdSessions(allocator: Allocator, io: Io, opt: CliOptions) u8 {
 }
 
 fn cmdMessages(allocator: Allocator, io: Io, opt: CliOptions) u8 {
-    var db = cliOpenDb(allocator, io, opt) orelse {
+    const db_path = cliResolveDefaultPath(allocator, io, opt.db_path, "skynet.db") orelse {
+        cliWriteStderr(io, "内存不足\n");
+        return 4;
+    };
+    defer allocator.free(db_path);
+    var db = cliOpenDb(allocator, io, db_path) orelse {
         cliWriteStderr(io, "无法打开数据库\n");
         return 4;
     };
@@ -5750,7 +5793,12 @@ fn cmdMessages(allocator: Allocator, io: Io, opt: CliOptions) u8 {
 }
 
 fn cmdNew(allocator: Allocator, io: Io, opt: CliOptions) u8 {
-    var db = cliOpenDb(allocator, io, opt) orelse {
+    const db_path = cliResolveDefaultPath(allocator, io, opt.db_path, "skynet.db") orelse {
+        cliWriteStderr(io, "内存不足\n");
+        return 4;
+    };
+    defer allocator.free(db_path);
+    var db = cliOpenDb(allocator, io, db_path) orelse {
         cliWriteStderr(io, "无法打开数据库\n");
         return 4;
     };
@@ -6304,7 +6352,12 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
 
 /// 会话上下文/token 统计（compaction 调参用）
 fn cmdStats(allocator: Allocator, io: Io, opt: CliOptions) u8 {
-    var db = cliOpenDb(allocator, io, opt) orelse {
+    const db_path = cliResolveDefaultPath(allocator, io, opt.db_path, "skynet.db") orelse {
+        cliWriteStderr(io, "内存不足\n");
+        return 4;
+    };
+    defer allocator.free(db_path);
+    var db = cliOpenDb(allocator, io, db_path) orelse {
         cliWriteStderr(io, "无法打开数据库\n");
         return 4;
     };
@@ -6418,8 +6471,13 @@ fn cmdStats(allocator: Allocator, io: Io, opt: CliOptions) u8 {
     const request_est = estimateTokens(request_bytes + schema_bytes);
 
     // 窗口：从配置读当前模型（provider 可显式覆盖）
+    const cfg_path = cliResolveDefaultPath(allocator, io, opt.config_path, "config.json") orelse {
+        cliWriteStderr(io, "内存不足\n");
+        return 4;
+    };
+    defer allocator.free(cfg_path);
     var config = config_mod.Config{};
-    config.loadFile(io, allocator, opt.config_path);
+    config.loadFile(io, allocator, cfg_path, opt.config_path.len == 0);
     defer config.deinit(allocator);
     const model = config.current_model;
     var ctx_window: u64 = if (model.len > 0) modelContextWindow(model) else 131_072;
@@ -6651,14 +6709,24 @@ fn cmdCompact(init: std.process.Init, opt: CliOptions) u8 {
         defer allocator.free(z);
         break :blk allocator.dupe(u8, z) catch &.{};
     };
-    state.config.loadFile(io, allocator, opt.config_path);
-    state.db = cliOpenDb(allocator, io, opt);
+    const cfg_path = cliResolveDefaultPath(allocator, io, opt.config_path, "config.json") orelse {
+        cliWriteStderr(io, "内存不足\n");
+        return 4;
+    };
+    defer allocator.free(cfg_path);
+    state.config.loadFile(io, allocator, cfg_path, opt.config_path.len == 0);
+    const db_path = cliResolveDefaultPath(allocator, io, opt.db_path, "skynet.db") orelse {
+        cliWriteStderr(io, "内存不足\n");
+        return 4;
+    };
+    defer allocator.free(db_path);
+    state.db = cliOpenDb(allocator, io, db_path);
     if (state.db == null) {
         cliWriteStderr(io, "无法打开数据库\n");
         return 4;
     }
     defer cliCleanupState(&state, allocator);
-    state.db_path = opt.db_path;
+    state.db_path = db_path;
 
     const override_code = cliApplyProviderOverrides(&state, allocator, io, opt);
     if (override_code != 0) return override_code;
@@ -6758,14 +6826,24 @@ fn cmdAsk(init: std.process.Init, opt: CliOptions) u8 {
         defer allocator.free(z);
         break :blk allocator.dupe(u8, z) catch &.{};
     };
-    state.config.loadFile(io, allocator, opt.config_path);
-    state.db = cliOpenDb(allocator, io, opt);
+    const cfg_path = cliResolveDefaultPath(allocator, io, opt.config_path, "config.json") orelse {
+        cliWriteStderr(io, "内存不足\n");
+        return 4;
+    };
+    defer allocator.free(cfg_path);
+    state.config.loadFile(io, allocator, cfg_path, opt.config_path.len == 0);
+    const db_path = cliResolveDefaultPath(allocator, io, opt.db_path, "skynet.db") orelse {
+        cliWriteStderr(io, "内存不足\n");
+        return 4;
+    };
+    defer allocator.free(db_path);
+    state.db = cliOpenDb(allocator, io, db_path);
     if (state.db == null) {
         cliWriteStderr(io, "无法打开数据库\n");
         return 4;
     }
     defer cliCleanupState(&state, allocator);
-    state.db_path = opt.db_path;
+    state.db_path = db_path;
 
     const override_code = cliApplyProviderOverrides(&state, allocator, io, opt);
     if (override_code != 0) return override_code;
@@ -7311,15 +7389,26 @@ pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     const io = init.io;
 
-    // 日志（logs/；`SKYNET_LOG=off|error|warn|info|debug` 覆盖级别）
-    Log.init(io, allocator, init.environ_map.get("SKYNET_LOG") orelse "");
+    // 数据目录（exe 旁 data\；拿不到时退回 cwd 的相对路径——旧行为）
+    const data = paths.resolveDataDir(io, allocator);
+    defer if (data) |d| allocator.free(d.path);
+    const data_dir: []const u8 = if (data) |d| d.path else "";
+
+    // 日志（<数据目录>/logs/；`SKYNET_LOG=off|error|warn|info|debug` 覆盖级别）
+    Log.init(io, allocator, init.environ_map.get("SKYNET_LOG") orelse "", data_dir);
     // CLI 分支经 std.process.exit 退出（本 defer 不执行），runCli 内部自行 deinit
     defer Log.deinit();
 
     // 无界面子命令（ask/new/sessions/messages/help）：不初始化终端，直接执行后退出
-    var tui_db_path: []const u8 = "skynet.db";
+    // TUI 的默认库：数据目录内 skynet.db（显式 -db 覆盖；见下方解析）
+    const default_db_path_owned: ?[]u8 = if (data_dir.len > 0) (paths.join(allocator, data_dir, "skynet.db") catch null) else null;
+    defer if (default_db_path_owned) |p| allocator.free(p);
+    var tui_db_path: []const u8 = default_db_path_owned orelse "skynet.db";
     var tui_db_path_owned: ?[]u8 = null;
     defer if (tui_db_path_owned) |p| allocator.free(p);
+    // TUI 的默认配置：数据目录内 config.json（缺失时自动生成）
+    const tui_cfg_path_owned: ?[]u8 = if (data_dir.len > 0) (paths.join(allocator, data_dir, "config.json") catch null) else null;
+    defer if (tui_cfg_path_owned) |p| allocator.free(p);
     {
         var arg_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
         defer arg_it.deinit();
@@ -7330,11 +7419,11 @@ pub fn main(init: std.process.Init) !u8 {
         if (arg_list.items.len > 0 and isCliCommand(arg_list.items[0])) {
             std.process.exit(runCli(init, arg_list.items));
         }
-        // TUI 分支：同样解析 -db（与 CLI 子命令一致；默认 skynet.db）。
+        // TUI 分支：同样解析 -db（与 CLI 子命令一致；默认数据目录内 skynet.db）。
         // 参数切片归属 arg_it（块结束即释放）——必须复制到长生命周期内存。
         if (arg_list.items.len > 0) {
             if (cli.parseCliArgs(arg_list.items)) |parsed| {
-                if (parsed.db_path.len > 0 and !std.mem.eql(u8, parsed.db_path, "skynet.db")) {
+                if (parsed.db_path.len > 0) {
                     if (allocator.dupe(u8, parsed.db_path)) |copy| {
                         tui_db_path_owned = copy;
                         tui_db_path = copy;
@@ -7391,7 +7480,7 @@ pub fn main(init: std.process.Init) !u8 {
         defer allocator.free(z);
         break :blk allocator.dupe(u8, z) catch &.{};
     };
-    state.config.load(io, allocator);
+    state.config.loadFile(io, allocator, tui_cfg_path_owned orelse "config.json", true);
     // 模糊宽度策略（①←≤…按 1 列还是 2 列）：必须在首次绘制前应用
     applyAmbiguousWidth(&state);
 
@@ -11300,6 +11389,7 @@ test {
     _ = @import("cli_args.zig");
     _ = @import("log.zig");
     _ = @import("display.zig");
+    _ = @import("paths.zig");
 }
 
 test "历史消息会清洗非法 UTF-8（避免 JSON 退化为字节数组）" {

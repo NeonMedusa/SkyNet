@@ -10,3 +10,4 @@ nul
 skynet*.db*
 config.json
 test/*.running
+data/

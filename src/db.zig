@@ -156,16 +156,26 @@ pub fn probeVersionMismatch(allocator: Allocator, io: Io, filename: [:0]const u8
 }
 
 /// 选择旧库备份名：`<base>.old.db` → `<base>.old.2.db` → …（取第一个未被占用的名字；
-/// 只做存在性检查，不创建任何文件）。用于弹窗展示"将重命名为 X"与实际重命名。
+/// 只做存在性检查，不创建任何文件）。备份与库**同目录**（filename 可能带目录/
+/// 绝对路径，如数据目录内 skynet.db；否则备份会落到 cwd）。用于弹窗展示与实际重命名。
 pub fn pickLegacyBackupName(allocator: Allocator, io: Io, filename: [:0]const u8) ![]u8 {
     const dir = Io.Dir.cwd();
     const base = std.fs.path.basename(filename);
+    const parent = std.fs.path.dirname(filename);
     var n: usize = 0;
     while (n < 100) : (n += 1) {
-        const candidate = if (n == 0)
+        var candidate: []u8 = if (n == 0)
             try std.fmt.allocPrint(allocator, "{s}.old.db", .{base})
         else
             try std.fmt.allocPrint(allocator, "{s}.old.{d}.db", .{ base, n + 1 });
+        if (parent) |p| {
+            const joined = std.fs.path.join(allocator, &.{ p, candidate }) catch |e| {
+                allocator.free(candidate);
+                return e;
+            };
+            allocator.free(candidate);
+            candidate = joined;
+        }
         const taken = blk: {
             dir.access(io, candidate, .{}) catch break :blk false;
             break :blk true;
@@ -185,6 +195,7 @@ pub fn pickLegacyBackupName(allocator: Allocator, io: Io, filename: [:0]const u8
 /// 全程只做"重命名"，不写入、不删除任何文件内容——失败时文件保持原位。
 pub fn renameLegacyDbFiles(allocator: Allocator, io: Io, filename: [:0]const u8) ![]u8 {
     const dir = Io.Dir.cwd();
+    // 备份与库同目录（target 为完整路径；rename(abs, abs) / rename(rel, rel) 均可用）
     const target = try pickLegacyBackupName(allocator, io, filename);
     errdefer allocator.free(target);
 

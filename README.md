@@ -52,7 +52,21 @@ zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/SkyNet.exe help                                # 全部子命令与参数
 ```
 
-首次启动自动生成 `config.json`（空配置）与 `skynet.db`（SQLite，WAL）。
+> 数据目录：配置/数据库/日志默认在 **exe 同目录 `data\`**（不存在自动创建；scoop 安装时指向 persist）。
+> 用 `-db` / `-config` 可显式指定其他位置。
+
+首次启动自动生成 `config.json`（空配置）与 `skynet.db`（SQLite，WAL）——
+默认都在 **exe 同目录的 `data\` 子目录**下（便携模式：目录/配置/数据库/日志不存在时自动创建）：
+
+```
+zig-out\bin\SkyNet.exe
+zig-out\bin\data\config.json      ← 配置
+zig-out\bin\data\skynet.db        ← 数据库
+zig-out\bin\data\logs\            ← 日志
+```
+
+scoop 安装时 `data` 是指向 `scoop\persist\skynet\data` 的 junction——升级/卸载（默认）都不动数据。
+如需自定义位置：`-db <路径>` / `-config <路径>` 显式指定（优先于默认）。
 第一次使用：TUI 里按 `Esc` → `models` → 底部「+ 添加提供商…」，填入 API 地址与密钥
 （密钥也可留空、改填环境变量名）。
 
