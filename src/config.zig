@@ -114,8 +114,11 @@ pub const Behavior = struct {
     /// 没有真实 usage 时无法显示缓存命中率、压缩阈值只能退化为估算。
     include_usage: bool = true,
     extra_headers: []const HeaderKV = &.{},
-    /// 思考强度："" 不发 / "off" / "low" / "high" / "max"
+    /// 思考强度："" 不发 / "off" / "low" / "high" / "max"（off 的表达方式见 reasoning_off_none）
     reasoning_effort: []const u8 = "",
+    /// off 的表达方式：true = 发 reasoning_effort:"none"；false = 不发送该字段
+    /// （能力表数据：部分模型（如 qwen 系）只接受显式的 none 才算关闭思考）
+    reasoning_off_none: bool = false,
     /// DeepSeek 系：额外发 thinking:{type} 开关（直连 deepseek.com 或 deepseek 预设）
     deepseek_thinking: bool = false,
 };
@@ -249,12 +252,31 @@ const WidthOverridesJson = struct {
 const ConfigJson = struct {
     providers: []const ProviderJson = &.{},
     current: CurrentJson = .{},
-    /// 全局思考强度：` / off / low / high / max
+    /// 全局思考强度（未在 thinking_by_model 里指定的模型用这个）：` / off / low / high / max
     thinking: []const u8 = "",
+    /// 每模型思考强度记忆：key = "provider/model"，value = 档位
+    thinking_by_model: []const ThinkingByModelJson = &.{},
+    /// 模型能力用户覆盖：按 "provider/model" 或 "model" 键（用户优先级最高）
+    model_overrides: []const ModelOverrideJson = &.{},
     /// 模糊宽度策略（①←≤…等 EAW=Ambiguous 字符）："" = auto / wide / narrow
     ambiguous_width: []const u8 = "",
     /// 用户宽度覆盖名单（在策略之外按字符覆盖）
     width_overrides: WidthOverridesJson = .{},
+};
+
+const ThinkingByModelJson = struct {
+    provider: []const u8 = "",
+    model: []const u8 = "",
+    thinking: []const u8 = "",
+};
+
+const ModelOverrideJson = struct {
+    provider: []const u8 = "",
+    model: []const u8 = "",
+    /// 覆盖上下文窗口（0 = 不覆盖）
+    context_window: u64 = 0,
+    /// 覆盖可用档位（空 = 不覆盖）
+    efforts: []const []const u8 = &.{},
 };
 
 /// 新增/更新提供商用的字段集合
@@ -305,10 +327,25 @@ const SaveWidthOverrides = struct {
     narrow: ?[]const u8 = null,
 };
 
+const SaveThinkingByModel = struct {
+    provider: []const u8 = "",
+    model: []const u8,
+    thinking: []const u8,
+};
+
+const SaveModelOverride = struct {
+    provider: []const u8 = "",
+    model: []const u8,
+    context_window: ?u64 = null,
+    efforts: ?[]const []const u8 = null,
+};
+
 const SaveConfig = struct {
     providers: []const SaveProvider,
     current: SaveCurrent,
     thinking: ?[]const u8 = null,
+    thinking_by_model: ?[]const SaveThinkingByModel = null,
+    model_overrides: ?[]const SaveModelOverride = null,
     ambiguous_width: ?[]const u8 = null,
     width_overrides: ?SaveWidthOverrides = null,
 };
@@ -382,6 +419,97 @@ pub const Config = struct {
     width_overrides_narrow: []u8 = &.{},
     /// 配置文件保存路径（loadFile 记录；空 = cwd/config.json）
     save_path: []u8 = &.{},
+    /// 每模型思考强度记忆：key = "provider/model"（provider 为预设 id；未知时仅 "model"）
+    thinking_by_model: std.StringArrayHashMapUnmanaged([]u8) = .empty,
+    /// 模型能力用户覆盖：key 同上（最高优先级）
+    model_overrides: std.StringArrayHashMapUnmanaged(ModelOverride) = .empty,
+
+    /// 模型能力用户覆盖（config.json 的 model_overrides）
+    pub const ModelOverride = struct {
+        /// 覆盖上下文窗口（0 = 不覆盖）
+        context_window: u64 = 0,
+        /// 覆盖可用档位（空格分隔原文；用于保存）
+        efforts: []u8 = &.{},
+        /// 解析后的档位列表（含 off；元素指向 efforts 内的切片；load 时解析）
+        levels: [8][]const u8 = undefined,
+        levels_len: usize = 0,
+
+        pub fn deinit(self: *ModelOverride, allocator: Allocator) void {
+            allocator.free(self.efforts);
+            self.efforts = &.{};
+            self.levels_len = 0;
+        }
+
+        /// 档位列表（含 off）
+        pub fn levelsSlice(self: *const ModelOverride) []const []const u8 {
+            return self.levels[0..self.levels_len];
+        }
+
+        /// 解析 efforts 到 levels（load 时调用一次；efforts 之后不再变更）
+        fn parseLevels(self: *ModelOverride) void {
+            self.levels[0] = "off";
+            var n: usize = 1;
+            var it = std.mem.tokenizeScalar(u8, self.efforts, ' ');
+            while (it.next()) |tok| {
+                if (n >= self.levels.len) break;
+                if (std.mem.eql(u8, tok, "off")) continue;
+                self.levels[n] = tok;
+                n += 1;
+            }
+            self.levels_len = n;
+        }
+    };
+
+    /// 取每模型思考强度（先查 "provider/model"，再查 "model"）；未命中返回空串
+    pub fn thinkingFor(self: *const Config, provider: []const u8, model: []const u8) []const u8 {
+        if (model.len == 0) return "";
+        var buf: [512]u8 = undefined;
+        if (provider.len > 0) {
+            if (std.fmt.bufPrint(&buf, "{s}/{s}", .{ provider, model })) |k| {
+                if (self.thinking_by_model.get(k)) |v| return v;
+            } else |_| {}
+        }
+        if (self.thinking_by_model.get(model)) |v| return v;
+        return "";
+    }
+
+    /// 写入每模型思考强度（provider 非空时用 "provider/model" 键）
+    pub fn setThinkingFor(self: *Config, allocator: Allocator, provider: []const u8, model: []const u8, value: []const u8) void {
+        if (model.len == 0) return;
+        var buf: [512]u8 = undefined;
+        const key = if (provider.len > 0)
+            (std.fmt.bufPrint(&buf, "{s}/{s}", .{ provider, model }) catch return)
+        else
+            model;
+        const copy = allocator.dupe(u8, value) catch return;
+        const gop = self.thinking_by_model.getOrPut(allocator, key) catch {
+            allocator.free(copy);
+            return;
+        };
+        if (gop.found_existing) {
+            allocator.free(gop.value_ptr.*);
+        } else {
+            gop.key_ptr.* = allocator.dupe(u8, key) catch {
+                _ = self.thinking_by_model.swapRemove(key);
+                allocator.free(copy);
+                return;
+            };
+        }
+        gop.value_ptr.* = copy;
+    }
+
+    /// 取模型能力用户覆盖（先查 "provider/model"，再查 "model"）；未命中返回 null
+    pub fn modelOverride(self: *Config, provider: []const u8, model: []const u8) ?*const ModelOverride {
+        if (model.len == 0) return null;
+        var buf: [512]u8 = undefined;
+        if (provider.len > 0) {
+            if (std.fmt.bufPrint(&buf, "{s}/{s}", .{ provider, model })) |k| {
+                if (self.model_overrides.getPtr(k)) |v| return v;
+            } else |_| {}
+        }
+        if (self.model_overrides.getPtr(model)) |v| return v;
+        return null;
+    }
 
     /// 加载配置并记录保存路径（供 save 写回同一位置）
     pub fn load(self: *Config, io: Io, allocator: Allocator) void {
@@ -455,6 +583,42 @@ pub const Config = struct {
             }
             if (v.thinking.len > 0) {
                 self.setThinking(allocator, v.thinking);
+            }
+            // 每模型档位记忆
+            for (v.thinking_by_model) |tm| {
+                if (tm.model.len == 0 or tm.thinking.len == 0) continue;
+                self.setThinkingFor(allocator, tm.provider, tm.model, tm.thinking);
+            }
+            // 用户模型覆盖（上下文/档位）
+            for (v.model_overrides) |mo| {
+                if (mo.model.len == 0) continue;
+                var joined: []u8 = &.{};
+                if (mo.efforts.len > 0) {
+                    joined = std.mem.join(allocator, " ", mo.efforts) catch continue;
+                }
+                var key_buf: [512]u8 = undefined;
+                const key = if (mo.provider.len > 0)
+                    (std.fmt.bufPrint(&key_buf, "{s}/{s}", .{ mo.provider, mo.model }) catch {
+                        allocator.free(joined);
+                        continue;
+                    })
+                else
+                    mo.model;
+                const gop = self.model_overrides.getOrPut(allocator, key) catch {
+                    allocator.free(joined);
+                    continue;
+                };
+                if (gop.found_existing) {
+                    allocator.free(gop.value_ptr.efforts);
+                } else {
+                    gop.key_ptr.* = allocator.dupe(u8, key) catch {
+                        _ = self.model_overrides.swapRemove(key);
+                        allocator.free(joined);
+                        continue;
+                    };
+                }
+                gop.value_ptr.* = .{ .context_window = mo.context_window, .efforts = joined };
+                gop.value_ptr.parseLevels();
             }
         }
     }
@@ -574,6 +738,53 @@ pub const Config = struct {
             }) catch return;
         }
 
+        // 每模型档位记忆（key "provider/model" 或 "model" 拆回两字段存储）
+        var tbm_list = std.ArrayListUnmanaged(SaveThinkingByModel){ .items = &.{}, .capacity = 0 };
+        defer tbm_list.deinit(allocator);
+        for (self.thinking_by_model.keys(), self.thinking_by_model.values()) |k, v| {
+            if (v.len == 0) continue;
+            const slash = std.mem.indexOfScalar(u8, k, '/');
+            tbm_list.append(allocator, .{
+                .provider = if (slash) |i| k[0..i] else "",
+                .model = if (slash) |i| k[i + 1 ..] else k,
+                .thinking = v,
+            }) catch return;
+        }
+
+        // 用户模型覆盖（efforts 字符串拆成数组）
+        var mo_list = std.ArrayListUnmanaged(SaveModelOverride){ .items = &.{}, .capacity = 0 };
+        var mo_effort_lists = std.ArrayListUnmanaged([]const []const u8){ .items = &.{}, .capacity = 0 };
+        defer {
+            for (mo_effort_lists.items) |el| allocator.free(el);
+            mo_effort_lists.deinit(allocator);
+            mo_list.deinit(allocator);
+        }
+        for (self.model_overrides.keys(), self.model_overrides.values()) |k, ov| {
+            if (ov.context_window == 0 and ov.efforts.len == 0) continue;
+            var efforts_arr: ?[]const []const u8 = null;
+            if (ov.efforts.len > 0) {
+                var list = std.ArrayListUnmanaged([]const u8){ .items = &.{}, .capacity = 0 };
+                var tok = std.mem.tokenizeScalar(u8, ov.efforts, ' ');
+                while (tok.next()) |t| list.append(allocator, t) catch {
+                    allocator.free(list.items);
+                    return;
+                };
+                const owned = list.toOwnedSlice(allocator) catch return;
+                mo_effort_lists.append(allocator, owned) catch {
+                    allocator.free(owned);
+                    return;
+                };
+                efforts_arr = owned;
+            }
+            const slash = std.mem.indexOfScalar(u8, k, '/');
+            mo_list.append(allocator, .{
+                .provider = if (slash) |i| k[0..i] else "",
+                .model = if (slash) |i| k[i + 1 ..] else k,
+                .context_window = if (ov.context_window > 0) ov.context_window else null,
+                .efforts = efforts_arr,
+            }) catch return;
+        }
+
         var stringify: std.json.Stringify = .{
             .writer = &out.writer,
             .options = .{ .whitespace = .indent_2, .emit_null_optional_fields = false },
@@ -585,6 +796,8 @@ pub const Config = struct {
                 .model = self.current_model,
             },
             .thinking = if (self.thinking.len > 0) self.thinking else null,
+            .thinking_by_model = if (tbm_list.items.len > 0) tbm_list.items else null,
+            .model_overrides = if (mo_list.items.len > 0) mo_list.items else null,
             .ambiguous_width = if (self.ambiguous_width.len > 0) self.ambiguous_width else null,
             .width_overrides = if (self.width_overrides_wide.len > 0 or self.width_overrides_narrow.len > 0)
                 .{
@@ -627,6 +840,14 @@ pub const Config = struct {
         self.width_overrides_narrow = &.{};
         allocator.free(self.save_path);
         self.save_path = &.{};
+        for (self.thinking_by_model.keys()) |k| allocator.free(k);
+        for (self.thinking_by_model.values()) |v| allocator.free(v);
+        self.thinking_by_model.deinit(allocator);
+        self.thinking_by_model = .empty;
+        for (self.model_overrides.keys()) |k| allocator.free(k);
+        for (self.model_overrides.values()) |*v| v.deinit(allocator);
+        self.model_overrides.deinit(allocator);
+        self.model_overrides = .empty;
     }
 };
 
@@ -814,4 +1035,65 @@ test "config：width_overrides 解析与设置" {
     cfg.setWidthOverridesNarrow(allocator, parsed.value.width_overrides.narrow);
     try std.testing.expectEqualStrings("U+2460-U+249B", cfg.width_overrides_wide);
     try std.testing.expectEqualStrings("— →", cfg.width_overrides_narrow);
+}
+
+test "config：每模型档位记忆与用户覆盖（读→查→写往返）" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    const json =
+        \\{
+        \\  "providers": [{"name": "p1", "endpoint": "https://x/v1", "api_key": "k", "preset": "opencode-go"}],
+        \\  "current": {"provider": "p1", "model": "mimo-v2.6-flash"},
+        \\  "thinking": "high",
+        \\  "thinking_by_model": [
+        \\    {"provider": "opencode-go", "model": "mimo-v2.6-flash", "thinking": "low"},
+        \\    {"model": "global-model", "thinking": "max"}
+        \\  ],
+        \\  "model_overrides": [
+        \\    {"provider": "opencode-go", "model": "mimo-v2.6-flash", "context_window": 262144, "efforts": ["low", "medium"]},
+        \\    {"model": "some-model", "efforts": ["high", "xhigh"]}
+        \\  ]
+        \\}
+    ;
+    const path = "skynet_test_config_roundtrip.json";
+    Io.Dir.cwd().deleteFile(io, path) catch {};
+    {
+        const f = try Io.Dir.cwd().createFile(io, path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, json);
+    }
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var cfg = Config{};
+    defer cfg.deinit(allocator);
+    cfg.loadFile(io, allocator, path, false);
+
+    // 每模型档位：精确键命中；全局键回退；无键空
+    try std.testing.expectEqualStrings("low", cfg.thinkingFor("opencode-go", "mimo-v2.6-flash"));
+    try std.testing.expectEqualStrings("max", cfg.thinkingFor("", "global-model"));
+    try std.testing.expectEqualStrings("", cfg.thinkingFor("", "unknown-model"));
+
+    // 用户覆盖：context + levels 解析
+    const ov = cfg.modelOverride("opencode-go", "mimo-v2.6-flash").?;
+    try std.testing.expectEqual(@as(u64, 262144), ov.context_window);
+    try std.testing.expectEqual(@as(usize, 3), ov.levels_len); // off + low + medium
+    try std.testing.expectEqualStrings("off", ov.levelsSlice()[0]);
+    try std.testing.expectEqualStrings("medium", ov.levelsSlice()[2]);
+    const ov2 = cfg.modelOverride("", "some-model").?;
+    try std.testing.expectEqual(@as(usize, 3), ov2.levels_len);
+
+    // 写回 → 重新加载 → 数据仍在（往返）
+    cfg.setThinkingFor(allocator, "opencode-go", "other-model", "max");
+    cfg.save(io, allocator);
+    var cfg2 = Config{};
+    defer cfg2.deinit(allocator);
+    cfg2.loadFile(io, allocator, path, false);
+    try std.testing.expectEqualStrings("max", cfg2.thinkingFor("opencode-go", "other-model"));
+    try std.testing.expectEqualStrings("low", cfg2.thinkingFor("opencode-go", "mimo-v2.6-flash"));
+    const ov3 = cfg2.modelOverride("opencode-go", "mimo-v2.6-flash").?;
+    try std.testing.expectEqual(@as(u64, 262144), ov3.context_window);
 }

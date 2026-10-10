@@ -105,6 +105,10 @@ pub fn buildRequestBody(
     // （DeepSeek 有效档位 high/max，关闭用 thinking.type=disabled）
     if (behavior.reasoning_effort.len > 0) {
         if (std.mem.eql(u8, behavior.reasoning_effort, "off")) {
+            // off 的表达方式由能力表决定：部分模型（qwen 系等）只接受显式 none 才算关闭
+            if (behavior.reasoning_off_none) {
+                try root.put(a, "reasoning_effort", .{ .string = "none" });
+            }
             if (behavior.deepseek_thinking) {
                 var thinking = std.json.ObjectMap{};
                 try thinking.put(a, "type", .{ .string = "disabled" });
@@ -1089,6 +1093,14 @@ test "请求体：思考强度（reasoning_effort / deepseek thinking）" {
     defer std.testing.allocator.free(b4);
     try std.testing.expect(std.mem.indexOf(u8, b4, "thinking") == null);
     try std.testing.expect(std.mem.indexOf(u8, b4, "reasoning_effort") == null);
+
+    // off + off_none（能力表：qwen 系等只认显式 none）→ 发 reasoning_effort:"none"
+    const b5 = try buildRequestBody(std.testing.allocator, "m", &messages, &.{}, "", .{
+        .reasoning_effort = "off",
+        .reasoning_off_none = true,
+    });
+    defer std.testing.allocator.free(b5);
+    try std.testing.expect(std.mem.indexOf(u8, b5, "\"reasoning_effort\":\"none\"") != null);
 }
 
 test "SSE 解析：usage 缓存字段（三家命名）" {

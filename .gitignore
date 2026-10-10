@@ -11,3 +11,4 @@ skynet*.db*
 config.json
 test/*.running
 data/
+models_dev_api.json

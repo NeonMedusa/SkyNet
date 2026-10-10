@@ -1,0 +1,62 @@
+{
+  "_comment": "模型能力表修正层：人工/AI 实测维护，永远优先于 models.dev 拉取数据。规则：按 provider+model 精确匹配；efforts 为 null 表示不改动；ctx 为 null 表示不改动。",
+  "_verified": "2026-10-09 实测（opencode zen/go，curl 直发 reasoning_effort 探测）",
+  "corrections": [
+    {
+      "provider": "opencode-go",
+      "model": "mimo-v2.6-flash",
+      "ctx": 1048576,
+      "efforts": ["low", "high"],
+      "note": "实测 max=400（Invalid request parameters）；high/low/medium=200。models.dev 无数据，同模型其他网关数据无 max 佐证"
+    },
+    {
+      "provider": "opencode-go",
+      "model": "mimo-v2.5-pro",
+      "ctx": 1048576,
+      "efforts": ["low", "high"],
+      "note": "实测 max=400；high/low/medium=200"
+    },
+    {
+      "provider": "opencode-go",
+      "model": "mimo-v2.6-pro",
+      "ctx": 1048576,
+      "efforts": ["low", "high"],
+      "note": "实测 max=400；high/low/medium=200"
+    },
+    {
+      "provider": "opencode-go",
+      "model": "mimo-v2.5",
+      "ctx": 1048576,
+      "efforts": ["low", "high", "max"],
+      "note": "实测 max=200（与其他 mimo 不同！）；high/low/medium=200"
+    },
+    {
+      "provider": "opencode-go",
+      "model": "qwen3.7-plus",
+      "ctx": 1000000,
+      "efforts": ["low", "high"],
+      "note": "实测 max=400（must be one of none/minimal/low/medium/high/xhigh）；low/high/medium=200"
+    },
+    {
+      "provider": "opencode-go",
+      "model": "qwen3.6-plus",
+      "ctx": 1000000,
+      "efforts": ["low", "high"],
+      "note": "实测 max=400（invalid_value: none/minimum/low/medium/high/xhigh）；low/high/medium=200"
+    },
+    {
+      "provider": "opencode-go",
+      "model": "qwen3.8-max",
+      "ctx": 1000000,
+      "efforts": ["low", "high", "max"],
+      "note": "实测 max=200、high=200（models.dev 记录为 low/medium/xhigh，不符；以实测为准）"
+    },
+    {
+      "provider": "opencode-go",
+      "model": "deepseek-v4.1-flash",
+      "ctx": 1000000,
+      "efforts": ["low", "high", "max"],
+      "note": "实测 max=200；与 models.dev 一致，显式记录防回退"
+    }
+  ]
+}

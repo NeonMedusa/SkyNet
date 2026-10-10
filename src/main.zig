@@ -14,6 +14,7 @@ const cli = @import("cli_args.zig");
 const Log = @import("log.zig");
 const paths = @import("paths.zig");
 const display_mod = @import("display.zig");
+const model_table = @import("model_table.zig");
 
 // 显示文本纯函数（display.zig）——保留短名，避免大范围改调用点
 const toolBlockKind = display_mod.toolBlockKind;
@@ -121,22 +122,116 @@ const help_commands = [_]HelpCommand{
     .{ .name = "exit", .desc = "退出程序" },
 };
 
-/// 合法思考强度（"" 表示默认不发送）
+/// 合法思考强度（"" 表示默认不发送；表外模型也允许这些常见档位）
 fn isThinkingLevel(s: []const u8) bool {
-    const known = [_][]const u8{ "off", "low", "high", "max" };
+    const known = [_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh", "max" };
     for (known) |k| {
         if (std.mem.eql(u8, s, k)) return true;
     }
     return false;
 }
 
-/// 思考强度候选（DeepSeek flash 支持 low；其余给 off/high/max）
-const thinking_levels_base = [_][]const u8{ "off", "high", "max" };
-const thinking_levels_flash = [_][]const u8{ "off", "low", "high", "max" };
+/// 未知模型的档位全集（全档位可选：表外模型让用户自行尝试；菜单会加提示）
+const thinking_levels_unknown = [_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh", "max" };
 
-fn thinkingLevelsFor(model: []const u8) []const []const u8 {
-    if (std.ascii.indexOfIgnoreCase(model, "flash") != null) return &thinking_levels_flash;
-    return &thinking_levels_base;
+/// 模型档位解析结果（供菜单/钳制/发送使用）
+pub const ThinkingInfo = struct {
+    /// 可选项（含 off；toggle 型为 off/high——high 即"开"）
+    levels: []const []const u8,
+    /// 是否命中能力表（false = 未知模型：菜单提示自行尝试，发送不钳制）
+    known: bool,
+    /// off 的表达方式：true = 发 reasoning_effort:"none"；false = 不发送该字段
+    off_none: bool = false,
+};
+
+/// 当前档位取值结果
+const ThinkingChoice = struct { level: []const u8, explicit: bool };
+
+/// provider 的能力表键：预设 id（自定义 provider 为空 → 表查找要求模型名全局唯一）
+fn providerTableId(prov: ?*const config_mod.Provider) []const u8 {
+    const p = prov orelse return "";
+    return p.preset;
+}
+
+/// 模型档位解析：用户覆盖（config.model_overrides）> 能力表 > 未知全集
+fn thinkingInfoFor(config: *config_mod.Config, preset: []const u8, model: []const u8) ThinkingInfo {
+    if (config.modelOverride(preset, model)) |ov| {
+        if (ov.levels_len > 0) {
+            return .{ .levels = ov.levelsSlice(), .known = true, .off_none = false };
+        }
+    }
+    const e = model_table.lookup(preset, model) orelse
+        return .{ .levels = &thinking_levels_unknown, .known = false, .off_none = false };
+    return .{ .levels = e.levels, .known = true, .off_none = e.off_none };
+}
+
+/// 全局默认档位解析到具体模型：全局值在该模型可用集内 → 原样；否则取表内最高档
+/// （"未选过强度的模型默认用它支持的最高档"；未知模型原样放行）。
+/// 显示与发送共用此函数，保证两者一致。
+fn resolveDefaultThinking(config: *config_mod.Config, preset: []const u8, model: []const u8, global: []const u8) []const u8 {
+    if (global.len == 0) return "";
+    const info = thinkingInfoFor(config, preset, model);
+    if (!info.known) return global;
+    for (info.levels) |lv| {
+        if (std.mem.eql(u8, lv, global)) return global;
+    }
+    // 取该模型支持的最高档（档序中的最后一个；跳过 off——"默认档"不应解析为关闭）
+    const order = [_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh", "max" };
+    var i = order.len;
+    while (i > 0) {
+        i -= 1;
+        for (info.levels) |lv| {
+            if (std.mem.eql(u8, lv, order[i])) return lv;
+        }
+    }
+    return "off";
+}
+
+/// 发送前钳制（仅用于"全局默认档位"场景）：不在可用集时降档
+/// （先往高找、再往低找）。未知模型不钳制（放行，用户自试）。
+fn clampThinking(config: *config_mod.Config, preset: []const u8, model: []const u8, level: []const u8) []const u8 {
+    if (level.len == 0) return "";
+    const info = thinkingInfoFor(config, preset, model);
+    if (!info.known) return level;
+    for (info.levels) |lv| {
+        if (std.mem.eql(u8, lv, level)) return level;
+    }
+    const order = [_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh", "max" };
+    var start: usize = 0;
+    for (order, 0..) |o, i| {
+        if (std.mem.eql(u8, o, level)) {
+            start = i;
+            break;
+        }
+    }
+    var i = start;
+    while (i < order.len) : (i += 1) {
+        for (info.levels) |lv| {
+            if (std.mem.eql(u8, lv, order[i])) return lv;
+        }
+    }
+    i = start;
+    while (i > 0) {
+        i -= 1;
+        for (info.levels) |lv| {
+            if (std.mem.eql(u8, lv, order[i])) return lv;
+        }
+    }
+    return "off";
+}
+
+/// 上下文窗口解析：模型级覆盖 > provider 级覆盖 > 能力表 > 默认 128k
+fn resolveContextWindow(config: *config_mod.Config, preset: []const u8, model: []const u8, provider_opt: u64) u64 {
+    if (config.modelOverride(preset, model)) |ov| {
+        if (ov.context_window > 0) return ov.context_window;
+    }
+    if (provider_opt > 0) return provider_opt;
+    if (model.len > 0) {
+        if (model_table.lookup(preset, model)) |e| {
+            if (e.ctx > 0) return e.ctx;
+        }
+    }
+    return 131_072;
 }
 
 fn firstToken(s: []const u8) []const u8 {
@@ -708,6 +803,8 @@ const AppState = struct {
     // 上下文压缩（compaction）
     /// 上下文窗口覆盖（0 = 用 provider 配置/启发式；CLI --max-context 用）
     context_window_override: u64 = 0,
+    /// 思考强度一次性覆盖（CLI -thinking 用；空 = 不覆盖，优先于每模型记忆）
+    thinking_override: []const u8 = &.{},
     /// 自动压缩触发阈值（窗口百分比；0 = 关闭），将来可考虑做成可配置项
     auto_compact_pct: u64 = 90,
     /// 压缩时保留的最近 token 数
@@ -1251,7 +1348,9 @@ const AppState = struct {
     /// 空闲时检测其他进程（如 CLI）写入当前会话的新消息并增量追加（外部聊天实时可见）。
     /// 用 SQLite data_version 判断外部提交，避免每帧都查消息表。
     fn pollExternalUpdates(self: *AppState) void {
-        if (self.isStreaming()) return;
+        // 生成中/压缩中不轮询：本进程 worker 的独立连接写入同样会推进 data_version，
+        // 轮询会把"自家写入"误判为外部更新（压缩时还会误报"外部压缩"）
+        if (self.isStreaming() or self.isCompacting()) return;
         const db = if (self.db) |*d| d else return;
 
         const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
@@ -1262,10 +1361,14 @@ const AppState = struct {
         if (dv == self.db_data_version) return;
         self.db_data_version = dv;
 
-        // 外部进程做了压缩：history 结构已变，整会话重载
+        // 外部进程做了压缩：history 结构已变，整会话重载。
+        // 只认"出现更新的 checkpoint"（cp_id > 上次）：cp_id 变小/归零只可能是
+        // 会话切换后游标未同步的残留状态，重载反而会打断用户（历史 bug：
+        // newSession 未复位游标 → 新会话首轮结束被误判为"外部压缩"）。
         const cp = db.latestCompaction(self.session_id) catch null;
         const cp_id = if (cp) |c| c.id else 0;
-        if (cp_id != self.last_compaction_id) {
+        if (cp_id > self.last_compaction_id) {
+            Log.warn(.db, "外部压缩检测：cp_id={d} 上次={d}，整会话重载", .{ cp_id, self.last_compaction_id });
             self.last_compaction_id = cp_id;
             self.clearHistory();
             self.clearDisplay();
@@ -1289,11 +1392,10 @@ const AppState = struct {
     /// 有效上下文窗口：CLI 覆盖 > provider 配置 > 模型名启发式
     fn contextWindowCurrent(self: *AppState) u64 {
         if (self.context_window_override > 0) return self.context_window_override;
-        if (self.currentProvider()) |p| {
-            if (p.opt_context_window > 0) return p.opt_context_window;
-        }
         const model = self.currentModel();
-        return if (model.len > 0) modelContextWindow(model) else 131_072;
+        const prov = self.currentProvider();
+        const popt: u64 = if (prov) |p| p.opt_context_window else 0;
+        return resolveContextWindow(&self.config, providerTableId(prov), model, popt);
     }
 
     /// 估算当前请求 token（仅用于压缩决策/确认框展示；状态栏显示用服务端真实值）。
@@ -2663,6 +2765,12 @@ const AppState = struct {
         self.clearDisplay();
         self.clearPendingSends();
         self.last_seen_msg_id = 0;
+        // 新会话无 compaction：复位 checkpoint 游标（否则首轮结束后，worker 落库
+        // 引起 data_version 变化 → 外部轮询把"cp_id=0 ≠ 旧会话 id"误判为外部压缩，
+        // 整会话重载并弹错提示）。窗口化游标一并复位，避免沿用旧会话的裁剪偏移。
+        self.last_compaction_id = 0;
+        self.trimmed_above = 0;
+        self.tail_has_more = false;
         const sid = db.createSession("") catch {
             self.addMessage("新建会话失败", .{ .fg = .red });
             return;
@@ -2776,24 +2884,61 @@ const AppState = struct {
         self.startCompaction(keep_tokens);
     }
 
-    /// 应用思考强度（persist=true 时写入 config.json；测试用 false）。
-    /// 右上角弹一个 2 秒的悬浮通知。
+    /// 当前思考强度：CLI 一次性覆盖 > 每模型记忆 > 全局默认（按能力表解析到该模型
+    /// 支持的最高档位——全局值不被支持时显示与发送保持一致，不再"继承"不可用档）。
+    /// explicit = 用户显式设置过（发送时不钳制，尊重用户选择）
+    fn currentThinkingEx(self: *AppState) ThinkingChoice {
+        if (self.thinking_override.len > 0) return .{ .level = self.thinking_override, .explicit = true };
+        const model = self.currentModel();
+        const pid = providerTableId(self.currentProvider());
+        const per = self.config.thinkingFor(pid, model);
+        if (per.len > 0) return .{ .level = per, .explicit = true };
+        return .{ .level = resolveDefaultThinking(&self.config, pid, model, self.config.thinking), .explicit = false };
+    }
+
+    /// 应用思考强度（写每模型记忆；persist=true 时写入 config.json）。
+    /// 右上角弹一个 2 秒的悬浮通知；档位不在能力表时附加提示。
     fn applyThinking(self: *AppState, value: []const u8, persist: bool) void {
-        self.config.setThinking(self.allocator, value);
+        const model = self.currentModel();
+        const pid = providerTableId(self.currentProvider());
+        if (model.len > 0) {
+            self.config.setThinkingFor(self.allocator, pid, model, value);
+        } else {
+            self.config.setThinking(self.allocator, value);
+        }
         if (persist) self.config.save(self.io, self.allocator);
-        var buf: [64]u8 = undefined;
+        var buf: [96]u8 = undefined;
         const label = if (value.len == 0) "未设置" else value;
-        if (std.fmt.bufPrint(&buf, "思考强度: {s}", .{label})) |msg| {
-            self.setToast(msg);
-        } else |_| {}
+        const info = thinkingInfoFor(&self.config, pid, model);
+        var miss = false;
+        if (info.known and value.len > 0) {
+            miss = true;
+            for (info.levels) |lv| {
+                if (std.mem.eql(u8, lv, value)) {
+                    miss = false;
+                    break;
+                }
+            }
+        }
+        if (miss) {
+            if (std.fmt.bufPrint(&buf, "思考强度: {s}（能力表中无此档位，可能报错）", .{label})) |msg| {
+                self.setToast(msg);
+            } else |_| {}
+        } else {
+            if (std.fmt.bufPrint(&buf, "思考强度: {s}", .{label})) |msg| {
+                self.setToast(msg);
+            } else |_| {}
+        }
     }
 
     /// 打开思考强度选单（parent 非空时 Esc 返回该菜单）
     fn openThinkingSelect(self: *AppState, parent: ?Mode) void {
-        const levels = thinkingLevelsFor(self.currentModel());
+        const pid = providerTableId(self.currentProvider());
+        const info = thinkingInfoFor(&self.config, pid, self.currentModel());
+        const cur = self.currentThinkingEx().level;
         self.thinking_select_index = 0;
-        for (levels, 0..) |lv, i| {
-            if (std.mem.eql(u8, lv, self.config.thinking)) {
+        for (info.levels, 0..) |lv, i| {
+            if (std.mem.eql(u8, lv, cur)) {
                 self.thinking_select_index = i;
                 break;
             }
@@ -2803,7 +2948,8 @@ const AppState = struct {
     }
 
     fn handleThinkingSelectKey(self: *AppState, key: tui.KeyEvent) void {
-        const levels = thinkingLevelsFor(self.currentModel());
+        const pid = providerTableId(self.currentProvider());
+        const levels = thinkingInfoFor(&self.config, pid, self.currentModel()).levels;
         const total = levels.len;
         switch (key.code) {
             .up => {
@@ -3852,8 +3998,16 @@ const AppState = struct {
         job.provider_name = try arena.dupe(u8, provider.name);
         job.session_id = try arena.dupe(u8, self.sessionUuid());
         job.behavior = config_mod.behavior(provider);
-        // 思考强度是全局设置：拷进 job arena，避免主线程改动导致悬空
-        job.behavior.reasoning_effort = try arena.dupe(u8, self.config.thinking);
+        // 思考强度：每模型记忆优先（显式设置尊重用户，原样发送）；全局默认则先解析到
+        // 该模型支持的档位（显示与发送一致），再钳制兜底。
+        // 拷进 job arena，避免主线程改动导致悬空。
+        const think = self.currentThinkingEx();
+        const eff = if (think.explicit)
+            think.level
+        else
+            clampThinking(&self.config, provider.preset, model, think.level);
+        job.behavior.reasoning_effort = try arena.dupe(u8, eff);
+        job.behavior.reasoning_off_none = thinkingInfoFor(&self.config, provider.preset, model).off_none;
         job.environ_map = self.environ_map;
         // worker 自建连接时用实际打开的库路径（测试/CLI 可能不是默认路径）
         const db_path: []const u8 = if (self.db) |*d| d.path else self.db_path;
@@ -4193,6 +4347,12 @@ const AppState = struct {
         }) catch return null;
         const idx = self.messages.items.len - 1;
         self.streaming_msg_idx = idx;
+        // 诊断：记录流式消息创建时刻（回合开始后 ms）——增量是否"迟到最后才来"
+        // （如网关/代理缓冲 SSE）可由本行与"回合结束"行的间隔判断
+        if (self.stream_start_ms > 0) {
+            const dt = std.Io.Timestamp.now(self.io, .awake).toMilliseconds() - self.stream_start_ms;
+            Log.info(.stream, "流式消息创建（回合开始后 {d}ms）", .{dt});
+        }
         // 锚点模型：新空消息在末尾，不影响锚点指向的视口内容
         return idx;
     }
@@ -4369,6 +4529,11 @@ const AppState = struct {
         const msg = &self.messages.items[idx];
 
         const first_content = msg.content.len == 0;
+        // 诊断：首块正文到达时刻（回合开始后 ms）——判断流式是否被上游/代理缓冲
+        if (first_content and self.stream_start_ms > 0) {
+            const dt = std.Io.Timestamp.now(self.io, .awake).toMilliseconds() - self.stream_start_ms;
+            Log.info(.stream, "首块正文到达（回合开始后 {d}ms）", .{dt});
+        }
 
         const joined = self.allocator.alloc(u8, msg.content.len + chunk.len) catch return;
         @memcpy(joined[0..msg.content.len], msg.content);
@@ -4390,6 +4555,11 @@ const AppState = struct {
         const msg = &self.messages.items[idx];
 
         const first_reasoning = msg.reasoning == null;
+        // 诊断：首块思考到达时刻（回合开始后 ms）
+        if (first_reasoning and self.stream_start_ms > 0) {
+            const dt = std.Io.Timestamp.now(self.io, .awake).toMilliseconds() - self.stream_start_ms;
+            Log.info(.stream, "首块思考到达（回合开始后 {d}ms）", .{dt});
+        }
         const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
         if (msg.reasoning == null) msg.reasoning_start_ms = now;
         msg.reasoning_end_ms = now;
@@ -6480,12 +6650,16 @@ fn cmdStats(allocator: Allocator, io: Io, opt: CliOptions) u8 {
     config.loadFile(io, allocator, cfg_path, opt.config_path.len == 0);
     defer config.deinit(allocator);
     const model = config.current_model;
-    var ctx_window: u64 = if (model.len > 0) modelContextWindow(model) else 131_072;
+    var prov_opt: u64 = 0;
+    var preset_id: []const u8 = "";
     for (config.providers.items) |p| {
-        if (std.mem.eql(u8, p.name, config.current_provider_name) and p.opt_context_window > 0) {
-            ctx_window = p.opt_context_window;
+        if (std.mem.eql(u8, p.name, config.current_provider_name)) {
+            prov_opt = p.opt_context_window;
+            preset_id = p.preset;
+            break;
         }
     }
+    const ctx_window: u64 = resolveContextWindow(&config, preset_id, model, prov_opt);
     const pct = contextUsagePercent(request_est, ctx_window);
 
     const title = if (info) |i| i.title else "";
@@ -6848,13 +7022,25 @@ fn cmdAsk(init: std.process.Init, opt: CliOptions) u8 {
     const override_code = cliApplyProviderOverrides(&state, allocator, io, opt);
     if (override_code != 0) return override_code;
 
-    // 思考强度（仅本次请求，不写回配置）
+    // 思考强度（仅本次请求，不写回配置；一次性覆盖，优先于每模型记忆）
     if (opt.thinking.len > 0) {
         if (!isThinkingLevel(opt.thinking)) {
-            cliWriteStderr(io, "thinking 可选: off / low / high / max\n");
+            cliWriteStderr(io, "thinking 可选: off/minimal/low/medium/high/xhigh/max\n");
             return 2;
         }
-        state.config.setThinking(allocator, opt.thinking);
+        state.thinking_override = opt.thinking;
+        // 能力表外档位：提示可能报错（不拦截——用户显式指定，尊重选择）
+        const tinfo = thinkingInfoFor(&state.config, providerTableId(state.currentProvider()), state.currentModel());
+        if (tinfo.known) {
+            var found = false;
+            for (tinfo.levels) |lv| {
+                if (std.mem.eql(u8, lv, opt.thinking)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) cliWriteStderr(io, "提示：该模型能力表中无此档位，可能报错\n");
+        }
     }
 
     // 会话：-new 强制新建；否则按参数解析（latest/空 不存在则新建；数字必须存在）
@@ -7966,34 +8152,6 @@ fn formatCount(buf: []u8, n: u64) []const u8 {
 }
 
 /// 模型上下文窗口大小（/models 不返回该信息，按模型名启发式匹配）
-fn modelContextWindow(model: []const u8) u64 {
-    const Entry = struct { needle: []const u8, ctx: u64 };
-    const table = [_]Entry{
-        .{ .needle = "gpt-4.1", .ctx = 1_047_576 },
-        .{ .needle = "gpt-4o", .ctx = 128_000 },
-        .{ .needle = "gpt-4", .ctx = 128_000 },
-        .{ .needle = "gpt-5", .ctx = 400_000 },
-        .{ .needle = "o3", .ctx = 200_000 },
-        .{ .needle = "o4", .ctx = 200_000 },
-        .{ .needle = "deepseek-v4", .ctx = 1_048_576 },
-        .{ .needle = "deepseek", .ctx = 128_000 },
-        .{ .needle = "kimi", .ctx = 256_000 },
-        .{ .needle = "moonshot", .ctx = 128_000 },
-        .{ .needle = "glm", .ctx = 128_000 },
-        .{ .needle = "qwen", .ctx = 131_072 },
-        .{ .needle = "gemini", .ctx = 1_048_576 },
-        .{ .needle = "grok", .ctx = 256_000 },
-        .{ .needle = "minimax", .ctx = 204_800 },
-        .{ .needle = "llama", .ctx = 131_072 },
-        .{ .needle = "mistral", .ctx = 131_072 },
-        .{ .needle = "claude", .ctx = 200_000 },
-    };
-    for (table) |e| {
-        if (std.ascii.indexOfIgnoreCase(model, e.needle) != null) return e.ctx;
-    }
-    return 131_072;
-}
-
 fn contextUsagePercent(used: u64, ctx: u64) u64 {
     if (ctx == 0) return 0;
     return @min(used * 100 / ctx, 999);
@@ -9019,7 +9177,7 @@ fn drawFrame(state: *AppState, buf: *Buffer) void {
             drawOverlayMenu(state, area, buf, help_commands.len, drawHelpSelect);
             drawCompactConfirmOverlay(state, area, buf);
         },
-        .thinking_select => drawOverlayMenu(state, area, buf, thinkingLevelsFor(state.currentModel()).len, drawThinkingSelect),
+        .thinking_select => drawOverlayMenu(state, area, buf, thinkingMenuRows(state), drawThinkingSelect),
         .preset_select => drawOverlayMenu(state, area, buf, config_mod.presets.len + 1, drawPresetSelect),
         .session_select => drawOverlayMenu(state, area, buf, state.session_list.len + 1, drawSessionSelect),
         .session_confirm => {
@@ -10430,12 +10588,15 @@ fn drawThinkingSelect(state: *AppState, area: Rect, buf: *Buffer) void {
     const inner = blk.inner(area);
     if (inner.height == 0 or inner.width == 0) return;
 
-    const levels = thinkingLevelsFor(state.currentModel());
+    const pid = providerTableId(state.currentProvider());
+    const info = thinkingInfoFor(&state.config, pid, state.currentModel());
+    const levels = info.levels;
+    const cur = state.currentThinkingEx().level;
     var y = inner.y;
     for (levels, 0..) |lv, i| {
         if (y >= inner.y + inner.height) break;
         const is_selected = i == state.thinking_select_index;
-        const is_current = std.mem.eql(u8, lv, state.config.thinking);
+        const is_current = std.mem.eql(u8, lv, cur);
         var prefix: []const u8 = "  ";
         var style: Style = .{ .fg = .white };
         var sub_bg: Style = .{};
@@ -10454,6 +10615,17 @@ fn drawThinkingSelect(state: *AppState, area: Rect, buf: *Buffer) void {
         }
         y += 1;
     }
+    // 未知模型提示（能力表外：全档位可选，需自行尝试）
+    if (!info.known and y < inner.y + inner.height) {
+        _ = drawTextAt(buf, inner.x + 2, y, "（不在能力表中，请自行尝试）", .{ .fg = .dark_gray });
+    }
+}
+
+/// 思考选单的菜单行数（含未知模型提示行）
+fn thinkingMenuRows(state: *AppState) usize {
+    const pid = providerTableId(state.currentProvider());
+    const info = thinkingInfoFor(&state.config, pid, state.currentModel());
+    return info.levels.len + @as(usize, if (info.known) 0 else 1);
 }
 
 fn drawProviderModels(state: *AppState, area: Rect, buf: *Buffer) void {
@@ -11214,7 +11386,7 @@ fn drawInputStatus(state: *AppState, area: Rect, buf: *Buffer) void {
         // 无数据（新会话）时显示 0%；数据来源 = 服务端最近一次真实回传
         const used_tokens = state.context_usage.input_tokens + state.context_usage.output_tokens;
         {
-            const ctx = modelContextWindow(model);
+            const ctx = state.contextWindowCurrent();
             const pct = contextUsagePercent(used_tokens, ctx);
             var b0: [24]u8 = undefined;
             var b1: [24]u8 = undefined;
@@ -11241,9 +11413,10 @@ fn drawInputStatus(state: *AppState, area: Rect, buf: *Buffer) void {
             x = drawStatusSegment(buf, x, end_x, area.y, " · ", .{ .fg = .dark_gray });
             x = drawStatusSegment(buf, x, end_x, area.y, provider_name, .{ .fg = .dark_gray });
         }
-        if (state.config.thinking.len > 0) {
+        const think_now = state.currentThinkingEx().level;
+        if (think_now.len > 0) {
             var tb: [32]u8 = undefined;
-            const text = std.fmt.bufPrint(&tb, " · think:{s}", .{state.config.thinking}) catch "";
+            const text = std.fmt.bufPrint(&tb, " · think:{s}", .{think_now}) catch "";
             if (text.len > 0) {
                 x = drawStatusSegment(buf, x, end_x, area.y, text, .{ .fg = .yellow });
             }
@@ -13150,6 +13323,30 @@ test "外部写入增量刷新：追加新消息且不重复" {
     state.pollExternalUpdates();
     try std.testing.expectEqual(@as(usize, 4), state.history.items.len);
     try std.testing.expectEqualStrings("第二条", state.history.items[3].content);
+
+    // 残留压缩游标（旧会话遗留的高值）不应被误判为"外部压缩"：
+    // cp_id(0) 不大于旧值 → 走增量路径，游标保持（回归：新会话首轮误报外部压缩）
+    state.last_compaction_id = 42;
+    {
+        var other = try db_mod.Db.openFile(alloc, io, db_path);
+        defer other.deinit();
+        _ = try other.insertMessage(.{ .session_id = sid, .role = "user", .content = "第三条" });
+    }
+    state.last_db_poll_ms = 0;
+    state.pollExternalUpdates();
+    try std.testing.expectEqual(@as(usize, 5), state.history.items.len); // 增量追加
+    try std.testing.expectEqual(@as(i64, 42), state.last_compaction_id); // 未被误改
+
+    // 出现更新的 checkpoint → 识别为外部压缩，整载（游标对齐新 id）
+    state.last_compaction_id = 0; // 模拟正常加载后的状态
+    {
+        var other = try db_mod.Db.openFile(alloc, io, db_path);
+        defer other.deinit();
+        _ = try other.insertCompaction(sid, "EXT_SUMMARY", 0, 0, 100, "m");
+    }
+    state.last_db_poll_ms = 0;
+    state.pollExternalUpdates();
+    try std.testing.expect(state.last_compaction_id > 0);
 }
 
 test "集成：compaction（需本地 mock 服务器 127.0.0.1:18125）" {
@@ -13972,24 +14169,56 @@ test "思考强度：选单、设置与候选" {
         state.config.deinit(std.testing.allocator);
     }
 
-    // 候选随模型变化：flash 支持 low
-    try std.testing.expectEqual(@as(usize, 4), thinkingLevelsFor("deepseek-v4.1-flash").len);
-    try std.testing.expectEqual(@as(usize, 3), thinkingLevelsFor("deepseek-v4-pro").len);
+    // 档位合法性（放宽后：xhigh/minimal/medium 也合法）
     try std.testing.expect(isThinkingLevel("max") and isThinkingLevel("low"));
+    try std.testing.expect(isThinkingLevel("xhigh") and isThinkingLevel("medium"));
     try std.testing.expect(!isThinkingLevel("bogus"));
 
-    // 选单：从帮助菜单进入，光标定位到当前值；Esc 返回
+    // 表驱动档位：已知模型命中能力表；未知模型给全集
+    const info_known = thinkingInfoFor(&state.config, "opencode-go", "deepseek-v4.1-flash");
+    try std.testing.expect(info_known.known);
+    try std.testing.expect(info_known.levels.len >= 3); // off + 至少 low/high
+    const info_unknown = thinkingInfoFor(&state.config, "some-provider", "no-such-model");
+    try std.testing.expect(!info_unknown.known);
+    try std.testing.expectEqual(@as(usize, 7), info_unknown.levels.len); // off+minimal+low+medium+high+xhigh+max
+
+    // 钳制：mimo-v2.6-flash 无 max → 降到 high；未知模型放行
+    try std.testing.expectEqualStrings("high", clampThinking(&state.config, "opencode-go", "mimo-v2.6-flash", "max"));
+    try std.testing.expectEqualStrings("max", clampThinking(&state.config, "some-provider", "no-such-model", "max"));
+    // 支持 max 的模型原样保留
+    try std.testing.expectEqualStrings("max", clampThinking(&state.config, "opencode-go", "deepseek-v4.1-flash", "max"));
+
+    // 默认档位解析：全局 max 对 mimo（无 max）→ 该模型最高档 high（显示与发送一致）
+    try std.testing.expectEqualStrings("high", resolveDefaultThinking(&state.config, "opencode-go", "mimo-v2.6-flash", "max"));
+    // 全局档位在模型可用集内 → 原样
+    try std.testing.expectEqualStrings("max", resolveDefaultThinking(&state.config, "opencode-go", "deepseek-v4.1-flash", "max"));
+    try std.testing.expectEqualStrings("low", resolveDefaultThinking(&state.config, "opencode-go", "mimo-v2.6-flash", "low"));
+    // 未知模型原样放行；空全局值保持空
+    try std.testing.expectEqualStrings("max", resolveDefaultThinking(&state.config, "some-provider", "no-such-model", "max"));
+    try std.testing.expectEqualStrings("", resolveDefaultThinking(&state.config, "opencode-go", "mimo-v2.6-flash", ""));
+    // 每模型记忆优先于全局默认（currentThinkingEx 链路）
+    state.config.setCurrentProvider(std.testing.allocator, "mock");
+    state.config.setCurrentModel(std.testing.allocator, "mimo-v2.6-flash");
     state.config.setThinking(std.testing.allocator, "max");
+    state.config.setThinkingFor(std.testing.allocator, "", "mimo-v2.6-flash", "low");
+    const choice = state.currentThinkingEx();
+    try std.testing.expect(choice.explicit);
+    try std.testing.expectEqualStrings("low", choice.level);
+
+    // 选单：从帮助菜单进入，光标定位到当前值；Esc 返回
+    state.config.setCurrentProvider(std.testing.allocator, "mock");
     state.config.setCurrentModel(std.testing.allocator, "deepseek-v4.1-flash");
+    // provider 无预设（preset 空）→ 模型名全局唯一才命中；deepseek-v4.1-flash 出现在多 provider
+    // → 按未知处理（7 项）；全局 max 原样解析 → 光标定位到 max（index 6）
     state.openThinkingSelect(.help_select);
     try std.testing.expectEqual(Mode.thinking_select, state.mode);
-    try std.testing.expectEqual(@as(usize, 3), state.thinking_select_index); // off/low/high/max → max 在下标 3
+    try std.testing.expectEqual(@as(usize, 6), state.thinking_select_index);
     state.handleThinkingSelectKey(.{ .code = .esc });
     try std.testing.expectEqual(Mode.help_select, state.mode);
 
-    // 应用（不落盘）：右上角悬浮通知，不往聊天区刷消息
+    // 应用（不落盘）：每模型记忆 + 右上角悬浮通知，不往聊天区刷消息
     state.applyThinking("high", false);
-    try std.testing.expectEqualStrings("high", state.config.thinking);
+    try std.testing.expectEqualStrings("high", state.config.thinkingFor("", "deepseek-v4.1-flash"));
     try std.testing.expect(state.messages.items.len == 0);
     try std.testing.expect(std.mem.indexOf(u8, state.toast[0..state.toast_len], "思考强度: high") != null);
 }
@@ -15011,8 +15240,15 @@ test "上下文估算：加载会话后即有占用（无需先对话）" {
         state.compact_reasoning_buf.deinit(alloc);
     }
 
-    // 新会话（无 usage 数据）→ 上下文占用归零（不再显示估算值）
+    // 新会话（无 usage 数据）→ 上下文占用归零（不再显示估算值）；
+    // 压缩/窗口化游标一并复位（防外部轮询把"cp_id=0 ≠ 旧会话 id"误判为外部压缩）
+    state.last_compaction_id = 42;
+    state.trimmed_above = 100;
+    state.tail_has_more = true;
     state.newSession();
+    try std.testing.expectEqual(@as(i64, 0), state.last_compaction_id);
+    try std.testing.expectEqual(@as(usize, 0), state.trimmed_above);
+    try std.testing.expect(!state.tail_has_more);
     try std.testing.expectEqual(@as(u64, 0), state.last_usage.input_tokens);
     try std.testing.expectEqual(@as(u64, 0), state.context_usage.input_tokens);
     try std.testing.expect(state.usage_estimated); // 尚无"本轮"真实数据（CLI 契约）
@@ -15466,10 +15702,15 @@ test "env 回退：api_key 为空时读取环境变量" {
 }
 
 test "上下文窗口启发式与百分比" {
-    try std.testing.expectEqual(@as(u64, 1_048_576), modelContextWindow("deepseek-v4.1-flash"));
-    try std.testing.expectEqual(@as(u64, 200_000), modelContextWindow("claude-sonnet-4-5"));
-    try std.testing.expectEqual(@as(u64, 1_047_576), modelContextWindow("gpt-4.1-mini"));
-    try std.testing.expectEqual(@as(u64, 131_072), modelContextWindow("some-local-model"));
+    var config = config_mod.Config{};
+    defer config.deinit(std.testing.allocator);
+    // 能力表命中（预设 id 精确匹配）
+    try std.testing.expectEqual(@as(u64, 1_000_000), resolveContextWindow(&config, "opencode-go", "deepseek-v4.1-flash", 0));
+    try std.testing.expectEqual(@as(u64, 262_144), resolveContextWindow(&config, "moonshot", "kimi-k2.6", 0));
+    // provider 级覆盖优先于表
+    try std.testing.expectEqual(@as(u64, 999_999), resolveContextWindow(&config, "opencode-go", "deepseek-v4.1-flash", 999_999));
+    // 未知模型兜底
+    try std.testing.expectEqual(@as(u64, 131_072), resolveContextWindow(&config, "", "some-local-model", 0));
 
     try std.testing.expectEqual(@as(u64, 0), contextUsagePercent(0, 128_000));
     try std.testing.expectEqual(@as(u64, 50), contextUsagePercent(64_000, 128_000));

@@ -35,6 +35,8 @@
 | `display.zig` | ~0.3k | **纯函数**：工具调用行/块标题/参数摘要/截断/结果摘要（无 UI 依赖） | `formatToolCallLine`、`toolRowHeader` |
 | `textarea.zig` | ~0.7k | 多行输入框（折行、选择、粘贴、光标） | `insertBytes`、`draw` |
 | `config.zig` | ~0.7k | config.json 读写、提供商/预设/思考强度/宽度策略 | `load`、`behavior` |
+| `model_table.zig` | 生成 | 模型能力表（上下文窗口/思考档位；models.dev + 实测修正生成，勿手改） | `lookup` |
+| `tools/gen_model_table.zig` | 工具 | 能力表生成脚本（手动跑；读 models.dev + model_corrections.json） | — |
 | `context.zig` | ~0.4k | **纯计算**：压缩区间选择、工具输出折叠扫描、checkpoint 包装 | `selectCompactionRange`、`FoldScanner` |
 | `regex.zig` | ~0.5k | 自研正则（grep 工具用，零依赖） | `parse`、`exec` |
 | `log.zig` | ~0.3k | 日志（分文件、分级、保留清理） | `info`、`Log.info` |

@@ -54,7 +54,9 @@ zig build
 |---|---|
 | `providers` | 提供商列表（数组）。TUI 里增删改会自动写回本文件 |
 | `current.provider` / `current.model` | 当前使用的提供商与模型 |
-| `thinking` | 思考强度：`""`（不发送）/ `off` / `low` / `high` / `max`。TUI 的 `/thinking` 会写回这里 |
+| `thinking` | 全局思考强度（未在 `thinking_by_model` 里单独设置的模型用这个）：`""`（不发送）/ `off` / `low` / `high` / `max` 等。TUI 的 `/thinking` 会写回这里 |
+| `thinking_by_model` | 每模型思考强度记忆：`[{"provider": "opencode-go", "model": "mimo-v2.6-flash", "thinking": "low"}]`。`provider` 可省略（按模型名匹配）。TUI 切换档位时自动写入 |
+| `model_overrides` | 模型能力用户覆盖（最高优先）：`[{"provider": "opencode-go", "model": "x", "context_window": 262144, "efforts": ["low", "high"]}]`。`provider` 可省略；`context_window` 覆盖上下文窗口，`efforts` 覆盖可用档位（含 `off` 无需写）。用途：内置能力表判错/滞后时自行修正 |
 | `ambiguous_width` | 模糊宽度字符（`①②③`、`→≤…` 等）排版档位：省略或 `"auto"`（默认）= 窄基底 + 内置推荐名单（带圈/带括号字母数字按两列）；`"wide"` = 全部两列；`"narrow"` = 全部一列 |
 | `width_overrides` | 在档位之外的按字符覆盖，**永远最高优先**。`wide` 名单强制两列、`narrow` 名单强制一列；格式：空白/逗号分隔，支持码点范围 `U+2460-U+249B`（`U+` 前缀可省）或字面字符 `— → ←`。上限各 1024 个码点 |
 
@@ -175,7 +177,7 @@ zig build
 | `/models` | 打开模型/提供商选择菜单 |
 | `/sessions` | 打开会话选择菜单 |
 | `/compact [保留token]` | 压缩当前会话；省略参数用默认保留窗口（20000 token）。直接输入即执行 |
-| `/thinking [级别]` | 不带参数打开选择器；带 `off` / `low` / `high` / `max` 直接设置并写回配置 |
+| `/thinking [级别]` | 不带参数打开选择器（档位来自内置模型能力表；表外模型给全档位并提示自行尝试）；带级别名直接设置并写回配置（按模型记忆） |
 | `/exit` | 退出程序 |
 
 ### 3.2 键盘快捷键
@@ -355,7 +357,7 @@ skynet help
 | `-title <文本>` | 新会话标题 |
 | `-provider <名称>` | 临时覆盖提供商（不写回 config.json） |
 | `-model <模型id>` | 临时覆盖模型（不写回 config.json） |
-| `-thinking <级别>` | 思考强度 `off`/`low`/`high`/`max`（仅本次请求） |
+| `-thinking <级别>` | 思考强度（如 `off`/`low`/`high`/`max`；仅本次请求） |
 | `-db <路径>` | 数据库文件（默认 exe 同目录 `data\skynet.db`） |
 | `-config <路径>` | 配置文件（默认 exe 同目录 `data\config.json`） |
 | `-n <数量>` | `messages` 只显示最后 N 条 |
