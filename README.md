@@ -1,4 +1,4 @@
-<img width="1265" height="759" alt="图片" src="https://github.com/user-attachments/assets/54c6ca37-7cbc-46d9-b38b-28eb377adbc6" />
+<img width="1229" height="721" alt="图片" src="https://github.com/user-attachments/assets/fed718f1-09bf-4243-9b78-01c702b796ff" />
 
 # SkyNet
 
@@ -32,6 +32,20 @@ CLI 与 TUI 共用同一套 agent 逻辑。
   也不一致，可能出现报错、重复计费或行为异常。
 - 本项目仅供学习与自用，不提供任何形式的担保（见文末）。
 
+## 安装
+
+**直接使用**：从 [Releases](https://github.com/NeonMedusa/SkyNet/releases) 下载 `SkyNet.exe`，双击（或命令行）运行即可——单个静态二进制，无需安装任何运行时。
+首次启动会在 **exe 同目录自动创建 `data\` 子目录**（配置 `config.json`、数据库 `skynet.db`、日志 `logs\` 都在里面），整个目录可以随意移动/拷贝，即插即用。
+
+**Scoop 安装**：本程序已收录进 [lemon bucket](https://github.com/hoilc/scoop-lemon)，执行：
+
+```powershell
+scoop bucket add lemon https://github.com/hoilc/scoop-lemon
+scoop install skynet
+```
+
+升级 `scoop update skynet`；卸载 `scoop uninstall skynet`（数据默认保留，加 `-p` 连数据一起删）。
+
 ## 构建
 
 需要 Zig 0.16。仓库用 git submodule 引入 zigtui，克隆时请带 `--recurse-submodules`
@@ -52,11 +66,7 @@ zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/SkyNet.exe help                                # 全部子命令与参数
 ```
 
-> 数据目录：配置/数据库/日志默认在 **exe 同目录 `data\`**（不存在自动创建；scoop 安装时指向 persist）。
-> 用 `-db` / `-config` 可显式指定其他位置。
-
-首次启动自动生成 `config.json`（空配置）与 `skynet.db`（SQLite，WAL）——
-默认都在 **exe 同目录的 `data\` 子目录**下（便携模式：目录/配置/数据库/日志不存在时自动创建）：
+数据目录（首次启动自动生成；`-db` / `-config` 可显式指定其他位置）：
 
 ```
 zig-out\bin\SkyNet.exe
@@ -65,8 +75,7 @@ zig-out\bin\data\skynet.db        ← 数据库
 zig-out\bin\data\logs\            ← 日志
 ```
 
-scoop 安装时 `data` 是指向 `scoop\persist\skynet\data` 的 junction——升级/卸载（默认）都不动数据。
-如需自定义位置：`-db <路径>` / `-config <路径>` 显式指定（优先于默认）。
+Scoop 安装时 `data` 是指向 `scoop\persist\skynet\data` 的 junction——升级/卸载（默认）都不动数据。
 第一次使用：TUI 里按 `Esc` → `models` → 底部「+ 添加提供商…」，填入 API 地址与密钥
 （密钥也可留空、改填环境变量名）。
 

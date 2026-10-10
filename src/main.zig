@@ -9309,6 +9309,9 @@ fn countVisualLines(content: []const u8, width: usize) usize {
 /// 没有正文时不再留"思考块与正文之间"的空行，避免与消息间隔叠加成两行
 fn thoughtHasBody(msg: Message) bool {
     if (msg.tool_block != null) return true;
+    // 优先看解析后的行数：正文为纯空白（如只剩尾随换行）时 md 已裁成 0 行，
+    // 不应再保留“思考与正文之间的空行”（否则思考块与工具块间距多一行）
+    if (msg.md) |md| return md.len > 0;
     return msg.content.len > 0;
 }
 
@@ -18151,4 +18154,49 @@ test "空闲看门狗：模型列表拉取半开卡死时自动收尾（需 mock
         if (std.mem.indexOf(u8, m.content, "获取模型列表失败") != null) saw_fail = true;
     }
     try std.testing.expect(saw_fail);
+}
+
+test "间距一致性：尾随换行数不同的正文渲染行数相同" {
+    // 实测数据：assistant 正文尾随 \n\n（24 条）与 \n\n\n\n（5 条）应产生相同间距。
+    // 修复前：2 行 vs 4 行间距；修复后：均 = 正文行数 + 1（消息间分隔）
+    var a = Message{ .style = .{} };
+    const c1 = try std.testing.allocator.dupe(u8, "正文内容\n\n");
+    defer std.testing.allocator.free(c1);
+    a.content = c1;
+    a.md = try md_mod.parse(std.testing.allocator, c1, md_mod.default_styles);
+    defer if (a.md) |md| md_mod.free(std.testing.allocator, md);
+
+    var b = Message{ .style = .{} };
+    const c2 = try std.testing.allocator.dupe(u8, "正文内容\n\n\n\n");
+    defer std.testing.allocator.free(c2);
+    b.content = c2;
+    b.md = try md_mod.parse(std.testing.allocator, c2, md_mod.default_styles);
+    defer if (b.md) |md| md_mod.free(std.testing.allocator, md);
+
+    const rows_a = messageRowCount(a, 80);
+    const rows_b = messageRowCount(b, 80);
+    try std.testing.expectEqual(rows_a, rows_b); // 间距一致（修复前 2≠4）
+    try std.testing.expectEqual(@as(usize, 1), rows_a); // 仅正文 1 行
+
+    // 纯空白正文：不产生幽灵空行
+    var c = Message{ .style = .{} };
+    const c3 = try std.testing.allocator.dupe(u8, "\n\n\n");
+    defer std.testing.allocator.free(c3);
+    c.content = c3;
+    c.md = try md_mod.parse(std.testing.allocator, c3, md_mod.default_styles);
+    defer if (c.md) |md| md_mod.free(std.testing.allocator, md);
+    try std.testing.expectEqual(@as(usize, 0), messageRowCount(c, 80));
+
+    // 思考块 + 纯空白正文：不应留“思考与正文之间的空行”
+    var d = Message{ .style = .{} };
+    const r = try std.testing.allocator.dupe(u8, "思考内容");
+    defer std.testing.allocator.free(r);
+    const c4 = try std.testing.allocator.dupe(u8, "\n\n");
+    defer std.testing.allocator.free(c4);
+    d.reasoning = r;
+    d.content = c4;
+    d.md = try md_mod.parse(std.testing.allocator, c4, md_mod.default_styles);
+    defer if (d.md) |md| md_mod.free(std.testing.allocator, md);
+    // 折叠头 1 行 + 无正文（不留空行）= 1 行
+    try std.testing.expectEqual(@as(usize, 1), messageRowCount(d, 80));
 }

@@ -172,6 +172,18 @@ pub fn parse(allocator: Allocator, content: []const u8, styles: Styles) ![]Line 
         try appendInline(allocator, &items, raw, base, styles);
     }
 
+    // 裁剪末尾空行：模型正文常带 1~3 个尾随换行，若原样渲染会与“消息间固定
+    // 1 行分隔”叠加，造成正文与工具块间距忽 2 忽 4 行（实测数据：24 条 \n\n、
+    // 5 条 \n\n\n\n）。显示层统一裁掉，间距恒定；DB 内容始终是全文不受影响。
+    while (items.items.len > 0) {
+        const last = items.items[items.items.len - 1];
+        if (last.kind == .normal and last.runs.len == 0 and last.table == null) {
+            _ = items.pop();
+        } else {
+            break;
+        }
+    }
+
     return try items.toOwnedSlice(allocator);
 }
 
@@ -1205,4 +1217,36 @@ test "rowSegments: 折行片段与列偏移" {
     try testing.expectEqual(@as(usize, 1), n2);
     try testing.expectEqualStrings("中", segs[0].text);
     try testing.expectEqual(@as(usize, 2), segs[0].width);
+}
+
+test "末尾空行裁剪：尾随换行不产生多余空行，中间空行保留" {
+    // 模型正文常见形态：内容 + 尾随 \n\n / \n\n\n\n（实测 24 条 \n\n、5 条 \n\n\n\n）
+    // 显示层应裁掉尾部空行，与"消息间固定 1 行分隔"叠加后间距恒定
+    const c1 = "正文内容\n\n";
+    const l1 = try parse(testing.allocator, c1, default_styles);
+    defer free(testing.allocator, l1);
+    try testing.expectEqual(@as(usize, 1), l1.len); // 只有正文行，尾部空行被裁
+
+    const c2 = "正文内容\n\n\n\n";
+    const l2 = try parse(testing.allocator, c2, default_styles);
+    defer free(testing.allocator, l2);
+    try testing.expectEqual(@as(usize, 1), l2.len); // 多个尾随换行同样裁净
+
+    // 中间空行必须保留（段落分隔的语义）
+    const c3 = "第一段\n\n第二段\n\n";
+    const l3 = try parse(testing.allocator, c3, default_styles);
+    defer free(testing.allocator, l3);
+    try testing.expectEqual(@as(usize, 3), l3.len); // 段1 + 空行 + 段2
+
+    // 纯空行内容：全裁（渲染为 0 行，不产生幽灵空行）
+    const c4 = "\n\n\n";
+    const l4 = try parse(testing.allocator, c4, default_styles);
+    defer free(testing.allocator, l4);
+    try testing.expectEqual(@as(usize, 0), l4.len);
+
+    // 尾随空白行（含空格）同样裁
+    const c5 = "文字\n  \n\t\n";
+    const l5 = try parse(testing.allocator, c5, default_styles);
+    defer free(testing.allocator, l5);
+    try testing.expectEqual(@as(usize, 1), l5.len);
 }
