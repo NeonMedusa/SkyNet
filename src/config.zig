@@ -121,6 +121,10 @@ pub const Behavior = struct {
     reasoning_off_none: bool = false,
     /// DeepSeek 系：额外发 thinking:{type} 开关（直连 deepseek.com 或 deepseek 预设）
     deepseek_thinking: bool = false,
+    /// 思考回传字段名（assistant 消息带回的 reasoning 字段）：
+    /// "reasoning" / "reasoning_content" / "reasoning_text"；空 = 不回传。
+    /// 由调用方从能力表查出后填入（见 main.zig createStreamJob）。
+    interleaved: []const u8 = "",
 };
 
 pub fn behavior(p: *const Provider) Behavior {

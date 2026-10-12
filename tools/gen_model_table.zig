@@ -53,6 +53,10 @@ const Entry = struct {
     efforts: []const []const u8 = &.{},
     /// off（关闭思考）是否用 reasoning_effort:"none" 表达（false = 不发送该字段）
     off_none: bool = false,
+    /// 思考回传字段名（assistant 消息要带上的 reasoning 字段）：
+    /// "reasoning" / "reasoning_content" / "reasoning_text"；空 = 不回传。
+    /// 只认这三种字符串（models.dev 的 interleaved.field）；boolean true 与其他值忽略。
+    interleaved: []const u8 = "",
 };
 
 /// 档位排序用的固定顺序（不认识的词排最后，按字典序）
@@ -197,6 +201,18 @@ pub fn main(init: std.process.Init) !u8 {
                 break :blk getInt(lim, "context");
             };
 
+            // 思考回传字段（interleaved.field；只认三个已知字段名）
+            var interleaved: []const u8 = "";
+            if (getField(mv, "interleaved")) |iv| {
+                const f = getStr(iv, "field") orelse "";
+                if (std.mem.eql(u8, f, "reasoning") or
+                    std.mem.eql(u8, f, "reasoning_content") or
+                    std.mem.eql(u8, f, "reasoning_text"))
+                {
+                    interleaved = f;
+                }
+            }
+
             var efforts = std.ArrayListUnmanaged([]const u8){ .items = &.{}, .capacity = 0 };
             var toggle = false;
             var off_none = false;
@@ -248,6 +264,7 @@ pub fn main(init: std.process.Init) !u8 {
                 .kind = kind,
                 .efforts = efforts.items,
                 .off_none = off_none,
+                .interleaved = interleaved,
             });
         }
     }
@@ -266,6 +283,17 @@ pub fn main(init: std.process.Init) !u8 {
                 }
                 if (getField(c, "off_none")) |ov| {
                     if (ov == .bool) e.off_none = ov.bool;
+                }
+                if (getField(c, "interleaved")) |iv| {
+                    if (iv == .string) {
+                        const f = iv.string;
+                        if (std.mem.eql(u8, f, "reasoning") or
+                            std.mem.eql(u8, f, "reasoning_content") or
+                            std.mem.eql(u8, f, "reasoning_text") or f.len == 0)
+                        {
+                            e.interleaved = f;
+                        }
+                    }
                 }
                 if (getField(c, "efforts")) |ev| {
                     if (ev == .array) {
@@ -329,6 +357,8 @@ pub fn main(init: std.process.Init) !u8 {
         \\    levels: []const []const u8 = &.{},
         \\    /// off 是否用 reasoning_effort:"none" 表达（false = 不发送该字段）
         \\    off_none: bool = false,
+        \\    /// 思考回传字段名（assistant 消息带回的 reasoning 字段；空 = 不回传）
+        \\    interleaved: []const u8 = "",
         \\};
         \\
         \\pub const entries = [_]Entry{
@@ -336,8 +366,8 @@ pub fn main(init: std.process.Init) !u8 {
     );
 
     for (list.items) |e| {
-        try w.print("    .{{ .provider = \"{s}\", .model = \"{s}\", .ctx = {d}, .kind = .{s}, .off_none = {}, .levels = &.{{ ", .{
-            e.provider, e.model, e.ctx, @tagName(e.kind), e.off_none,
+        try w.print("    .{{ .provider = \"{s}\", .model = \"{s}\", .ctx = {d}, .kind = .{s}, .off_none = {}, .interleaved = \"{s}\", .levels = &.{{ ", .{
+            e.provider, e.model, e.ctx, @tagName(e.kind), e.off_none, e.interleaved,
         });
         // 展示列表 = off + 档位（toggle 型固定为 off/high——high 即"开"）
         try w.writeAll("\"off\"");

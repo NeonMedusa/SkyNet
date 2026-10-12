@@ -20,9 +20,13 @@ pub fn toolsSchemaBytes() usize {
     return n;
 }
 
-/// 单条消息进入请求的近似字节数（正文 + tool_calls 参数）
-pub fn messageRequestBytes(m: ai.Message) usize {
+/// 单条消息进入请求的近似字节数（正文 + tool_calls 参数）。
+/// `count_reasoning`：当前模型回传思考（能力表 interleaved 非空）时，assistant 的
+/// reasoning 字段也会进请求，计入估算才能保证"估算 = 实际发送量"（与 messageToValue
+/// 的发送条件逐字对应：interleaved 非空 且 role = assistant）。
+pub fn messageRequestBytes(m: ai.Message, count_reasoning: bool) usize {
     var n: usize = m.content.len;
+    if (count_reasoning and std.mem.eql(u8, m.role, "assistant")) n += m.reasoning.len;
     if (m.tool_calls) |cs| {
         for (cs) |c| n += c.arguments.len + 32;
     }
@@ -30,10 +34,63 @@ pub fn messageRequestBytes(m: ai.Message) usize {
 }
 
 /// 一段历史的近似请求字节数
-pub fn historyRequestBytesSlice(history: []const ai.Message) usize {
+pub fn historyRequestBytesSlice(history: []const ai.Message, count_reasoning: bool) usize {
     var bytes: usize = 0;
-    for (history) |m| bytes += messageRequestBytes(m);
+    for (history) |m| bytes += messageRequestBytes(m, count_reasoning);
     return bytes;
+}
+
+// ── 上下文溢出错误识别（P2 自愈：溢出 → 自动压缩 → 重试一次）──
+
+/// 大小写不敏感子串查找（模式均为 ASCII）
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var k: usize = 0;
+        while (k < needle.len) : (k += 1) {
+            if (std.ascii.toLower(haystack[i + k]) != std.ascii.toLower(needle[k])) break;
+        }
+        if (k == needle.len) return true;
+    }
+    return false;
+}
+
+/// 错误体是否表示"输入超出上下文窗口"（参考 pi / opencode 的厂商错误模式表；
+/// 取通用子串而非全量正则）。仅认输入超限类；排除限流/瞬时故障以免误判。
+pub fn isContextOverflowText(msg: []const u8) bool {
+    if (msg.len == 0) return false;
+    const excludes = [_][]const u8{
+        "rate limit",  "too many requests", "throttling", "service unavailable",
+        "please wait", "overloaded",
+    };
+    for (excludes) |p| if (containsIgnoreCase(msg, p)) return false;
+    const patterns = [_][]const u8{
+        "prompt is too long",
+        "prompt too long",
+        "request_too_large",
+        "input is too long",
+        "exceeds the context window",
+        "maximum context length",
+        "context_length_exceeded",
+        "context length is only",
+        "context length exceeded",
+        "reduce the length of the messages",
+        "maximum prompt length is",
+        "exceeds the maximum allowed input length",
+        "longer than the model's context length",
+        "exceeds the available context size",
+        "greater than the context length",
+        "context window exceeds limit",
+        "exceeded model token limit",
+        "too large for model with",
+        "configured context size is",
+        "model_context_window_exceeded",
+        "token limit exceeded",
+    };
+    for (patterns) |p| if (containsIgnoreCase(msg, p)) return true;
+    return false;
 }
 
 // ── 工具输出折叠 ──
@@ -162,7 +219,7 @@ pub const CompactionRange = struct {
 
 /// 选择压缩区间：system 与已有 checkpoint 永不进入摘要；
 /// 保留区按字节预算从新到旧累计，起点对齐到不会被孤立的边界。
-pub fn selectCompactionRange(history: []const ai.Message, keep_bytes: usize) ?CompactionRange {
+pub fn selectCompactionRange(history: []const ai.Message, keep_bytes: usize, count_reasoning: bool) ?CompactionRange {
     if (history.len == 0) return null;
 
     var summarize_start: usize = 0;
@@ -175,7 +232,7 @@ pub fn selectCompactionRange(history: []const ai.Message, keep_bytes: usize) ?Co
     var keep_start = history.len;
     var acc: usize = 0;
     while (keep_start > summarize_start) {
-        const sz = messageRequestBytes(history[keep_start - 1]);
+        const sz = messageRequestBytes(history[keep_start - 1], count_reasoning);
         if (acc > 0 and acc + sz > keep_bytes) break;
         acc += sz;
         keep_start -= 1;
@@ -225,12 +282,31 @@ pub fn truncateChars(s: []const u8, max_chars: usize) []const u8 {
     return s[0..i];
 }
 
-/// 构建摘要请求的对话文本：工具输出截断到 2000 字符
+/// 摘要输入构建选项（第 2 层阶梯用）
+pub const CompactionPayloadOptions = struct {
+    /// 是否把思考作为文本喂给摘要器（默认开；超预算时降级为 false）
+    include_thinking: bool = true,
+    /// 工具结果截断上限（字符）
+    tool_result_cap: usize = 2000,
+    /// 工具参数截断上限（字符）
+    tool_args_cap: usize = 500,
+};
+
+/// 摘要输入的保守字节预算：按"1 token ≥ 3 字节"的保守换算，并给摘要输出留余量。
+/// 超预算 → 按阶梯降级（剥思考 → 加狠截断 → 丢最老）。
+pub fn compactionPayloadBudgetBytes(window_tokens: usize) usize {
+    const reserve = @min(window_tokens / 4, 16_384);
+    const usable = window_tokens -| reserve;
+    return usable * 3;
+}
+
+/// 构建摘要请求的对话文本（默认带思考；工具输出/参数按选项截断）
 pub fn buildCompactionPayload(
     allocator: Allocator,
     history: []const ai.Message,
     range: CompactionRange,
     prev_summary: []const u8,
+    opts: CompactionPayloadOptions,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -254,10 +330,13 @@ pub fn buildCompactionPayload(
         if (std.mem.eql(u8, m.role, "user")) {
             try out.writer.print("[user]\n{s}\n\n", .{m.content});
         } else if (std.mem.eql(u8, m.role, "assistant")) {
+            if (opts.include_thinking and m.reasoning.len > 0) {
+                try out.writer.print("[thinking]\n{s}\n", .{m.reasoning});
+            }
             if (m.content.len > 0) try out.writer.print("[assistant]\n{s}\n", .{m.content});
             if (m.tool_calls) |cs| {
                 for (cs) |c| {
-                    try out.writer.print("[tool call] {s}({s})\n", .{ c.name, truncateChars(c.arguments, 500) });
+                    try out.writer.print("[tool call] {s}({s})\n", .{ c.name, truncateChars(c.arguments, opts.tool_args_cap) });
                 }
             }
             try out.writer.writeAll("\n");
@@ -271,10 +350,156 @@ pub fn buildCompactionPayload(
                     }
                 }
             }
-            try out.writer.print("[tool result: {s}]\n{s}\n\n", .{ name, truncateChars(m.content, 2000) });
+            try out.writer.print("[tool result: {s}]\n{s}\n\n", .{ name, truncateChars(m.content, opts.tool_result_cap) });
         }
     }
     return out.toOwnedSlice();
+}
+
+/// 预算化构建结果（诊断/降级重试用）
+pub const BudgetedPayload = struct {
+    payload: []u8,
+    /// 最终口径是否含思考
+    include_thinking: bool,
+    /// 是否用了加狠截断
+    hard_truncated: bool,
+    /// 从最老端丢掉的正文消息条数
+    dropped_messages: usize,
+};
+
+/// 按预算构建摘要输入（第 2 层阶梯）：默认带思考 → 剥思考 → 工具加狠截断 →
+/// 从最老端丢消息。上一轮摘要（prev_summary）始终保留；至少保留最后一条正文消息。
+pub fn buildBudgetedCompactionPayload(
+    allocator: Allocator,
+    history: []const ai.Message,
+    range: CompactionRange,
+    prev_summary: []const u8,
+    window_tokens: usize,
+) !BudgetedPayload {
+    const budget = compactionPayloadBudgetBytes(window_tokens);
+    var opts = CompactionPayloadOptions{};
+    var start = range.summarize_start;
+    var dropped: usize = 0;
+    while (true) {
+        const sub = CompactionRange{ .summarize_start = start, .retain_start = range.retain_start };
+        const payload = try buildCompactionPayload(allocator, history, sub, prev_summary, opts);
+        if (payload.len <= budget) {
+            return .{
+                .payload = payload,
+                .include_thinking = opts.include_thinking,
+                .hard_truncated = opts.tool_result_cap < 2000,
+                .dropped_messages = dropped,
+            };
+        }
+        const excess = payload.len - budget;
+        allocator.free(payload);
+        if (opts.include_thinking) {
+            opts.include_thinking = false;
+            continue;
+        }
+        if (opts.tool_result_cap >= 2000) {
+            opts.tool_result_cap = 500;
+            opts.tool_args_cap = 200;
+            continue;
+        }
+        if (start + 1 < range.retain_start) {
+            // 丢最老：按消息近似字节逐条丢（至少丢 1 条），至少保留最后一条
+            var acc: usize = 0;
+            while (start + 1 < range.retain_start and acc < excess) {
+                acc += messageRequestBytes(history[start], false);
+                start += 1;
+                dropped += 1;
+            }
+            continue;
+        }
+        // 已到保底（只剩最后一条）仍超预算：尽力而为返回（预算极端小时才会发生）
+        const payload2 = try buildCompactionPayload(allocator, history, sub, prev_summary, opts);
+        return .{
+            .payload = payload2,
+            .include_thinking = opts.include_thinking,
+            .hard_truncated = true,
+            .dropped_messages = dropped,
+        };
+    }
+}
+
+test "摘要输入：默认带思考；超预算按阶梯降级（剥思考 → 加狠截断 → 丢最老）" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const calls = [_]ai.ToolCall{.{ .id = "c1", .name = "read", .arguments = "x" ** 800 }};
+    var msgs = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
+    try msgs.append(a, .{ .role = "system", .content = "sys" });
+    try msgs.append(a, .{ .role = "user", .content = "U" ** 40 });
+    try msgs.append(a, .{ .role = "assistant", .content = "A" ** 40, .reasoning = "R" ** 200, .tool_calls = &calls });
+    try msgs.append(a, .{ .role = "tool", .content = "T" ** 3000, .tool_call_id = "c1" });
+    try msgs.append(a, .{ .role = "user", .content = "V" ** 40 });
+    try msgs.append(a, .{ .role = "assistant", .content = "B" ** 40, .reasoning = "S" ** 200 });
+
+    const range = CompactionRange{ .summarize_start = 1, .retain_start = 6 };
+    const prev = "PSPSPSPSPSPSPSPSPSPS";
+
+    // 三个档位的底价：带思考 / 剥思考 / 加狠截断（量出实际字节数，再反推窗口）
+    const full = try buildCompactionPayload(a, msgs.items, range, prev, .{});
+    const stripped = try buildCompactionPayload(a, msgs.items, range, prev, .{ .include_thinking = false });
+    const hard = try buildCompactionPayload(a, msgs.items, range, prev, .{ .include_thinking = false, .tool_result_cap = 500, .tool_args_cap = 200 });
+    try t.expect(full.len > stripped.len + 200);
+    try t.expect(stripped.len > hard.len + 200);
+    try t.expect(std.mem.indexOf(u8, full, "[thinking]") != null);
+    try t.expect(std.mem.indexOf(u8, full, "R" ** 200) != null);
+    try t.expect(std.mem.indexOf(u8, stripped, "[thinking]") == null);
+
+    const windowFor = struct {
+        fn f(target: usize) usize {
+            var w: usize = 8;
+            while (compactionPayloadBudgetBytes(w) < target) w += 1;
+            return w;
+        }
+    }.f;
+
+    // 档位 0：大窗口 → 带思考（上一轮摘要始终在）
+    {
+        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, 1_000_000);
+        try t.expect(built.include_thinking);
+        try t.expect(std.mem.indexOf(u8, built.payload, "R" ** 200) != null);
+        try t.expect(std.mem.indexOf(u8, built.payload, prev) != null);
+    }
+    // 档位 1：预算刚好装下“剥思考”版 → 剥思考
+    {
+        const w = windowFor(stripped.len + 8);
+        try t.expect(compactionPayloadBudgetBytes(w) < full.len);
+        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, w);
+        try t.expect(!built.include_thinking);
+        try t.expect(!built.hard_truncated);
+        try t.expectEqual(@as(usize, 0), built.dropped_messages);
+    }
+    // 档位 2：预算只装得下“加狠截断”版 → 剥思考 + 加狠截断
+    {
+        const w = windowFor(hard.len + 8);
+        try t.expect(compactionPayloadBudgetBytes(w) < stripped.len);
+        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, w);
+        try t.expect(!built.include_thinking);
+        try t.expect(built.hard_truncated);
+        try t.expectEqual(@as(usize, 0), built.dropped_messages);
+    }
+    // 档位 3：预算不足 → 从最老端丢消息（上一轮摘要与最新消息保留）
+    {
+        const w = windowFor(hard.len / 2 + 8);
+        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, w);
+        try t.expect(built.dropped_messages > 0);
+        try t.expect(std.mem.indexOf(u8, built.payload, "U" ** 40) == null);
+        try t.expect(std.mem.indexOf(u8, built.payload, "B" ** 40) != null);
+        try t.expect(std.mem.indexOf(u8, built.payload, prev) != null);
+    }
+    // 档位 4：极端小窗口 → 保底（只剩最后一条），尽力而为返回
+    {
+        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, 8);
+        try t.expectEqual(@as(usize, 4), built.dropped_messages);
+        try t.expect(std.mem.indexOf(u8, built.payload, "B" ** 40) != null);
+        try t.expect(std.mem.indexOf(u8, built.payload, prev) != null);
+    }
 }
 
 // ── 测试 ──
@@ -382,12 +607,12 @@ test "压缩区间选择（跳过已有 checkpoint，保留边界不产生孤立
         .{ .role = "assistant", .content = "a2" },
     };
     // 保留窗口极小 → 收下 a2 后 u2 超预算，keep_start 落在 assistant（不再强推回 user）
-    const r = selectCompactionRange(&msgs, 1).?;
+    const r = selectCompactionRange(&msgs, 1, false).?;
     try testing.expectEqual(@as(usize, 1), r.summarize_start);
     try testing.expectEqual(@as(usize, 5), r.retain_start);
 
     // 窗口很大 → 无需压缩
-    try testing.expect(selectCompactionRange(&msgs, 1 << 20) == null);
+    try testing.expect(selectCompactionRange(&msgs, 1 << 20, false) == null);
 
     // 已有 checkpoint：摘要从 checkpoint 之后开始
     const with_cp = [_]ai.Message{
@@ -397,7 +622,7 @@ test "压缩区间选择（跳过已有 checkpoint，保留边界不产生孤立
         .{ .role = "tool", .content = "t1", .tool_call_id = "c1" },
         .{ .role = "user", .content = "u2" },
     };
-    const r2 = selectCompactionRange(&with_cp, 1).?;
+    const r2 = selectCompactionRange(&with_cp, 1, false).?;
     try testing.expectEqual(@as(usize, 2), r2.summarize_start);
     try testing.expectEqual(@as(usize, 4), r2.retain_start);
 }
@@ -416,13 +641,13 @@ test "压缩区间选择：保留区可从 assistant 开始（当前回合可被
         .{ .role = "tool", .content = "tttt", .tool_call_id = "c2" },
     };
     // 预算 42：收下 t2(4)+a2(38)，再往前 t1 超预算 → keep_start 落在 assistant（index 6）
-    const r = selectCompactionRange(&turn, 42).?;
+    const r = selectCompactionRange(&turn, 42, false).?;
     try testing.expectEqual(@as(usize, 1), r.summarize_start);
     try testing.expectEqual(@as(usize, 6), r.retain_start); // 当前回合前半段(u1,a1,t1)进入摘要
 
     // keep_start 落在 tool 上时向前跳过（不能以 tool 开头），落到其后的 assistant
     // 预算 50：收下 t2(4)+a2(38)+t1(4)=46，再往前 a1 超预算 → keep_start=5（tool t1）→ 跳到 6
-    const r2 = selectCompactionRange(&turn, 50).?;
+    const r2 = selectCompactionRange(&turn, 50, false).?;
     try testing.expectEqual(@as(usize, 6), r2.retain_start);
 
     // 尾部全是 tool（异常历史）：退回对齐到最后一个 user，保证不产生孤立引用
@@ -436,8 +661,44 @@ test "压缩区间选择：保留区可从 assistant 开始（当前回合可被
         .{ .role = "tool", .content = "t2", .tool_call_id = "c2" },
     };
     // 预算 3：收下 t2(2)，t1(2) 超预算 → keep_start=6（tool）→ 跳过剩余 tool → 退到 u1
-    const r3 = selectCompactionRange(&tails, 3).?;
+    const r3 = selectCompactionRange(&tails, 3, false).?;
     try testing.expectEqual(@as(usize, 3), r3.retain_start);
+}
+
+test "请求字节估算：思考按需计入（能力表 interleaved 口径）" {
+    const msgs = [_]ai.Message{
+        .{ .role = "user", .content = "u" },
+        .{ .role = "assistant", .content = "a", .reasoning = "rrrrrr" },
+        .{ .role = "tool", .content = "t", .tool_call_id = "c1" },
+    };
+    // 不计入：只算正文（user 1 + assistant 1 + tool 1）
+    try testing.expectEqual(@as(usize, 3), historyRequestBytesSlice(&msgs, false));
+    // 计入：assistant 的 reasoning 也进请求（6 字节）；非 assistant 无此字段
+    try testing.expectEqual(@as(usize, 9), historyRequestBytesSlice(&msgs, true));
+
+    // 保留区选择同口径：思考重时单条字节更大、预算更早打满（保留区更小）
+    const tail = [_]ai.Message{
+        .{ .role = "system", .content = "sys" },
+        .{ .role = "user", .content = "u0" },
+        .{ .role = "assistant", .content = "a1", .reasoning = "x" ** 60 },
+    };
+    // 预算 10：不计 reasoning → 保留窗口吃掉全部（无需压缩）；
+    // 计入后 a1 单条即超预算 → 有可压缩内容（保留区不再吞掉整段）
+    try testing.expect(selectCompactionRange(&tail, 10, false) == null);
+    try testing.expect(selectCompactionRange(&tail, 10, true) != null);
+}
+
+test "上下文溢出错误识别（P2 自愈用）" {
+    try testing.expect(isContextOverflowText("This model's maximum context length is 131072 tokens."));
+    try testing.expect(isContextOverflowText("Prompt is too long: 213462 tokens > 200000 maximum"));
+    try testing.expect(isContextOverflowText("{\"error\":{\"code\":\"context_length_exceeded\"}}"));
+    try testing.expect(isContextOverflowText("the request exceeds the available context size, try increasing it"));
+    try testing.expect(isContextOverflowText("prompt too long; exceeded max context length"));
+    // 反例：限流/瞬时故障（含“too many tokens”的限流误报）与无关文本
+    try testing.expect(!isContextOverflowText("Rate limit reached for requests"));
+    try testing.expect(!isContextOverflowText("ThrottlingException: Too many tokens, please wait before trying again."));
+    try testing.expect(!isContextOverflowText("Internal server error"));
+    try testing.expect(!isContextOverflowText(""));
 }
 
 test "checkpointBody：剥离固定包装（二次压缩合并时避免标签污染）" {

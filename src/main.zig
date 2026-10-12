@@ -40,8 +40,11 @@ const checkpointBody = context_mod.checkpointBody;
 const wrapCheckpoint = context_mod.wrapCheckpoint;
 const CompactionRange = context_mod.CompactionRange;
 const selectCompactionRange = context_mod.selectCompactionRange;
+const isContextOverflowText = context_mod.isContextOverflowText;
 const compaction_system_prompt = context_mod.compaction_system_prompt;
 const buildCompactionPayload = context_mod.buildCompactionPayload;
+const buildBudgetedCompactionPayload = context_mod.buildBudgetedCompactionPayload;
+const compactionPayloadBudgetBytes = context_mod.compactionPayloadBudgetBytes;
 const cliTruncate = context_mod.truncateChars;
 const fold_protect_bytes = context_mod.fold_protect_bytes;
 const fold_min_bytes = context_mod.fold_min_bytes;
@@ -151,6 +154,24 @@ const ThinkingChoice = struct { level: []const u8, explicit: bool };
 fn providerTableId(prov: ?*const config_mod.Provider) []const u8 {
     const p = prov orelse return "";
     return p.preset;
+}
+
+/// 当前模型是否回传思考（能力表 interleaved 非空）——与 createStreamJob 的
+/// `job.behavior.interleaved` 同源判定：估算计入 reasoning 的条件必须与发送逐字一致。
+fn countsReasoningFor(preset: []const u8, model: []const u8) bool {
+    if (model.len == 0) return false;
+    const e = model_table.lookup(preset, model) orelse return false;
+    return e.interleaved.len > 0;
+}
+
+/// 锚点新鲜度键：provider 名 + 模型 id 的哈希（非零）。模型一变，旧锚点（旧请求的
+/// 服务端实测值）口径就不可比——弃用锚点、改走全量估算。
+fn modelIdentityKey(provider_name: []const u8, model: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(provider_name);
+    h.update("\x00");
+    h.update(model);
+    return h.final() | 1; // 保证非零（0 留作"未标注"哨兵）
 }
 
 /// 模型档位解析：用户覆盖（config.model_overrides）> 能力表 > 未知全集
@@ -677,6 +698,8 @@ const StreamJob = struct {
     anchor_tokens: u64 = 0,
     /// 本回合是否发生过中途压缩（finalize 后需按 checkpoint 重建主线程历史）
     compacted_midturn: bool = false,
+    /// 救援：本回合是否已因请求失败压缩重发过（一次性，防死循环）
+    overflow_recovery_attempted: bool = false,
     /// 服务端错误详情（失败时带回给主线程展示）
     error_detail: []const u8 = "",
     /// 本回合累计的 token 用量（含缓存命中）
@@ -790,6 +813,9 @@ const AppState = struct {
     /// 回合收尾时记录（真实 usage）；折叠时递减；历史重建/新会话时清空。
     usage_anchor_len: ?usize = null,
     usage_anchor_tokens: u64 = 0,
+    /// 锚点新鲜度键（provider 名 + 模型 id 哈希）：模型切换后锚点口径（是否含 reasoning）
+    /// 不可比 → 弃用锚点走全量估算。0 = 未标注（不校验，兼容手设锚点的测试）。
+    usage_anchor_key: u64 = 0,
     /// last_usage 是否来自估算（尚无真实 usage 时为 true，状态栏显示 ~ 前缀）
     usage_estimated: bool = true,
 
@@ -1398,17 +1424,36 @@ const AppState = struct {
         return resolveContextWindow(&self.config, providerTableId(prov), model, popt);
     }
 
-    /// 估算当前请求 token（仅用于压缩决策/确认框展示；状态栏显示用服务端真实值）。
-    /// 有锚点时 = 锚点 token + 其后增量估算；否则 chars/4 纯估算。
-    fn estimateRequestTokens(self: *AppState) usize {
-        if (self.usage_anchor_len) |anchor_len| {
-            if (anchor_len <= self.history.items.len and self.usage_anchor_tokens > 0) {
-                const inc = historyRequestBytesSlice(self.history.items[anchor_len..]);
-                return @intCast(self.usage_anchor_tokens + estimateTokens(inc));
-            }
+    /// 当前模型是否回传思考 → 估算是否把 reasoning 计入请求量（保证"估算=实际发送"）。
+    fn currentCountsReasoning(self: *AppState) bool {
+        return countsReasoningFor(providerTableId(self.currentProvider()), self.currentModel());
+    }
+
+    /// 锚点是否可用于当前模型的估算：有条目、在界内、且模型未变。
+    /// key 为 0（未标注）时不校验（兼容测试手设锚点）；生产路径播种/刷新锚点时必写 key。
+    fn anchorUsable(self: *AppState) ?usize {
+        const al = self.usage_anchor_len orelse return null;
+        if (al > self.history.items.len or self.usage_anchor_tokens == 0) return null;
+        if (self.usage_anchor_key != 0) {
+            const prov = self.currentProvider();
+            const pname: []const u8 = if (prov) |p| p.name else "";
+            if (self.usage_anchor_key != modelIdentityKey(pname, self.currentModel())) return null;
         }
-        // 政策A：system 由加载/新建路径前置进 history，无需单独补计
-        return estimateTokens(historyRequestBytesSlice(self.history.items) + toolsSchemaBytes());
+        return al;
+    }
+
+    /// 估算当前请求 token（压缩决策/确认框/状态栏显示）。
+    /// 取大：账本口径（真实 usage + 增量，可能过期）vs 全量字节口径（永远按当前口径算）。
+    /// reasoning 计入与否跟随当前模型（currentCountsReasoning），与发送口径一致。
+    fn estimateRequestTokens(self: *AppState) usize {
+        const cr = self.currentCountsReasoning();
+        const pure = estimateTokens(historyRequestBytesSlice(self.history.items, cr) + toolsSchemaBytes());
+        if (self.anchorUsable()) |anchor_len| {
+            const inc = historyRequestBytesSlice(self.history.items[anchor_len..], cr);
+            const anchored: usize = @intCast(self.usage_anchor_tokens + estimateTokens(inc));
+            return @max(anchored, pure);
+        }
+        return pure;
     }
 
     /// 用数据库里最后一条真实 usage 播种上下文占用（加载/切换会话后调用）：
@@ -1421,6 +1466,7 @@ const AppState = struct {
         self.context_usage = .{};
         self.usage_anchor_len = null;
         self.usage_anchor_tokens = 0;
+        self.usage_anchor_key = 0;
         self.usage_estimated = true; // 尚未有"本轮"真实数据（CLI 契约用）
 
         const db = if (self.db) |*d| d else return;
@@ -1445,6 +1491,7 @@ const AppState = struct {
             if (m.db_id == row.db_id) {
                 self.usage_anchor_len = i + 1;
                 self.usage_anchor_tokens = in_tokens + out_tokens;
+                self.usage_anchor_key = modelIdentityKey(row.provider, row.model);
                 break;
             }
         }
@@ -1455,18 +1502,8 @@ const AppState = struct {
         _ = self;
     }
 
-    /// 接近窗口阈值时自动压缩（在发起新一轮请求前调用）
-    fn maybeAutoCompact(self: *AppState) void {
-        if (self.auto_compact_pct == 0) return;
-        const window = self.contextWindowCurrent();
-        if (window == 0) return;
-        const est = self.estimateRequestTokens();
-        if (est * 100 < window * self.auto_compact_pct) return;
-        const out = self.runCompaction(0);
-        if (out.compacted) self.setToast("上下文已自动压缩");
-    }
-
-    /// 同步执行一次上下文压缩（自动触发 / CLI 用；TUI 手动走异步 startCompaction）。
+    /// 同步执行一次上下文压缩（CLI `compact` / 测试用；TUI 手动走异步 startCompaction，
+    /// 自动压缩在 worker 首轮前执行——见 streamWorker 循环顶部）。
     /// keep_tokens_override > 0 时覆盖保留窗口（CLI --keep-tokens）。
     fn runCompaction(self: *AppState, keep_tokens_override: usize) CompactionOutcome {
         var outcome = CompactionOutcome{};
@@ -1504,6 +1541,7 @@ const AppState = struct {
             .behavior = config_mod.behavior(provider),
             .environ_map = self.environ_map,
             .history = self.history.items,
+            .counts_reasoning = countsReasoningFor(provider.preset, model),
             .keep_tokens = if (keep_tokens_override > 0) keep_tokens_override else self.keep_recent_tokens,
         };
         self.compact_cancel.store(false, .release);
@@ -2030,6 +2068,7 @@ const AppState = struct {
         // 历史整体更换：usage 锚点失效
         self.usage_anchor_len = null;
         self.usage_anchor_tokens = 0;
+        self.usage_anchor_key = 0;
     }
 
     /// 把数据库中的消息灌入内存历史与界面显示（无 checkpoint 版本）。
@@ -2185,9 +2224,12 @@ const AppState = struct {
             if (std.mem.eql(u8, row.role, "assistant")) {
                 const calls = parseToolCalls(arena, row.tool_calls);
                 if (in_tail) {
+                    // 思考一并进历史：部分网关（DeepSeek 系等）要求 assistant 消息
+                    // 回传 reasoning（见 ai.zig messageToValue 的 interleaved 处理）
                     self.appendHistoryMessage(.{
                         .role = "assistant",
                         .content = row.content,
+                        .reasoning = row.reasoning,
                         .tool_calls = calls,
                         .db_id = row.id,
                     });
@@ -2856,20 +2898,21 @@ const AppState = struct {
     /// 手动压缩：先按默认保留窗口选区间，没命中再按历史字节逐级缩小
     /// （纯计算，不发请求；返回选定的保留 token 数）
     fn chooseCompactionKeep(self: *AppState, keep_override: usize) ?usize {
+        const cr = self.currentCountsReasoning();
         if (keep_override > 0) {
-            return if (selectCompactionRange(self.history.items, keep_override * 4) != null) keep_override else null;
+            return if (selectCompactionRange(self.history.items, keep_override * 4, cr) != null) keep_override else null;
         }
         if (self.keep_recent_tokens > 0 and
-            selectCompactionRange(self.history.items, self.keep_recent_tokens * 4) != null)
+            selectCompactionRange(self.history.items, self.keep_recent_tokens * 4, cr) != null)
         {
             return self.keep_recent_tokens;
         }
-        const hist_bytes = historyRequestBytesSlice(self.history.items);
+        const hist_bytes = historyRequestBytesSlice(self.history.items, cr);
         const fractions = [_]usize{ 2, 4, 8, 16, 32 };
         for (fractions) |f| {
             const k = hist_bytes / f / 4;
             if (k == 0) break;
-            if (selectCompactionRange(self.history.items, k * 4) != null) return k;
+            if (selectCompactionRange(self.history.items, k * 4, cr) != null) return k;
         }
         return null;
     }
@@ -2994,6 +3037,7 @@ const AppState = struct {
             .session_id = self.session_id,
             .behavior = config_mod.behavior(provider),
             .environ_map = self.environ_map,
+            .counts_reasoning = countsReasoningFor(provider.preset, model),
             .keep_tokens = keep,
         };
         errdefer plan.arena.deinit();
@@ -4008,6 +4052,8 @@ const AppState = struct {
             clampThinking(&self.config, provider.preset, model, think.level);
         job.behavior.reasoning_effort = try arena.dupe(u8, eff);
         job.behavior.reasoning_off_none = thinkingInfoFor(&self.config, provider.preset, model).off_none;
+        // 思考回传字段（能力表）：部分网关要求 assistant 消息带回 reasoning
+        job.behavior.interleaved = if (model_table.lookup(provider.preset, model)) |e| e.interleaved else "";
         job.environ_map = self.environ_map;
         // worker 自建连接时用实际打开的库路径（测试/CLI 可能不是默认路径）
         const db_path: []const u8 = if (self.db) |*d| d.path else self.db_path;
@@ -4020,14 +4066,13 @@ const AppState = struct {
         job.round_usage = .{};
         job.anchor_len = 0;
         job.anchor_tokens = 0;
-        // usage 锚点随历史拷进 job（增量估算用；越界时不使用）
-        if (self.usage_anchor_len) |al| {
-            if (al <= self.history.items.len) {
-                job.anchor_len = al;
-                job.anchor_tokens = self.usage_anchor_tokens;
-            }
+        // usage 锚点随历史拷进 job（增量估算用）；越界或模型已切换（anchorUsable 校验）时不带
+        if (self.anchorUsable()) |al| {
+            job.anchor_len = al;
+            job.anchor_tokens = self.usage_anchor_tokens;
         }
         job.compacted_midturn = false;
+        job.overflow_recovery_attempted = false;
         job.error_detail = "";
         job.usage_input = 0;
         job.usage_output = 0;
@@ -4150,8 +4195,9 @@ const AppState = struct {
             return;
         }
 
-        // 接近窗口阈值时先压缩（失败不阻塞对话；会重建历史/显示）
-        self.maybeAutoCompact();
+        // 接近窗口阈值时的自动压缩由 worker 在首轮请求前执行（异步：界面保持可用，
+        // 显示"正在压缩…"气泡）。此前这里同步压缩会冻结主线程（大会话摘要请求
+        // 30~100 秒、消息滞留输入框），已移除（2026-10-12）。
 
         const provider = self.currentProvider() orelse {
             self.addMessage("尚无可用提供商，输入 /models 后按 Ctrl+A 添加", .{ .fg = .red });
@@ -4778,6 +4824,7 @@ const AppState = struct {
             // 只认正常结束的回合：取消/失败时 history 可能含部分内容，用旧 usage 当锚点会低估
             const anchor_tokens: u64 = job.round_usage.input_tokens + job.round_usage.output_tokens;
             const anchor_ok = self.streamStatus() == .done and err == null and job.round_usage.input_tokens > 0;
+            const anchor_key = modelIdentityKey(job.provider_name, job.model);
             job.deinit();
             self.stream_job = null;
             // 回合结束：停止输入框标题的计时（flushPendingSends 会为新回合重新落时间）
@@ -4787,12 +4834,15 @@ const AppState = struct {
                 self.rebuildHistoryFromDb();
                 self.usage_anchor_len = null; // 重建后的前缀与 round_usage 不对应
                 self.usage_anchor_tokens = 0;
+                self.usage_anchor_key = 0;
             } else if (anchor_ok) {
                 self.usage_anchor_tokens = anchor_tokens;
                 self.usage_anchor_len = self.history.items.len;
+                self.usage_anchor_key = anchor_key;
             } else {
                 self.usage_anchor_len = null;
                 self.usage_anchor_tokens = 0;
+                self.usage_anchor_key = 0;
             }
         }
         defer if (error_detail.len > 0) self.allocator.free(error_detail);
@@ -4815,10 +4865,12 @@ const AppState = struct {
 
         if (err) |e| {
             var err_buf: [256]u8 = undefined;
-            const err_msg: []const u8 = switch (e) {
-                error.StreamTruncated => "连接中断：响应流未正常结束，本次回复可能不完整（可重发消息重试）",
-                else => std.fmt.bufPrint(&err_buf, "AI 请求失败: {}", .{e}) catch "AI 请求失败",
-            };
+            const err_msg: []const u8 = if (e == error.StreamTruncated)
+                "连接中断：响应流未正常结束，本次回复可能不完整（可重发消息重试）"
+            else if (error_detail.len > 0 and isContextOverflowText(error_detail))
+                "AI 请求失败（上下文超限）：自动压缩恢复未成功（可 /compact 或换更大窗口模型）"
+            else
+                std.fmt.bufPrint(&err_buf, "AI 请求失败: {}", .{e}) catch "AI 请求失败";
             self.addMessage(err_msg, .{ .fg = .red });
             if (error_detail.len > 0) {
                 // 只取首行、截断到 ~200 字符
@@ -4872,6 +4924,7 @@ const AppState = struct {
         var scan2 = FoldScanner{};
         var folded: usize = 0;
         var saved: usize = 0;
+        var first_folded: ?usize = null; // 最小被折下标（=最早失效点）
         i = self.history.items.len;
         while (i > 0) {
             i -= 1;
@@ -4900,6 +4953,7 @@ const AppState = struct {
                     self.allocator.free(@constCast(m.content));
                     m.content = new_content;
                     folded += 1;
+                    first_folded = i;
                 },
             }
         }
@@ -4910,7 +4964,13 @@ const AppState = struct {
                 const cut: u64 = @intCast(estimateTokens(saved));
                 self.usage_anchor_tokens -|= cut;
             }
-            Log.info(.fold, "折叠 {d} 条旧工具输出（约 {d}KB）", .{ folded, saved / 1024 });
+            const prefix_tokens: usize = if (first_folded) |fi|
+                estimateTokens(historyRequestBytesSlice(self.history.items[0..fi], self.currentCountsReasoning()))
+            else
+                0;
+            Log.info(.fold, "折叠 {d} 条旧工具输出（约 {d}KB）；首折 idx={d}（其前约 {d} tokens，缓存预计自该处失效）", .{
+                folded, saved / 1024, first_folded orelse 0, prefix_tokens,
+            });
             var note_buf: [96]u8 = undefined;
             const note = std.fmt.bufPrint(&note_buf, "已折叠 {d} 条旧工具输出（约 {d}KB）", .{
                 folded,
@@ -6146,6 +6206,8 @@ const CompactionPlan = struct {
     behavior: config_mod.Behavior = .{},
     environ_map: ?*const std.process.Environ.Map = null,
     history: []ai.Message = &.{},
+    /// 本计划所属模型是否回传思考（决定保留区选择/记录估算是否计入 reasoning）
+    counts_reasoning: bool = false,
     keep_tokens: usize = 0,
 
     // 结果
@@ -6184,16 +6246,26 @@ fn compactionExecute(plan: *CompactionPlan) void {
     });
     defer if (local_db) |*d| d.deinit();
 
-    const range = selectCompactionRange(plan.history, plan.keep_tokens * 4) orelse return;
+    const range = selectCompactionRange(plan.history, plan.keep_tokens * 4, plan.counts_reasoning) orelse return;
     const prev_summary: []const u8 = if (range.summarize_start > 1 and
         isCheckpointMessage(plan.history[range.summarize_start - 1]))
         plan.history[range.summarize_start - 1].content
     else
         "";
-    const payload = buildCompactionPayload(plan.arena.allocator(), plan.history, range, prev_summary) catch {
+    const built = buildBudgetedCompactionPayload(plan.arena.allocator(), plan.history, range, prev_summary, app.contextWindowCurrent()) catch {
         plan.err = "构建摘要输入失败";
         return;
     };
+    var payload = built.payload;
+    var payload_thinking = built.include_thinking;
+    Log.info(.compact, "摘要输入 {d} 字节（预算 {d}）：{s}{s}{s}（丢最老 {d} 条）", .{
+        payload.len,
+        compactionPayloadBudgetBytes(app.contextWindowCurrent()),
+        if (built.include_thinking) "带思考" else "剥思考",
+        if (built.hard_truncated) " · 加狠截断" else "",
+        if (built.dropped_messages > 0) " · 从最老端丢消息" else "",
+        built.dropped_messages,
+    });
 
     // 摘要请求：一次性路由 id + 不写 prompt cache（避免污染正式会话缓存）
     var seed: [16]u8 = undefined;
@@ -6219,7 +6291,7 @@ fn compactionExecute(plan: *CompactionPlan) void {
     };
     defer client.deinitClient();
 
-    const msgs = [_]ai.Message{
+    var msgs = [_]ai.Message{
         .{ .role = "system", .content = compaction_system_prompt },
         .{ .role = "user", .content = payload },
     };
@@ -6235,6 +6307,26 @@ fn compactionExecute(plan: *CompactionPlan) void {
     while (true) {
         client.streamMessage(&msgs, &.{}, &app.compact_cancel, &collector, SummaryCollector.cb, null) catch |e| {
             if (!streamErrorRetryable(e) or attempt >= stream_retry_max or app.compact_cancel.load(.acquire)) {
+                // 第 2 层兜底：首试带思考、重试耗尽仍失败 → 剥思考重建后重试一次
+                if (payload_thinking and e != error.Canceled and !app.compact_cancel.load(.acquire)) {
+                    if (client.takeErrorBody()) |body| app.allocator.free(body);
+                    payload = buildCompactionPayload(plan.arena.allocator(), plan.history, range, prev_summary, .{ .include_thinking = false }) catch {
+                        plan.err = "构建摘要输入失败";
+                        return;
+                    };
+                    payload_thinking = false;
+                    msgs[1].content = payload;
+                    collector.list.clearRetainingCapacity();
+                    collector.reasoning.clearRetainingCapacity();
+                    collector.reasoning_start_ms = 0;
+                    collector.reasoning_end_ms = 0;
+                    if (plan.async and !compactRetryHandshake(app, &app.compact_cancel)) {
+                        plan.err = "已取消";
+                        return;
+                    }
+                    Log.warn(.compact, "压缩请求失败（{s}）→ 剥思考重试一次", .{@errorName(e)});
+                    continue;
+                }
                 plan.err = if (e == error.Canceled) "已取消" else @errorName(e);
                 if (client.takeErrorBody()) |body| {
                     defer app.allocator.free(body);
@@ -6298,7 +6390,7 @@ fn compactionExecute(plan: *CompactionPlan) void {
         .reasoning = collector.reasoning.items,
         .reasoning_ms = collector.reasoningMs(),
     }) catch 0;
-    const tokens_before = estimateTokens(historyRequestBytesSlice(plan.history) + toolsSchemaBytes());
+    const tokens_before = estimateTokens(historyRequestBytesSlice(plan.history, plan.counts_reasoning) + toolsSchemaBytes());
     _ = db.insertCompaction(
         plan.session_id,
         if (summary_msg_id != 0) "" else collector.list.items,
@@ -6325,12 +6417,16 @@ fn compactionWorker(plan: *CompactionPlan) void {
 
 /// 估算 job.history 发一次请求的 token 数（优先 usage 锚点 + 增量）
 fn estimateJobRequestTokens(job: *const StreamJob) usize {
+    const cr = job.behavior.interleaved.len > 0;
+    // 取大：账本口径（真实 usage + 增量，可能过期）vs 全量字节口径（永远按当前要发什么算）。
+    // 账本过期偏低时取大能照出真实大小（防漏压）；字节估算偏低时账本更准。哪个大用哪个。
+    const pure = estimateTokens(historyRequestBytesSlice(job.history, cr) + toolsSchemaBytes());
     if (job.anchor_tokens > 0 and job.anchor_len <= job.history.len) {
-        const inc = historyRequestBytesSlice(job.history[job.anchor_len..]);
-        return @intCast(job.anchor_tokens + estimateTokens(inc));
+        const inc = historyRequestBytesSlice(job.history[job.anchor_len..], cr);
+        const anchored: usize = @intCast(job.anchor_tokens + estimateTokens(inc));
+        return @max(anchored, pure);
     }
-    // 政策A：system 由加载/新建路径前置进 job.history，无需单独补计
-    return estimateTokens(historyRequestBytesSlice(job.history) + toolsSchemaBytes());
+    return pure;
 }
 
 /// 回合中途压缩：worker 已实时落库，整段 job.history（含当前回合）都可参与压缩。
@@ -6356,20 +6452,21 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
     const arena = job.arena.allocator();
     // 区间：默认按保留窗口选；手动排队时若选不中（内容较少，默认窗口吃掉全部），
     // 按历史字节逐级缩小（与同步路径 chooseCompactionKeep 的自适应一致）
+    const cr = job.behavior.interleaved.len > 0;
     const keep_bytes_default = (if (keep_override > 0)
         keep_override
     else if (job.keep_recent_tokens > 0)
         job.keep_recent_tokens
     else
         20_000) * 4;
-    var range = selectCompactionRange(hist, keep_bytes_default);
+    var range = selectCompactionRange(hist, keep_bytes_default, cr);
     if (range == null and force) {
-        const hist_bytes = historyRequestBytesSlice(hist);
+        const hist_bytes = historyRequestBytesSlice(hist, cr);
         const fractions = [_]usize{ 2, 4, 8, 16, 32 };
         for (fractions) |f| {
             const k = hist_bytes / f / 4;
             if (k == 0) break;
-            if (selectCompactionRange(hist, k * 4)) |r| {
+            if (selectCompactionRange(hist, k * 4, cr)) |r| {
                 range = r;
                 break;
             }
@@ -6385,7 +6482,17 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
     else
         "";
 
-    const payload = buildCompactionPayload(arena, hist, rng, prev_summary) catch return false;
+    const built = buildBudgetedCompactionPayload(arena, hist, rng, prev_summary, job.context_window) catch return false;
+    var payload = built.payload;
+    var payload_thinking = built.include_thinking;
+    Log.info(.compact, "摘要输入 {d} 字节（预算 {d}）：{s}{s}{s}（丢最老 {d} 条）", .{
+        payload.len,
+        compactionPayloadBudgetBytes(job.context_window),
+        if (built.include_thinking) "带思考" else "剥思考",
+        if (built.hard_truncated) " · 加狠截断" else "",
+        if (built.dropped_messages > 0) " · 从最老端丢消息" else "",
+        built.dropped_messages,
+    });
 
     // 摘要请求：一次性路由 id + 不写缓存
     var seed: [16]u8 = undefined;
@@ -6411,7 +6518,7 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
     };
     defer client.deinitClient();
 
-    const msgs = [_]ai.Message{
+    var msgs = [_]ai.Message{
         .{ .role = "system", .content = compaction_system_prompt },
         .{ .role = "user", .content = payload },
     };
@@ -6440,6 +6547,20 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
     while (true) {
         client.streamMessage(&msgs, &.{}, cancel, &collector, SummaryCollector.cb, null) catch |e| {
             if (!streamErrorRetryable(e) or attempt >= stream_retry_max or cancel.load(.acquire)) {
+                // 第 2 层兜底：首试带思考、重试耗尽仍失败 → 剥思考重建后重试一次
+                if (payload_thinking and e != error.Canceled and !cancel.load(.acquire)) {
+                    if (client.takeErrorBody()) |body| job.app.allocator.free(body);
+                    payload = buildCompactionPayload(arena, hist, rng, prev_summary, .{ .include_thinking = false }) catch return false;
+                    payload_thinking = false;
+                    msgs[1].content = payload;
+                    collector.list.clearRetainingCapacity();
+                    collector.reasoning.clearRetainingCapacity();
+                    collector.reasoning_start_ms = 0;
+                    collector.reasoning_end_ms = 0;
+                    if (!compactRetryHandshake(job.app, cancel)) return false;
+                    Log.warn(.compact, "压缩请求失败（{s}）→ 剥思考重试一次", .{@errorName(e)});
+                    continue;
+                }
                 // 失败时释放捕获的服务端错误体（该路径不展示详情，仅避免泄漏）
                 if (client.takeErrorBody()) |body| job.app.allocator.free(body);
                 return false;
@@ -7073,6 +7194,12 @@ fn cmdAsk(init: std.process.Init, opt: CliOptions) u8 {
 
     const turn_start_msgs = state.messages.items.len;
     const turn_start_hist = state.history.items.len;
+    // 行 id 基线：发起前压缩会重建历史（turn_start_hist 失效）→ 答案兜底按 DB 行 id 取
+    const turn_start_row: i64 = blk: {
+        var mx: i64 = 0;
+        for (state.history.items) |m| mx = @max(mx, m.db_id);
+        break :blk mx;
+    };
     var progress = CliProgress{
         .quiet = opt.quiet,
         .stream = opt.stream,
@@ -7092,7 +7219,8 @@ fn cmdAsk(init: std.process.Init, opt: CliOptions) u8 {
     }
     progress.tick(&state);
 
-    // 本轮最终回答（历史里最后一条有正文的 assistant）
+    // 本轮最终回答（历史里最后一条有正文的 assistant）。
+    // 发起前/中途压缩会重建历史（turn_start_hist 失效）→ 再按数据库行 id 兜底。
     var answer: []const u8 = "";
     var tool_calls: usize = 0;
     if (turn_start_hist <= state.history.items.len) {
@@ -7100,6 +7228,14 @@ fn cmdAsk(init: std.process.Init, opt: CliOptions) u8 {
             if (std.mem.eql(u8, m.role, "assistant")) {
                 if (m.content.len > 0) answer = m.content;
                 if (m.tool_calls) |cs| tool_calls += cs.len;
+            }
+        }
+    }
+    if (answer.len == 0) {
+        const rows_opt: ?[]const db_mod.MessageRow = db.loadMessagesAfter(sid, turn_start_row) catch null;
+        if (rows_opt) |rows| {
+            for (rows) |m| {
+                if (std.mem.eql(u8, m.role, "assistant") and m.content.len > 0) answer = m.content;
             }
         }
     }
@@ -8393,6 +8529,12 @@ fn cloneMessage(allocator: Allocator, m: ai.Message) error{OutOfMemory}!ai.Messa
         allocator.free(out.role);
         allocator.free(out.content);
     }
+    if (m.reasoning.len > 0) {
+        out.reasoning = try sanitizeDup(allocator, m.reasoning);
+    }
+    if (out.reasoning.len > 0) {
+        errdefer allocator.free(out.reasoning);
+    }
     if (m.tool_call_id) |id| {
         out.tool_call_id = try sanitizeDup(allocator, id);
     }
@@ -8425,6 +8567,7 @@ fn freeToolCall(allocator: Allocator, c: ai.ToolCall) void {
 fn freeMessage(allocator: Allocator, m: ai.Message) void {
     allocator.free(m.role);
     allocator.free(m.content);
+    if (m.reasoning.len > 0) allocator.free(m.reasoning);
     if (m.tool_call_id) |id| allocator.free(id);
     if (m.tool_calls) |calls| {
         for (calls) |c| freeToolCall(allocator, c);
@@ -8457,6 +8600,8 @@ fn appendAssistantTurn(job: *StreamJob, arena: Allocator, calls: []const ai.Tool
     const msg = ai.Message{
         .role = "assistant",
         .content = try arena.dupe(u8, job.content.items),
+        // 思考一并进历史（后续轮次按能力表回传；见 ai.zig messageToValue）
+        .reasoning = try arena.dupe(u8, job.reasoning.items),
         .tool_calls = if (calls.len > 0) try cloneToolCalls(arena, calls) else null,
     };
     const entry = TranscriptEntry{
@@ -8825,7 +8970,7 @@ fn streamWorker(job: *StreamJob) void {
     defer if (worker_db) |*d| d.deinit();
 
     // 持续循环，直到模型不再返回工具调用（自然结束）、出错或被用户取消
-    while (true) {
+    rounds: while (true) {
         // 工具轮次边界：把用户排队消息注入历史（下一轮请求即可见）
         injectPendingSends(job, &worker_db);
 
@@ -8890,6 +9035,33 @@ fn streamWorker(job: *StreamJob) void {
                 if (!streamErrorRetryable(err) or attempt >= stream_retry_max or
                     app.stream_cancel.load(.acquire))
                 {
+                    // 第 3 层救援：重试耗尽的失败（不管原因）→ 强制压缩一次并重发整请求
+                    // （一次性，防死循环）。不依赖错误码：实测网关超限时可能直接掐流、
+                    // 不给错误体；错误体可识别为"输入超限"时保留更具体的日志/提示。
+                    const overflow = if (client.error_body) |b| isContextOverflowText(b) else false;
+                    if (err != error.Canceled and !job.overflow_recovery_attempted and
+                        !app.stream_cancel.load(.acquire))
+                    {
+                        job.overflow_recovery_attempted = true;
+                        var recovered = false;
+                        if (ensureWorkerDb(job, &worker_db)) |wdb| {
+                            recovered = compactJobHistory(job, wdb, true, 0);
+                        }
+                        if (recovered) {
+                            // 释放本次错误体（重发前，避免泄漏）
+                            if (client.takeErrorBody()) |body| app.allocator.free(body);
+                            if (overflow) {
+                                Log.warn(.compact, "上下文溢出 → 已自动压缩，重发请求（一次性自愈）", .{});
+                                pushStreamEvent(app, .toast, "", "上下文超限：已自动压缩并重发", "", "", false);
+                            } else {
+                                Log.warn(.compact, "请求失败（{s}）→ 已自动压缩，重发请求（一次性救援）", .{@errorName(err)});
+                                pushStreamEvent(app, .toast, "", "请求失败：已自动压缩并重发", "", "", false);
+                            }
+                            job.content.clearRetainingCapacity();
+                            job.reasoning.clearRetainingCapacity();
+                            continue :rounds;
+                        }
+                    }
                     // 终态失败：累计本次尝试 usage（真实消耗）后走原有错误路径
                     job.usage_input += client.usage.input_tokens;
                     job.usage_output += client.usage.output_tokens;
@@ -11386,15 +11558,20 @@ fn drawInputStatus(state: *AppState, area: Rect, buf: *Buffer) void {
 
     if (model.len > 0) {
         // 最左：上下文占用（已用/窗口 + 百分比，按压力着色）。
-        // 无数据（新会话）时显示 0%；数据来源 = 服务端最近一次真实回传
-        const used_tokens = state.context_usage.input_tokens + state.context_usage.output_tokens;
+        // 取大：服务端最近一次真实回传 vs 当前估算（与压缩决策同口径）——
+        // 账本过期偏低时显示真实大小；估算胜出时加 ~ 前缀。
+        const real_tokens = state.context_usage.input_tokens + state.context_usage.output_tokens;
+        const est_tokens: u64 = @intCast(state.estimateRequestTokens());
+        const est_wins = est_tokens > real_tokens;
+        const used_tokens = if (est_wins) est_tokens else real_tokens;
         {
             const ctx = state.contextWindowCurrent();
             const pct = contextUsagePercent(used_tokens, ctx);
             var b0: [24]u8 = undefined;
             var b1: [24]u8 = undefined;
             var sb: [96]u8 = undefined;
-            const size_text = std.fmt.bufPrint(&sb, " {s}/{s} ", .{
+            const size_text = std.fmt.bufPrint(&sb, " {s}{s}/{s} ", .{
+                if (est_wins) "~" else "",
                 formatCount(&b0, used_tokens),
                 formatCount(&b1, ctx),
             }) catch "";
@@ -14663,6 +14840,98 @@ test "usage 锚点：估算 = 真实 usage + 其后增量；历史重建后失�
         .{ .role = "assistant", .content = "x" ** 400 }, // 400B ≈ 100 tokens
     });
     try std.testing.expectEqual(@as(usize, 900_100), estimateJobRequestTokens(&job));
+}
+
+test "估算：思考回传口径（能力表）+ 锚点随模型切换失效" {
+    // 能力表口径：interleaved 非空 → 回传思考（估算计入 reasoning）
+    try std.testing.expect(countsReasoningFor("opencode", "deepseek-v4.1-flash"));
+    // 表外/空预设 → 不回传（不计入）
+    try std.testing.expect(!countsReasoningFor("", "no-such-model-zzz"));
+
+    var state = AppState{};
+    state.allocator = std.testing.allocator;
+    defer {
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+    }
+    state.appendHistory("system", "sys");
+    state.appendHistory("user", "hello");
+
+    // 锚点 key = 当前模型（默认空 provider/模型）→ 相符，用锚点（估算 = 锚点值本身）
+    state.usage_anchor_tokens = 10_000;
+    state.usage_anchor_len = state.history.items.len;
+    state.usage_anchor_key = modelIdentityKey("", "");
+    try std.testing.expectEqual(@as(usize, 10_000), state.estimateRequestTokens());
+
+    // key=0（未标注，兼容手设锚点）不校验 → 仍用锚点
+    state.usage_anchor_key = 0;
+    try std.testing.expectEqual(@as(usize, 10_000), state.estimateRequestTokens());
+
+    // 模型切换后 key 不再相符 → 弃用锚点、回退全量估算
+    state.usage_anchor_key = modelIdentityKey("", "another-model");
+    try std.testing.expect(state.estimateRequestTokens() != 10_000);
+}
+
+test "估算：回传思考的模型把 reasoning 计入请求量（集成）" {
+    var state = AppState{};
+    state.allocator = std.testing.allocator;
+    defer {
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        state.config.providers.deinit(std.testing.allocator);
+    }
+    // 一个 preset=opencode 的 provider + 回传型模型（interleaved = reasoning_content）
+    try state.config.providers.append(std.testing.allocator, .{
+        .name = @constCast("opencode"),
+        .endpoint = @constCast("http://127.0.0.1"),
+        .api_key = @constCast("k"),
+        .preset = @constCast("opencode"),
+    });
+    state.config.current_provider_name = @constCast("opencode");
+    state.config.current_model = @constCast("deepseek-v4.1-flash");
+
+    state.appendHistory("system", "sys");
+    state.appendHistory("user", "u");
+    state.appendHistory("assistant", "a");
+    state.history.items[2].reasoning = try std.testing.allocator.dupe(u8, "r" ** 400);
+
+    const no_reasoning = estimateTokens(historyRequestBytesSlice(state.history.items, false) + toolsSchemaBytes());
+    try std.testing.expect(state.estimateRequestTokens() > no_reasoning);
+    try std.testing.expectEqual(no_reasoning + 100, state.estimateRequestTokens());
+}
+
+test "估算取大：账本过期偏低（口径漂移）时用字节估算防漏压；账本更大时用账本" {
+    var state = AppState{};
+    state.allocator = std.testing.allocator;
+    defer {
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        state.config.providers.deinit(std.testing.allocator);
+    }
+    try state.config.providers.append(std.testing.allocator, .{
+        .name = @constCast("opencode"),
+        .endpoint = @constCast("http://127.0.0.1"),
+        .api_key = @constCast("k"),
+        .preset = @constCast("opencode"),
+    });
+    state.config.current_provider_name = @constCast("opencode");
+    state.config.current_model = @constCast("deepseek-v4.1-flash");
+
+    state.appendHistory("system", "sys");
+    state.appendHistory("user", "u");
+    state.appendHistory("assistant", "a");
+    state.history.items[2].reasoning = try std.testing.allocator.dupe(u8, "r" ** 400);
+
+    // 账本 = 旧口径（不含思考）的小数字：纯字节估算（含思考）明显更大 → 取大用字节估算
+    state.usage_anchor_tokens = 100;
+    state.usage_anchor_len = state.history.items.len;
+    const pure = estimateTokens(historyRequestBytesSlice(state.history.items, true) + toolsSchemaBytes());
+    try std.testing.expect(pure > 200);
+    try std.testing.expectEqual(pure, state.estimateRequestTokens());
+
+    // 账本比字节估算大（如英文内容字节估算偏低 / 真实值含思考）→ 取大用账本
+    state.usage_anchor_tokens = @intCast(pure + 1_000_000);
+    try std.testing.expectEqual(@as(usize, pure + 1_000_000), state.estimateRequestTokens());
 }
 
 test "usage 锚点：只认正常结束的回合，取消不设锚点" {

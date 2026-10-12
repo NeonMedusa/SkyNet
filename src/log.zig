@@ -26,6 +26,7 @@ pub const Module = enum {
     db, // 数据库打开/落库失败
     compact, // 上下文压缩
     fold, // 工具输出折叠
+    cache, // 缓存诊断（请求体指纹/网关端点）
 };
 
 /// 保留最近 N 份日志文件

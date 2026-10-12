@@ -108,17 +108,71 @@ Terminal.flush → 仅输出变化单元格（SGR 合并）→ 同步输出块�
 - **后续候选**：bracketed paste（POSIX 接线）、Windows VT 输入（先 issue 探路）、
   模糊宽度（先 issue 探路）。skip：`width_overrides` 名单等应用层 curation 留 fork。
 
-### 2.3 搁置的实验（存档）
+### 2.3 思考回传（interleaved reasoning）
+
+**已落地（2026-10）**：部分网关在 thinking 模式下要求历史里每个 assistant 消息
+都回传思考字段（DeepSeek 系为典型；缺失会 400 "reasoning_content must be passed back"）。
+处理方式与 pi / opencode 一致：
+
+- 能力表带 `interleaved` 字段（`reasoning` / `reasoning_content` / `reasoning_text`），
+  生成时从 models.dev 的 `interleaved.field` 提取（只认三个已知字段名）；
+- 发送时 assistant 消息带该字段：有思考发内容，没有也发空串兑底
+  （opencode 注释：“Always set the field even when empty”）；未标记的模型不回传（省 token）；
+- 历史两路都带 reasoning：DB 加载（`row.reasoning` → history）与 worker 实时
+  （`appendAssistantTurn` 把 `job.reasoning` 带入 `job.history`）。
+- **估算与发送同口径（P1）**：`messageRequestBytes` 接受 `count_reasoning` 参数，仅当当前
+  模型 interleaved 非空时把 assistant 的 reasoning 计入请求量（压缩触发/保留区选择/
+  记录 `tokens_before` 全部同源）。不低估、非回传模型不过估。
+- **估算取大（2026-10-12）**：预检估算 = max(账本口径, 全量字节口径)。账本 = 上次真实
+  usage + 增量（锚点带模型标签 `usage_anchor_key` = provider+模型哈希，模型切换即弃用；
+  但"同模型换构建/换口径"拦不住）；字节口径永远按"当前要发什么"算。**哪个大用哪个**——
+  账本过期偏低时照出真实大小防漏压，字节估算偏低（英文/代码内容）时账本更准。修掉实测
+  自锁：v15 时代会话升级后锚点仍"模型相符"但口径过期（66.7 万 vs 实际 590 万）→ 不触发
+  压缩 → 22.97MB 请求被网关掐流 → 4 连败。状态栏显示同口径（估算胜出时加 `~` 前缀）。
+- **压缩（摘要）请求的思考策略（2026-10-12，对齐 pi/opencode 但带降级）**：摘要输入
+  **默认带思考**（`[thinking]` 文本段）；超预算按阶梯降级：**剥思考 → 工具加狠截断
+  （2000→500 / 500→200）→ 从最老端丢消息**（上一轮摘要始终保留、至少保留最后一条）。
+  预算 = 窗口按"1 token ≥ 3 字节"保守换算（如 100 万窗口 ≈ 2.95MB），给摘要输出留余量。
+  摘要请求若仍失败（重试耗尽）→ 剥思考重试一次。提示词：查证 pi/opencode 均无"思考怎么
+  处理"指引 → 本仓库也不加。实测（卡死会话自愈）：带思考 20.8MB 超预算 → 剥思考
+  1.48MB（455k tokens）→ 摘要成功 → 重建 → 58 条消息小请求 → 回复落库 ✅。
+- **失败救援（P2 泛化，2026-10-12）**：worker 失败路径：**重试耗尽的失败（不管原因、
+  不认错误码）→ 强制压缩一次 → 重发整请求；只救一次**（`overflow_recovery_attempted`，
+  防死循环）。错误体可识别为"输入超限"（`isContextOverflowText`，pi/opencode 错误模式
+  表的通用子串）时保留更具体的日志/提示。**为什么泛化**：实测本网关超限时不给错误体
+  （HTTP 200 接受后直接掐流，`StreamTruncated`），旧版"只认错误体"的 P2 永远不会触发。
+- **cmdAsk 答案兜底（2026-10-12）**：`ask` 的最终回答原本只扫本轮新增的 history 切片；
+  发起前压缩会重建历史（基线失效）→ 增加按 DB 行 id 兜底（`loadMessagesAfter`）。
+- **发起前自动压缩改在 worker 内异步执行（2026-10-12）**：此前 `askAI` 在主线程同步
+  压缩（大会话冻结界面 30~100 秒、消息滞留输入框）→ 移除该调用，交给 worker 首轮前
+  检查（界面显示"正在压缩…"气泡、输入保持可用）。
+
+**待办（未解决）**：
+
+- **openrouter 的 `reasoning_details` 协议**：openrouter 用结构化数组（type/text/signature）
+  而非字符串字段（全库 12 个模型标 `reasoning_details`，另有 7 个 `reasoning_content`）。
+  opencode 在通用 interleaved 路径里**明确排除 openrouter**（交给 AI SDK 适配层）；
+  我们目前对 `reasoning_details` 类模型不回传（保持现状），`reasoning_content` 类正常回传。
+  将来若直连 openrouter 遇到同类 400，需要：SSE 解析器保存结构化 reasoning（含 signature）、
+  请求序列化时按 `reasoning_details` 数组回传，并做**来源感知**（签名必须同源才能回传）。
+- **`interleaved: true`（boolean）**：107 个模型（bedrock/vercel 等）标记为 true，无字段名。
+  opencode 同样不处理（只认 object.field）；这些走各自 SDK 适配层。
+- **其他系是否该回传**：目前以 models.dev 的 `interleaved` 标记为准（约 1100+ 模型自动覆盖，
+  openai/groq/mistral/xai/google 为 0——本来也不需要）。若实测发现漏标（有网关实际要求
+  但 models.dev 未标），写进 `tools/model_corrections.json` 的 `interleaved` 字段即可。
+
+### 2.4 搁置的实验（存档）
 
 - **断流"续思交接"**：重试时不重发原请求，而是把已产出的部分思考注入为提示，让模型
   从中断处继续。**搁置原因**：无先例；模型可能无视"继续"指示而重头思考（反而更贵）。
   **重启条件**：长思考断流频繁且重试成本成痛点时，先做手动版（如 `/retry continue`）
-  对照实测。注：协议不支持真正的"续传"（reasoning 不能回传），整请求重发是唯一正解。
+  对照实测。注：协议层思考回传已支持（见 2.3）；但真正的"续传"仍不可能，
+  整请求重发是唯一正解。
 
 （断连重试的当前参数：2 次、2s/4s ±25%，代码常量 `stream_retry_max` /
 `stream_retry_delayMs`；网关长时间抖动时调大即可。）
 
-### 2.4 设计讨论（存档）：会话跨目录、/cd 与提示词系统
+### 2.5 设计讨论（存档）：会话跨目录、/cd 与提示词系统
 
 > 状态：**讨论稿，未实现；当前决策：不做**。若将来（顶不住压力/需求出现）要引入
 > 目录级提示词、`/cd` 或"会话记忆 cwd"，从本节重启讨论。
@@ -219,7 +273,7 @@ pi 已实现该场景（`session-cwd.ts`）——会话 cwd 不存在时：交�
 再加；C 与 A 互补（C 决定"在哪工作"，A 决定"知道自己在哪"），两者都做则跨目录困惑
 基本消除。`/cd` 可独立于提示词系统先做（第 1、3 点不依赖提示词）。
 
-### 2.5 工具集演进（待观察与设想）
+### 2.6 工具集演进（待观察与设想）
 
 **背景**：2026-09 对工具集做了一轮"低成本高收益"改进（`edit` 匹配失败给诊断线索、
 `ls` 新增 `depth` 递归参数），并对照调研了 pi / opencode 的工具设计（详见
@@ -280,7 +334,7 @@ Claude Code / Cursor / Aider 用 `old_string`/`old_str`，我们用蛇形 `old_t
 **结论**：暂不做；若将来出现真实需求（如用户抱怨"换了 agent 后旧习惯失效"）再评估。
 当前容错层只保留一种：`edits` 传成单个对象（纯格式差异，无命名歧义）。
 
-### 2.6 生成中手动压缩（排队）——已实现（2026-09-22）
+### 2.7 生成中手动压缩（排队）——已实现（2026-09-22）
 
 生成中按 `/compact` 不再被拒：**排队到下一个工具轮间隙执行**，与自动压缩
 **同位置同函数**（`streamWorker` 循环的 `injectPendingSends` 之后）。用户可见行为：

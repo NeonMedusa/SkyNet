@@ -56,6 +56,8 @@ pub const Message = struct {
     tool_call_id: ?[]const u8 = null,
     /// 助手消息发起的工具调用
     tool_calls: ?[]const ToolCall = null,
+    /// 助手消息的思考内容（仅本地使用；发送时按 behavior.interleaved 决定是否回传）
+    reasoning: []const u8 = "",
     /// 落库行 id（0 = 未落库；仅本地使用，不参与请求序列化）
     db_id: i64 = 0,
     /// 已对 AI 折叠（仅本地使用；content 仍是全文，发请求前换 stub）
@@ -127,7 +129,7 @@ pub fn buildRequestBody(
     var msg_arr = std.json.Array.init(a);
     // 修复悬空工具调用（取消/中止导致结果缺失）后再序列化，避免服务端拒绝整个请求
     const repaired = try repairDanglingToolCalls(a, messages);
-    for (repaired) |m| try msg_arr.append(try messageToValue(a, m));
+    for (repaired) |m| try msg_arr.append(try messageToValue(a, m, behavior.interleaved));
     try root.put(a, "messages", .{ .array = msg_arr });
 
     if (tools.len > 0) {
@@ -209,7 +211,7 @@ fn repairDanglingToolCalls(a: Allocator, messages: []const Message) error{OutOfM
     return out.items;
 }
 
-fn messageToValue(a: Allocator, m: Message) error{OutOfMemory}!std.json.Value {
+fn messageToValue(a: Allocator, m: Message, interleaved: []const u8) error{OutOfMemory}!std.json.Value {
     var obj = std.json.ObjectMap{};
     // 内部 role（system 通知 / summary）不直接发给网关：
     // 对话中间出现的 system 消息各网关处理不一致（有的报错、有的忽略）。
@@ -220,6 +222,13 @@ fn messageToValue(a: Allocator, m: Message) error{OutOfMemory}!std.json.Value {
         try obj.put(a, "content", .null);
     } else {
         try obj.put(a, "content", .{ .string = m.content });
+    }
+    // 思考回传：部分网关（DeepSeek 系、MiMo、GLM 等）在 thinking 模式下要求
+    // 历史里每个 assistant 消息都带对应 reasoning 字段——有内容发内容，
+    // 没有也发空串兜底（pi / opencode 同款做法："Always set the field even
+    // when empty"）。未标记 interleaved 的模型不回传（省 token）。
+    if (interleaved.len > 0 and std.mem.eql(u8, m.role, "assistant")) {
+        try obj.put(a, interleaved, .{ .string = m.reasoning });
     }
     if (m.tool_call_id) |id| try obj.put(a, "tool_call_id", .{ .string = id });
     if (m.tool_calls) |calls| {
@@ -697,6 +706,7 @@ pub const AI = struct {
             self.config.behavior,
         );
         defer self.allocator.free(body_json);
+        logRequestBodyFingerprint(body_json);
 
         // Build full URL
         const base = self.config.endpoint;
@@ -758,6 +768,10 @@ pub const AI = struct {
         // 重定向可能换了连接：刷新句柄
         self.watchPublishConnection(request.connection);
 
+        // 网关端点标识（缓存诊断：同会话端点漂移 → miss 可归因于路由）
+        var endpoint_buf: [64]u8 = undefined;
+        const endpoint_id = copyHeaderValue(response.head, "x-opencode-endpoint-id", &endpoint_buf);
+
         const status = response.head.status;
         if (status.class() != .success) {
             // 非成功响应记录状态码：此前该信息在错误分类中被静默丢弃，事后无从诊断
@@ -817,12 +831,41 @@ pub const AI = struct {
             Log.warn(.api, "流被截断（无 [DONE]/finish_reason）({d}ms)", .{std.Io.Timestamp.now(self.io, .awake).toMilliseconds() - t0});
             return error.StreamTruncated;
         }
-        Log.info(.api, "响应 {d}ms in={d} cached={d} out={d}", .{
+        Log.info(.api, "响应 {d}ms in={d} cached={d} out={d} endpoint={s}", .{
             std.Io.Timestamp.now(self.io, .awake).toMilliseconds() - t0,
             self.usage.input_tokens,
             self.usage.cached_tokens,
             self.usage.output_tokens,
+            endpoint_id,
         });
+    }
+
+    /// 缓存诊断：请求体指纹（固定偏移处的哈希 + 全长，偏移按 4× 递增便于定位漂移点）。
+    /// 与响应里的 cached= 对照：指纹未变而 cached 低 → 网关侧；指纹变了 → 我们改了前缀
+    /// （折叠/压缩/重建），且可从最近一个“仍相同”的偏移估算失效位置。
+    fn logRequestBodyFingerprint(body: []const u8) void {
+        const Wyhash = std.hash.Wyhash;
+        const cuts = [_]usize{ 4 << 10, 16 << 10, 64 << 10, 256 << 10, 1 << 20, 4 << 20 };
+        var h: [cuts.len]u64 = .{ 0, 0, 0, 0, 0, 0 };
+        for (cuts, 0..) |c, i| {
+            if (body.len >= c) h[i] = Wyhash.hash(0, body[0..c]);
+        }
+        Log.info(.cache, "请求指纹 bytes={d} h4k={x} h16k={x} h64k={x} h256k={x} h1m={x} h4m={x} full={x}", .{
+            body.len, h[0], h[1], h[2], h[3], h[4], h[5], Wyhash.hash(0, body),
+        });
+    }
+
+    /// 从响应头复制一个字段值（大小写不敏感）到调用方缓冲；找不到返回 ""。
+    pub fn copyHeaderValue(head: http.Client.Response.Head, name: []const u8, buf: []u8) []const u8 {
+        var it = head.iterateHeaders();
+        while (it.next()) |hdr| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, name)) {
+                const n = @min(hdr.value.len, buf.len);
+                @memcpy(buf[0..n], hdr.value[0..n]);
+                return buf[0..n];
+            }
+        }
+        return "";
     }
 
     pub fn listModels(self: *AI) AIError![]ModelInfo {
@@ -1389,4 +1432,57 @@ test "请求体：真实工具 schema（线程内构建，回归 arena UAF）" {
     };
     const t = try std.Thread.spawn(.{}, T.run, .{});
     t.join();
+}
+
+test "请求体：思考回传（interleaved 字段按能力表发送）" {
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .content = "hello", .reasoning = "让我想想" },
+        .{ .role = "user", .content = "again" },
+    };
+
+    // 1. DeepSeek 系（reasoning_content）：assistant 带回思考内容
+    const b1 = try buildRequestBody(std.testing.allocator, "m", &messages, &.{}, "", .{ .interleaved = "reasoning_content" });
+    defer std.testing.allocator.free(b1);
+    try std.testing.expect(std.mem.indexOf(u8, b1, "\"reasoning_content\":\"让我想想\"") != null);
+
+    // 2. 未标记（OpenAI 系等）：不回传（省 token）
+    const b2 = try buildRequestBody(std.testing.allocator, "m", &messages, &.{}, "", .{});
+    defer std.testing.allocator.free(b2);
+    try std.testing.expect(std.mem.indexOf(u8, b2, "reasoning_content") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b2, "让我想想") == null);
+
+    // 3. 空串兜底：assistant 无思考时也发空字段（pi/opencode 同款）
+    const no_reasoning = [_]Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .content = "hello" },
+    };
+    const b3 = try buildRequestBody(std.testing.allocator, "m", &no_reasoning, &.{}, "", .{ .interleaved = "reasoning_content" });
+    defer std.testing.allocator.free(b3);
+    try std.testing.expect(std.mem.indexOf(u8, b3, "\"reasoning_content\":\"\"") != null);
+
+    // 4. reasoning_text 变体（llama.cpp 等）
+    const b4 = try buildRequestBody(std.testing.allocator, "m", &messages, &.{}, "", .{ .interleaved = "reasoning_text" });
+    defer std.testing.allocator.free(b4);
+    try std.testing.expect(std.mem.indexOf(u8, b4, "\"reasoning_text\":\"让我想想\"") != null);
+
+    // 5. user/tool 消息不带该字段（只有 assistant）
+    const tool_msgs = [_]Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "tool", .content = "result", .tool_call_id = "c1" },
+    };
+    const b5 = try buildRequestBody(std.testing.allocator, "m", &tool_msgs, &.{}, "", .{ .interleaved = "reasoning_content" });
+    defer std.testing.allocator.free(b5);
+    try std.testing.expect(std.mem.indexOf(u8, b5, "reasoning_content") == null);
+}
+
+test "copyHeaderValue：大小写不敏感取响应头（缓存诊断用）" {
+    const raw = "HTTP/1.1 200 OK\r\nX-Opencode-Endpoint-Id: novita-deepseek\r\nContent-Type: text/plain\r\n\r\n";
+    const head = try http.Client.Response.Head.parse(raw);
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("novita-deepseek", AI.copyHeaderValue(head, "x-opencode-endpoint-id", &buf));
+    try std.testing.expectEqualStrings("", AI.copyHeaderValue(head, "missing", &buf));
+    // 超长值截断到缓冲大小
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("novi", AI.copyHeaderValue(head, "x-opencode-endpoint-id", &tiny));
 }
