@@ -263,10 +263,96 @@ pub fn selectCompactionRange(history: []const ai.Message, keep_bytes: usize, cou
 
 pub const compaction_system_prompt =
     "You are a context-compaction assistant for a coding agent. " ++
-    "Summarize the conversation segment so the agent can continue working without the original messages. " ++
+    "Do not continue the conversation. Do not respond to any questions in the conversation. " ++
+    "Only output the summary. " ++
+    "Tools are disabled and cannot actually run: attempting a tool call only outputs bare text, " ++
+    "so never write bare tool-call or tool-result text; " ++
+    "if you must reference tool-call or tool-result text, put it inside code blocks or inline code. " ++
+    "Summarize the conversation segment so the work can be picked up later without the original messages. " ++
     "Keep concrete facts: the user's goal, what was done, key decisions, file paths, commands, errors and outcomes, and next steps. " ++
     "Write in the same language as the conversation. Use short markdown sections: " ++
     "## Goal / ## Progress / ## Key decisions / ## Files / ## Next steps.";
+
+/// 摘要正文的"转录痕迹"标记（与 buildCompactionPayload 的转录格式一致）：
+/// 模型偶尔把"写摘要"变成"继续干活"，输出工具调用/结果/思考痕迹（2026-10-13 事故）。
+pub const summary_garbage_markers = [_][]const u8{
+    "[tool call]",
+    "[tool result",
+    "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}",
+    "[thinking]",
+};
+
+/// 摘要正文垃圾扫描器（**增量**；流式早停与落库前校验共用同一实现）。
+/// 规则：**反引号成对视为代码**（简化 CommonMark：任一反引号在"代码/正常"间切换，
+/// 单个 ` 与 ``` 均被成对反引号覆盖），代码态内不计；代码态外裸出现转录痕迹
+/// ≥3 次 → 垃圾（单次/两次可能只是顺嘴提到）。只扫描正文；思考不扫描。
+pub const SummaryScanner = struct {
+    count: usize = 0,
+    /// 行首命中的标记数（转录形态的强信号：`[tool call] name(` 出现在行首）
+    strong_hits: usize = 0,
+    in_code: bool = false,
+    /// 最近字节环形（保留 ≥ 最长标记长度，供后缀匹配）
+    hist: [64]u8 = undefined,
+    hist_len: usize = 0,
+    /// 累计喂入字节数（判断"命中是否在内容最开头"）
+    total_bytes: usize = 0,
+
+    pub fn feed(self: *SummaryScanner, delta: []const u8) void {
+        for (delta) |b| {
+            if (b == '`') {
+                self.in_code = !self.in_code;
+                self.histPush(b);
+                continue;
+            }
+            self.histPush(b);
+            if (self.in_code) continue;
+            for (summary_garbage_markers) |mk| {
+                if (self.hist_len >= mk.len and
+                    std.mem.eql(u8, self.hist[self.hist_len - mk.len .. self.hist_len], mk))
+                {
+                    self.count += 1;
+                    // 行首判定：命中起点前一个字节是换行（或命中在内容最开头）→ 强信号
+                    const start = self.hist_len - mk.len;
+                    const at_line_start = if (start == 0)
+                        self.total_bytes == mk.len
+                    else
+                        self.hist[start - 1] == '\n';
+                    if (at_line_start) self.strong_hits += 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    pub fn isGarbage(self: *const SummaryScanner) bool {
+        return self.count >= 3 or self.strong_hits >= 1;
+    }
+
+    fn histPush(self: *SummaryScanner, b: u8) void {
+        if (self.hist_len == self.hist.len) {
+            std.mem.copyForwards(u8, self.hist[0..32], self.hist[32..64]);
+            self.hist_len = 32;
+        }
+        self.hist[self.hist_len] = b;
+        self.hist_len += 1;
+        self.total_bytes += 1;
+    }
+};
+
+/// 摘要重试定向提示（追加到载荷**末尾**；前缀不变 → 提示缓存仍命中，只失效尾部一小段）：
+/// 标记型垃圾 → 明示不要续写/不要输出工具调用裸文本；引用一律进代码块/反引号。
+pub const compaction_retry_hint_garbage =
+    "本次只输出摘要正文。不要继续对话、不要调用工具；工具已被禁用，调用只会输出裸文本，请务必避免这类裸文本；如需引用这类文本，请放进代码块或反引号内。";
+/// 截断型（撞输出上限）→ 以正文为主、避免过度思考（思考同样吃上限；“务必简短”反而可能引发更久思考）。
+pub const compaction_retry_hint_truncated =
+    "请以输出摘要正文为主，避免过度思考；优先保留目标（Goal）、下一步（Next steps）与关键文件、命令。";
+
+/// 落库前校验（整段）：扫描器喂全量后判定。
+pub fn summaryLooksGarbage(content: []const u8) bool {
+    var s = SummaryScanner{};
+    s.feed(content);
+    return s.isGarbage();
+}
 
 /// 按字符截断（UTF-8 边界安全；max_chars = 0 表示不截断）
 pub fn truncateChars(s: []const u8, max_chars: usize) []const u8 {
@@ -375,9 +461,10 @@ pub fn buildBudgetedCompactionPayload(
     range: CompactionRange,
     prev_summary: []const u8,
     window_tokens: usize,
+    initial_opts: CompactionPayloadOptions,
 ) !BudgetedPayload {
     const budget = compactionPayloadBudgetBytes(window_tokens);
-    var opts = CompactionPayloadOptions{};
+    var opts = initial_opts;
     var start = range.summarize_start;
     var dropped: usize = 0;
     while (true) {
@@ -461,7 +548,7 @@ test "摘要输入：默认带思考；超预算按阶梯降级（剥思考 → 
 
     // 档位 0：大窗口 → 带思考（上一轮摘要始终在）
     {
-        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, 1_000_000);
+        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, 1_000_000, .{});
         try t.expect(built.include_thinking);
         try t.expect(std.mem.indexOf(u8, built.payload, "R" ** 200) != null);
         try t.expect(std.mem.indexOf(u8, built.payload, prev) != null);
@@ -470,7 +557,7 @@ test "摘要输入：默认带思考；超预算按阶梯降级（剥思考 → 
     {
         const w = windowFor(stripped.len + 8);
         try t.expect(compactionPayloadBudgetBytes(w) < full.len);
-        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, w);
+        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, w, .{});
         try t.expect(!built.include_thinking);
         try t.expect(!built.hard_truncated);
         try t.expectEqual(@as(usize, 0), built.dropped_messages);
@@ -479,7 +566,7 @@ test "摘要输入：默认带思考；超预算按阶梯降级（剥思考 → 
     {
         const w = windowFor(hard.len + 8);
         try t.expect(compactionPayloadBudgetBytes(w) < stripped.len);
-        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, w);
+        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, w, .{});
         try t.expect(!built.include_thinking);
         try t.expect(built.hard_truncated);
         try t.expectEqual(@as(usize, 0), built.dropped_messages);
@@ -487,7 +574,7 @@ test "摘要输入：默认带思考；超预算按阶梯降级（剥思考 → 
     // 档位 3：预算不足 → 从最老端丢消息（上一轮摘要与最新消息保留）
     {
         const w = windowFor(hard.len / 2 + 8);
-        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, w);
+        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, w, .{});
         try t.expect(built.dropped_messages > 0);
         try t.expect(std.mem.indexOf(u8, built.payload, "U" ** 40) == null);
         try t.expect(std.mem.indexOf(u8, built.payload, "B" ** 40) != null);
@@ -495,11 +582,85 @@ test "摘要输入：默认带思考；超预算按阶梯降级（剥思考 → 
     }
     // 档位 4：极端小窗口 → 保底（只剩最后一条），尽力而为返回
     {
-        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, 8);
+        const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, 8, .{});
         try t.expectEqual(@as(usize, 4), built.dropped_messages);
         try t.expect(std.mem.indexOf(u8, built.payload, "B" ** 40) != null);
         try t.expect(std.mem.indexOf(u8, built.payload, prev) != null);
     }
+}
+
+test "压缩提示词：禁止继续 + 只输出摘要 + 工具禁用（对齐 pi/opencode；无 continue working 字样）" {
+    try std.testing.expect(std.mem.indexOf(u8, compaction_system_prompt, "Do not continue the conversation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compaction_system_prompt, "Only output the summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compaction_system_prompt, "Tools are disabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compaction_system_prompt, "bare text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compaction_system_prompt, "continue working") == null);
+}
+
+test "摘要垃圾校验：续写垃圾拒绝 / 引用式摘要通过 / 阈值 ≥3 次" {
+    // 真实事故样本（Sawdust id=18）：续写 + 伪造工具调用/结果 → 垃圾
+    const garbage = "继续大任务。先核对 renderSegment 替换后的当前状态：\n" ++
+        "[tool call] read({\"path\":\"src/audio.zig\"})\n" ++
+        "[tool call] bash({...})\n" ++
+        "[tool result: read]\n" ++
+        "[工具输出已折叠：read 输出 4283 字符]\n" ++
+        "[tool result: bash]\n";
+    try std.testing.expect(summaryLooksGarbage(garbage));
+    // 老事故样本（id=12）：DSML 工具调用特殊标记裸出现 → 垃圾
+    try std.testing.expect(summaryLooksGarbage("<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c} calls>\n<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c} invoke name=\"bash\">\n<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c} parameter name=\"command\">x"));
+    // 思考痕迹裸出现 3 次 → 垃圾
+    try std.testing.expect(summaryLooksGarbage("[thinking] 一 [thinking] 二 [thinking] 三"));
+    // 引用式摘要（真实检查点形态）：标记都在代码块/行内代码里 → 通过
+    const quoting = "## 核心事故\n\n摘要正文出现 `[tool call]` / `[tool result` 即判垃圾：\n\n" ++
+        "```\n继续大任务。\n[tool call] read(...)\n[tool result: read]\n[tool call] bash(...)\n```\n\n" ++
+        "即把转录当成了续写模板。\n";
+    try std.testing.expect(!summaryLooksGarbage(quoting));
+    // 阈值：裸出现 2 次仍通过；3 次才判垃圾
+    try std.testing.expect(!summaryLooksGarbage("正文提到 [tool call] 一次、[tool call] 两次"));
+    // 正常摘要
+    try std.testing.expect(!summaryLooksGarbage("## Goal\n修复提示词。\n## Next steps\n重新压缩。"));
+}
+
+test "摘要重试提示：覆盖两个失败类型（只输出摘要 / 代码块口子 / 不过度思考）" {
+    try std.testing.expect(std.mem.indexOf(u8, compaction_retry_hint_garbage, "只输出摘要正文") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compaction_retry_hint_garbage, "不要继续对话") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compaction_retry_hint_garbage, "代码块或反引号") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compaction_retry_hint_truncated, "过度思考") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compaction_retry_hint_truncated, "Next steps") != null);
+}
+
+test "摘要垃圾扫描：分块喂入与整段一致（跨块半个标记 / 代码态跨界）" {
+    // 代码内引用不计；代码外 3 个裸标记 → 垃圾
+    const sample = "引言 `引用 [tool call]` 与 ```\n块内 [tool result: x]\n``` 之外 [tool call] [tool call] [tool call]";
+    try std.testing.expect(summaryLooksGarbage(sample));
+    // 逐字节喂
+    var s = SummaryScanner{};
+    for (sample) |b| s.feed(&[_]u8{b});
+    try std.testing.expect(s.isGarbage());
+    // 乱切块（每 3 字节，制造跨块半个标记）
+    var s2 = SummaryScanner{};
+    var i: usize = 0;
+    while (i < sample.len) : (i += 3) s2.feed(sample[i..@min(i + 3, sample.len)]);
+    try std.testing.expect(s2.isGarbage());
+    // 2 个裸标记 + 1 个块内标记 → 通过（块内不计）
+    const sample2 = "正文 [tool call] 一次 [tool call] 两次，示例：```[tool call] read()```";
+    var s3 = SummaryScanner{};
+    for (sample2) |b| s3.feed(&[_]u8{b});
+    try std.testing.expect(!s3.isGarbage());
+    // 标记跨块拆开仍能命中（"[tool " + "call]" ×3）
+    var s4 = SummaryScanner{};
+    s4.feed("[tool ");
+    s4.feed("call][tool ");
+    s4.feed("call][tool call]");
+    try std.testing.expect(s4.isGarbage());
+}
+
+test "摘要垃圾扫描：行首标记 1 次即垃圾（行中/代码内不算）" {
+    try std.testing.expect(summaryLooksGarbage("[tool call] read(x)")); // 内容开头
+    try std.testing.expect(summaryLooksGarbage("继续。\n[tool call] read(x)")); // 换行后行首
+    try std.testing.expect(!summaryLooksGarbage("正文里出现 [tool call] 的情况")); // 行中
+    try std.testing.expect(!summaryLooksGarbage("- [tool call] 行")); // 行首是"- "
+    try std.testing.expect(!summaryLooksGarbage("```\n[tool call] read(x)\n```")); // 代码块内
 }
 
 // ── 测试 ──

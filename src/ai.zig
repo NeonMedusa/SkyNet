@@ -103,6 +103,11 @@ pub fn buildRequestBody(
         try root.put(a, "stream_options", .{ .object = stream_options });
     }
 
+    // 输出上限（含思考；0 = 不发）。用户配置 + 按模型钳制后的值由调用方填入 behavior
+    if (behavior.max_tokens > 0) {
+        try root.put(a, "max_tokens", .{ .integer = @intCast(behavior.max_tokens) });
+    }
+
     // 思考强度：openai 兼容发 reasoning_effort；DeepSeek 直连另需 thinking 开关
     // （DeepSeek 有效档位 high/max，关闭用 thinking.type=disabled）
     if (behavior.reasoning_effort.len > 0) {
@@ -330,6 +335,10 @@ const StreamChunk = struct {
     usage: ?StreamUsage = null,
 };
 
+/// 无进度观察日志阈值：请求持续无"真实进度"（只有保活/成本块字节）超此值 → 记 WARN。
+/// **仅提示不中断**（看门狗语义保持"任意字节=活着"）；积累数据后再决定要不要"无进度就切"。
+pub const no_progress_warn_ms: i64 = 180_000;
+
 /// SSE 解析器：把字节流切成 data 行并提取 delta.content
 pub const SseParser = struct {
     allocator: Allocator,
@@ -337,6 +346,10 @@ pub const SseParser = struct {
     finished: bool = false,
     /// 是否见过 finish_reason（部分兼容服务不发 [DONE]，两者任一均视为正常结束）
     saw_finish_reason: bool = false,
+    /// finish_reason="length"（输出被上限截断）
+    stopped_by_length: bool = false,
+    /// 真实进度计数：含 choices 的 chunk 才 +1（保活/成本块/空行不算）
+    progress_chunks: usize = 0,
     /// 工具调用分片累积器（可选）
     tool_calls: ?*ToolCallAccumulator = null,
     /// token 用量输出（可选，最后一个 chunk 带回）
@@ -388,8 +401,10 @@ pub const SseParser = struct {
         }
 
         if (parsed.value.choices.len == 0) return;
+        self.progress_chunks += 1;
         if (parsed.value.choices[0].finish_reason) |fr| {
             if (fr.len > 0) self.saw_finish_reason = true;
+            if (std.mem.eql(u8, fr, "length")) self.stopped_by_length = true;
         }
         const d = parsed.value.choices[0].delta;
         if (d.content) |c| {
@@ -428,6 +443,8 @@ pub const AIError = error{
     StreamTruncated,
     /// 服务端瞬时故障（429 限流 / 5xx）——属"可重试"类，由调用方决定退避重发
     ServerTransient,
+    /// 自动压缩连续两次被拒（模型摘要输出异常）→ 中断回合止损（2026-10-13）
+    CompactionRejected,
 };
 
 pub const ModelInfo = struct {
@@ -491,6 +508,14 @@ pub const AI = struct {
     error_body: ?[]u8 = null,
     /// 最近一次请求的 token 用量（含缓存命中）
     usage: Usage = .{},
+    /// 最近一次请求因输出上限被截断（finish_reason="length"）
+    last_stopped_by_length: bool = false,
+    /// 宿主置位后，进行中的流尽快停下（**不按用户取消处理**；摘要流式垃圾早停用）
+    abort_requested: std.atomic.Value(bool) = .init(false),
+    /// 无进度观察（仅日志）：最近一次"真实进度"（含 choices 的 chunk）的时间戳
+    last_progress_ms: i64 = 0,
+    /// 已就当前无进度段打过 WARN；恢复/结束时补一条总结（仅日志）
+    progress_warned: bool = false,
 
     /// ── 空闲看门狗（长读超时兜底）──
     /// TCP 半开连接（服务端不发也不关）会让阻塞读永久挂住；此处暴露 socket
@@ -695,6 +720,14 @@ pub const AI = struct {
         tool_calls: ?*ToolCallAccumulator,
     ) AIError!void {
         self.usage = .{};
+        self.last_stopped_by_length = false;
+        self.abort_requested.store(false, .release);
+        self.last_progress_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        self.progress_warned = false;
+        // 观察项（仅日志）：请求带着"无进度"状态结束时补一条总结
+        defer if (self.progress_warned) {
+            Log.warn(.api, "无进度结束（请求终止）：共 {d}s（期间仅收到保活类字节）", .{std.Io.Timestamp.now(self.io, .awake).toMilliseconds() - self.last_progress_ms});
+        };
         const t0 = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
         Log.info(.api, "请求 model={s} 消息={d} 工具={d}", .{ self.config.model, history.len, tools.len });
         const body_json = try buildRequestBody(
@@ -810,6 +843,7 @@ pub const AI = struct {
         var parser = SseParser{ .allocator = self.allocator, .tool_calls = tool_calls, .usage = &self.usage };
         defer parser.deinit();
 
+        var aborted_early = false;
         var read_buf: [4096]u8 = undefined;
         while (!parser.finished) {
             if (cancel.load(.acquire)) return error.Canceled;
@@ -821,16 +855,36 @@ pub const AI = struct {
                 return error.NetworkError;
             };
             if (n == 0) break;
-            self.watchMarkData();
+            self.watchMarkData(); // 看门狗保持现状：任意字节（含保活）都算"活着"
+            const progress_before = parser.progress_chunks;
             try parser.feed(read_buf[0..n], ctx, on_delta);
+            // 无进度观察（仅日志）：真实进度 = 含 choices 的 chunk；保活/成本块不算
+            const now_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+            if (parser.progress_chunks != progress_before) {
+                if (self.progress_warned) {
+                    Log.warn(.api, "无进度结束：共 {d}s（期间仅收到保活类字节）", .{now_ms - self.last_progress_ms});
+                    self.progress_warned = false;
+                }
+                self.last_progress_ms = now_ms;
+            } else if (!self.progress_warned and now_ms - self.last_progress_ms >= no_progress_warn_ms) {
+                self.progress_warned = true;
+                Log.warn(.api, "无进度 {d}s：连接仍在收字节（保活类），仅提示不中断", .{@divTrunc(now_ms - self.last_progress_ms, 1000)});
+            }
+            // 宿主主动早停（摘要流式垃圾）：按"正常结束"停下，最终裁决交给落库前校验
+            if (self.abort_requested.load(.acquire)) {
+                aborted_early = true;
+                Log.warn(.api, "输出被主动早停（abort_requested）", .{});
+                break;
+            }
         }
         // 对端关闭连接（EOF）且流未经 [DONE]/finish_reason 正常终止 → 判定为截断。
         // 否则"纯思考/部分内容被截断"会被当成正常结束：用户只看到输出停住、无任何提示。
-        if (!parser.finished and !parser.saw_finish_reason) {
+        if (!aborted_early and !parser.finished and !parser.saw_finish_reason) {
             if (cancel.load(.acquire)) return error.Canceled;
             Log.warn(.api, "流被截断（无 [DONE]/finish_reason）({d}ms)", .{std.Io.Timestamp.now(self.io, .awake).toMilliseconds() - t0});
             return error.StreamTruncated;
         }
+        self.last_stopped_by_length = parser.stopped_by_length;
         Log.info(.api, "响应 {d}ms in={d} cached={d} out={d} endpoint={s}", .{
             std.Io.Timestamp.now(self.io, .awake).toMilliseconds() - t0,
             self.usage.input_tokens,
@@ -1105,6 +1159,16 @@ test "请求体：缓存参数与流式 usage" {
     try std.testing.expect(std.mem.indexOf(u8, clamped, long_id) == null);
 }
 
+test "请求体：max_tokens 输出上限（>0 才发）" {
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const with_cap = try buildRequestBody(std.testing.allocator, "m", &messages, &.{}, "", .{ .max_tokens = 50000 });
+    defer std.testing.allocator.free(with_cap);
+    try std.testing.expect(std.mem.indexOf(u8, with_cap, "\"max_tokens\":50000") != null);
+    const without = try buildRequestBody(std.testing.allocator, "m", &messages, &.{}, "", .{});
+    defer std.testing.allocator.free(without);
+    try std.testing.expect(std.mem.indexOf(u8, without, "max_tokens") == null);
+}
+
 test "请求体：思考强度（reasoning_effort / deepseek thinking）" {
     const messages = [_]Message{.{ .role = "user", .content = "hi" }};
 
@@ -1261,6 +1325,20 @@ test "SSE 解析：思考字段（reasoning_content 与 reasoning）" {
 
     try std.testing.expectEqualStrings("让我想想", collector.reasoning.items);
     try std.testing.expectEqualStrings("答案", collector.content.items);
+}
+
+test "SSE 解析：进度计数（含 choices 才算进度；成本块/保活不算）" {
+    var parser = SseParser{ .allocator = std.testing.allocator };
+    defer parser.deinit();
+    var dummy: u8 = 0;
+    const noop = struct {
+        fn cb(_: *anyopaque, _: DeltaKind, _: []const u8) void {}
+    }.cb;
+    try parser.feed("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n", @ptrCast(&dummy), noop);
+    try std.testing.expectEqual(@as(usize, 1), parser.progress_chunks);
+    try parser.feed("data: {\"choices\":[],\"cost\":\"0.01\"}\n", @ptrCast(&dummy), noop);
+    try parser.feed(": keepalive\n", @ptrCast(&dummy), noop);
+    try std.testing.expectEqual(@as(usize, 1), parser.progress_chunks);
 }
 
 test "SSE 解析：finish_reason 终止标志（截断检测前提）" {

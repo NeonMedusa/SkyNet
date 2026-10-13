@@ -23,6 +23,10 @@ pub const Entry = struct {
     off_none: bool = false,
     /// 思考回传字段名（assistant 消息带回的 reasoning 字段；空 = 不回传）
     interleaved: []const u8 = "",
+    /// 输出上限（0 = 无数据，不钳制）。应用值 = min(用户配置, 此值)
+    max_out: u64 = 0,
+    /// 该 provider/模型不收 max_tokens 字段（true = 不发）
+    no_max_tokens: bool = false,
 };
 
 pub const entries = [_]Entry{
@@ -419,7 +423,7 @@ pub const entries = [_]Entry{
     .{ .provider = "opencode-go", .model = "deepseek-v4-flash", .ctx = 1000000, .kind = .effort, .off_none = false, .interleaved = "reasoning_content", .levels = &.{ "off", "low", "high", "max" } },
     .{ .provider = "opencode-go", .model = "deepseek-v4-flash-vision-exp", .ctx = 1000000, .kind = .effort, .off_none = false, .interleaved = "reasoning_content", .levels = &.{ "off", "low", "high", "max" } },
     .{ .provider = "opencode-go", .model = "deepseek-v4-pro", .ctx = 1000000, .kind = .effort, .off_none = false, .interleaved = "reasoning_content", .levels = &.{ "off", "high", "max" } },
-    .{ .provider = "opencode-go", .model = "deepseek-v4.1-flash", .ctx = 1000000, .kind = .effort, .off_none = false, .interleaved = "reasoning_content", .levels = &.{ "off", "low", "high", "max" } },
+    .{ .provider = "opencode-go", .model = "deepseek-v4.1-flash", .ctx = 1000000, .kind = .effort, .off_none = false, .interleaved = "reasoning_content", .levels = &.{ "off", "low", "high", "max" }, .max_out = 393216 },
     .{ .provider = "opencode-go", .model = "glm-5.2", .ctx = 1000000, .kind = .effort, .off_none = false, .interleaved = "reasoning_content", .levels = &.{ "off", "high", "max" } },
     .{ .provider = "opencode-go", .model = "glm-5.3", .ctx = 1000000, .kind = .effort, .off_none = false, .interleaved = "reasoning_content", .levels = &.{ "off", "low", "high", "max" } },
     .{ .provider = "opencode-go", .model = "glm-5.3-flash", .ctx = 1000000, .kind = .effort, .off_none = false, .interleaved = "reasoning_content", .levels = &.{ "off", "low", "high", "max" } },

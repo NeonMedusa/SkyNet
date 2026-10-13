@@ -101,6 +101,10 @@ const Mode = enum {
     provider_confirm,
     compact_confirm,
     thinking_select,
+    /// 设置页（/settings 或帮助菜单进入；↑↓ 选择、←→/Enter 调整、Esc 返回）
+    settings,
+    /// 恢复默认设置确认框（设置页内两关确认）
+    settings_reset_confirm,
     preset_select,
     session_select,
     session_confirm,
@@ -121,9 +125,167 @@ const help_commands = [_]HelpCommand{
     .{ .name = "models", .desc = "打开模型/提供商选择菜单" },
     .{ .name = "compact", .desc = "压缩当前会话（/compact [保留token]，默认 20000）" },
     .{ .name = "thinking", .desc = "切换思考强度（/thinking off|low|high|max）" },
+    .{ .name = "settings", .desc = "设置页（输出上限 / 压缩行为开关）" },
     .{ .name = "cwd", .desc = "查看/切换会话工作目录（/cwd [路径]，无参显示当前）" },
     .{ .name = "exit", .desc = "退出程序" },
 };
+
+/// 设置页条目 id
+const SettingId = enum {
+    max_output_tokens,
+    interleaved_mode,
+    auto_compact,
+    auto_compact_pct,
+    keep_recent_tokens,
+    compaction_thinking,
+    summary_garbage_check,
+    compaction_retry,
+    compaction_strip_thinking,
+    fold_old_tool_outputs,
+    restore_defaults,
+};
+
+/// 设置页布局（group 非空 = 组标题行，不可选中）
+const SettingsRow = struct {
+    group: []const u8 = "",
+    id: ?SettingId = null,
+};
+
+const settings_layout = [_]SettingsRow{
+    .{ .group = "模型与输出" },
+    .{ .id = .max_output_tokens },
+    .{ .id = .interleaved_mode },
+    .{ .group = "压缩" },
+    .{ .id = .auto_compact },
+    .{ .id = .auto_compact_pct },
+    .{ .id = .keep_recent_tokens },
+    .{ .id = .compaction_thinking },
+    .{ .id = .summary_garbage_check },
+    .{ .id = .compaction_retry },
+    .{ .id = .compaction_strip_thinking },
+    .{ .group = "上下文" },
+    .{ .id = .fold_old_tool_outputs },
+    .{ .group = "操作" },
+    .{ .id = .restore_defaults },
+};
+
+fn settingLabel(id: SettingId) []const u8 {
+    return switch (id) {
+        .max_output_tokens => "输出上限（token）",
+        .interleaved_mode => "回传思考",
+        .auto_compact => "自动压缩",
+        .auto_compact_pct => "自动压缩阈值",
+        .keep_recent_tokens => "保留窗口（token）",
+        .compaction_thinking => "压缩时思考档",
+        .summary_garbage_check => "摘要垃圾审核",
+        .compaction_retry => "压缩失败重试",
+        .compaction_strip_thinking => "压缩时剥离思考",
+        .fold_old_tool_outputs => "旧工具输出折叠",
+        .restore_defaults => "恢复默认设置",
+    };
+}
+
+/// 值的显示文本（buf 由调用方提供）
+fn settingValueText(state: *AppState, id: SettingId, buf: []u8) []const u8 {
+    return switch (id) {
+        .max_output_tokens => if (state.config.max_output_tokens == 0)
+            "0（默认）"
+        else
+            formatK(buf, state.config.max_output_tokens),
+        .interleaved_mode => if (state.config.interleaved_mode.len == 0)
+            "自动"
+        else if (std.mem.eql(u8, state.config.interleaved_mode, "on"))
+            "强制开"
+        else if (std.mem.eql(u8, state.config.interleaved_mode, "off"))
+            "强制关（有 400 风险）"
+        else
+            "自动",
+        .auto_compact => if (state.config.auto_compact) "开" else "关",
+        .auto_compact_pct => std.fmt.bufPrint(buf, "{d}%", .{state.config.auto_compact_pct}) catch "",
+        .keep_recent_tokens => formatK(buf, state.config.keep_recent_tokens),
+        .compaction_thinking => if (state.config.compaction_thinking.len == 0 or
+            std.mem.eql(u8, state.config.compaction_thinking, "follow"))
+            "跟随会话"
+        else
+            state.config.compaction_thinking,
+        .summary_garbage_check => if (state.config.summary_garbage_check) "开" else "关（盲采）",
+        .compaction_retry => if (state.config.compaction_retry) "开" else "关",
+        .compaction_strip_thinking => if (state.config.compaction_strip_thinking.len == 0)
+            "仅失败重试时"
+        else if (std.mem.eql(u8, state.config.compaction_strip_thinking, "never"))
+            "从不"
+        else if (std.mem.eql(u8, state.config.compaction_strip_thinking, "always"))
+            "总是"
+        else
+            "仅失败重试时",
+        .fold_old_tool_outputs => if (state.config.fold_old_tool_outputs) "开" else "关",
+        .restore_defaults => "Enter 确认",
+    };
+}
+
+/// 设置页数字行（Enter 可键盘输入）
+fn isNumericSetting(id: SettingId) bool {
+    return switch (id) {
+        .max_output_tokens, .auto_compact_pct, .keep_recent_tokens => true,
+        else => false,
+    };
+}
+
+/// 解析设置页数值输入：数字 + 可选一位小数 + 可选 k/K（×1000）/ %（忽略）后缀。
+/// "20k" → 20000；"0.5k" → 500；"85%" → 85；空/非法 → null。
+fn parseSettingNumber(raw: []const u8) ?u64 {
+    var s = std.mem.trim(u8, raw, " \t");
+    if (s.len == 0) return null;
+    var mult: u64 = 1;
+    if (s[s.len - 1] == '%') {
+        s = s[0 .. s.len - 1];
+    } else if (s[s.len - 1] == 'k' or s[s.len - 1] == 'K') {
+        mult = 1000;
+        s = s[0 .. s.len - 1];
+    }
+    if (s.len == 0) return null;
+    var int_part: u64 = 0;
+    var frac: ?u64 = null;
+    var seen_dot = false;
+    for (s) |c| {
+        if (c == '.') {
+            if (seen_dot) return null;
+            seen_dot = true;
+            continue;
+        }
+        if (c < '0' or c > '9') return null;
+        const d: u64 = c - '0';
+        if (seen_dot) {
+            if (frac != null) return null;
+            frac = d;
+        } else {
+            int_part = int_part * 10 + d;
+            if (int_part > 1_000_000_000) return null;
+        }
+    }
+    var v = int_part * mult;
+    if (frac) |f| v += f * (mult / 10);
+    return v;
+}
+
+/// 在预设档位表中取“当前值的下一个”（找不到当前值 → 取第一个；wrap）
+fn nextInSteps(comptime T: type, steps: []const T, cur: T) T {
+    const is_str = T == []const u8;
+    for (steps, 0..) |s, i| {
+        const eq = if (is_str) std.mem.eql(u8, s, cur) else std.meta.eql(s, cur);
+        if (eq) return steps[(i + 1) % steps.len];
+    }
+    return steps[0];
+}
+
+/// token 数的 k 写法（整数 k / 一位小数 k；非整百原样）
+fn formatK(buf: []u8, tokens: usize) []const u8 {
+    if (tokens == 0) return "0";
+    if (tokens % 1000 == 0) return std.fmt.bufPrint(buf, "{d}k", .{tokens / 1000}) catch "";
+    if (tokens % 100 == 0) return std.fmt.bufPrint(buf, "{d}.{d}k", .{ tokens / 1000, (tokens % 1000) / 100 }) catch "";
+    if (tokens >= 100_000) return std.fmt.bufPrint(buf, "{d}k", .{(tokens + 500) / 1000}) catch "";
+    return std.fmt.bufPrint(buf, "{d}", .{tokens}) catch "";
+}
 
 /// 合法思考强度（"" 表示默认不发送；表外模型也允许这些常见档位）
 fn isThinkingLevel(s: []const u8) bool {
@@ -649,6 +811,8 @@ const StreamEvent = struct {
     is_error: bool = false,
     /// 服务端真实 usage（usage_update 事件：每轮请求即时刷新上下文占用）
     usage: ai.Usage = .{},
+    /// worker 当轮估算（usage_update 携带；0 = 无。中途压缩后显示立即正确的关键）
+    est: usize = 0,
     /// 关联的数据库行 id（窗口化：回填到显示消息，使其滚出视口后可卸载/重载）
     db_id: i64 = 0,
 };
@@ -698,6 +862,17 @@ const StreamJob = struct {
     anchor_tokens: u64 = 0,
     /// 本回合是否发生过中途压缩（finalize 后需按 checkpoint 重建主线程历史）
     compacted_midturn: bool = false,
+    /// 本回合摘要正文曾判垃圾（校验未过）：不再自动重试（防每轮重试风暴）；force 不受限。
+    /// 注意：create() 不应用默认值——createStreamJob 必须显式清零（漏了会随机跳过压缩）
+    compact_rejected_midturn: bool = false,
+    /// 压缩时思考档（设置页）："" = follow（跟随会话）；否则为指定档（已按模型钳制）
+    compaction_effort: []const u8 = "",
+    /// 摘要垃圾审核（设置页）：false = 盲采（不早停/不拒收/不查过短/不查截断）
+    summary_garbage_check: bool = true,
+    /// 压缩失败重试（设置页）
+    compaction_retry: bool = true,
+    /// 压缩时剥离思考（设置页）
+    compaction_strip_thinking: StripThinkingMode = .retry_only,
     /// 救援：本回合是否已因请求失败压缩重发过（一次性，防死循环）
     overflow_recovery_attempted: bool = false,
     /// 服务端错误详情（失败时带回给主线程展示）
@@ -809,6 +984,9 @@ const AppState = struct {
     last_usage: ai.Usage = .{},
     /// 本轮最后一个请求的用量（上下文占用显示：工具循环的多轮请求不累计）
     context_usage: ai.Usage = .{},
+    /// 回合进行中 worker 的权威估算（每轮 usage_update 携带；中途压缩后立即变小）。
+    /// 状态栏/对话框优先用它；回合结束/切换会话清空，回退主线程口径。
+    worker_est: ?usize = null,
     /// usage 锚点：history 前 usage_anchor_len 条 ≈ usage_anchor_tokens 个 token。
     /// 回合收尾时记录（真实 usage）；折叠时递减；历史重建/新会话时清空。
     usage_anchor_len: ?usize = null,
@@ -818,6 +996,8 @@ const AppState = struct {
     usage_anchor_key: u64 = 0,
     /// last_usage 是否来自估算（尚无真实 usage 时为 true，状态栏显示 ~ 前缀）
     usage_estimated: bool = true,
+    /// 发送拦截提示已出（一次封锁只提示一条；封锁解除时由每帧刷新复位）
+    limit_notice_active: bool = false,
 
     // 外部写入检测（CLI/其他进程写同一会话时，TUI 增量刷新）
     /// 当前会话已加载到的最大消息 id
@@ -831,8 +1011,8 @@ const AppState = struct {
     context_window_override: u64 = 0,
     /// 思考强度一次性覆盖（CLI -thinking 用；空 = 不覆盖，优先于每模型记忆）
     thinking_override: []const u8 = &.{},
-    /// 自动压缩触发阈值（窗口百分比；0 = 关闭），将来可考虑做成可配置项
-    auto_compact_pct: u64 = 90,
+    /// 自动压缩触发阈值（窗口百分比；0 = 关闭；启动时从 config 播种）
+    auto_compact_pct: u64 = 85,
     /// 压缩时保留的最近 token 数
     keep_recent_tokens: usize = 20_000,
     /// 已加载的最近 compaction id（用于发现外部压缩）
@@ -928,6 +1108,12 @@ const AppState = struct {
 
     // 思考强度选择器
     thinking_select_index: usize = 0,
+    /// 设置页光标（settings_layout 下标；组标题行不可选）
+    settings_index: usize = 0,
+    /// 设置页数值行编辑（Enter 进入；数字/./k/% 输入，Enter 提交，Esc 取消）
+    settings_edit: bool = false,
+    settings_edit_len: usize = 0,
+    settings_edit_buf: [12]u8 = [_]u8{0} ** 12,
 
     // 消息滚动状态
     /// 滚动锚点（锚点模型，取代旧的"距底部行数"）：视口首行所在的**全局**显示
@@ -1446,6 +1632,8 @@ const AppState = struct {
     /// 取大：账本口径（真实 usage + 增量，可能过期）vs 全量字节口径（永远按当前口径算）。
     /// reasoning 计入与否跟随当前模型（currentCountsReasoning），与发送口径一致。
     fn estimateRequestTokens(self: *AppState) usize {
+        // 回合进行中：worker 的估算才是权威（中途压缩后立即变小；主线程历史要等回合结束才重建）
+        if (self.worker_est) |e| return e;
         const cr = self.currentCountsReasoning();
         const pure = estimateTokens(historyRequestBytesSlice(self.history.items, cr) + toolsSchemaBytes());
         if (self.anchorUsable()) |anchor_len| {
@@ -1464,6 +1652,7 @@ const AppState = struct {
         // 先归零：切到无数据会话时不能残留上一个会话的值
         self.last_usage = .{};
         self.context_usage = .{};
+        self.worker_est = null;
         self.usage_anchor_len = null;
         self.usage_anchor_tokens = 0;
         self.usage_anchor_key = 0;
@@ -1538,12 +1727,28 @@ const AppState = struct {
             .api_key = self.resolvedApiKey(provider),
             .model = model,
             .provider_name = provider.name,
-            .behavior = config_mod.behavior(provider),
+            .behavior = blk: {
+                var b = config_mod.behavior(provider);
+                b.max_tokens = resolveMaxOutputTokens(&self.config, provider.preset, model);
+                break :blk b;
+            },
             .environ_map = self.environ_map,
             .history = self.history.items,
             .counts_reasoning = countsReasoningFor(provider.preset, model),
             .keep_tokens = if (keep_tokens_override > 0) keep_tokens_override else self.keep_recent_tokens,
         };
+        // 与对话/中途压缩一致：带会话思考档（历史遗留遗漏，2026-10-13 统一）
+        {
+            const eff = sessionThinkingEffort(self, provider.preset, model);
+            plan.behavior.reasoning_effort = arena.allocator().dupe(u8, eff) catch eff;
+            plan.behavior.reasoning_off_none = thinkingInfoFor(&self.config, provider.preset, model).off_none;
+            plan.behavior.interleaved = if (model_table.lookup(provider.preset, model)) |e| e.interleaved else "";
+        }
+        // 压缩相关（设置页；默认 = 现行为）
+        plan.compaction_effort = arena.allocator().dupe(u8, compactionEffortFor(&self.config, provider.preset, model)) catch "";
+        plan.summary_garbage_check = self.config.summary_garbage_check;
+        plan.compaction_retry = self.config.compaction_retry;
+        plan.compaction_strip_thinking = parseStripThinkingMode(self.config.compaction_strip_thinking);
         self.compact_cancel.store(false, .release);
         // 同步压缩阻塞主线程：主循环无法泵看门狗 → 临时起专用看门狗线程
         // （半开连接时超时唤醒；请求结束/异常均经 defer 停止并 join）
@@ -2337,6 +2542,12 @@ const AppState = struct {
         self.clearHistory();
         self.clearDisplay();
         self.clearSelection();
+        // 切会话丢弃排队消息：有则提示（避免“看起来已发送”的误解）
+        const dropped_n = self.pendingSendsCount();
+        if (dropped_n > 0) {
+            var db_tb: [64]u8 = undefined;
+            self.setToast(std.fmt.bufPrint(&db_tb, "已丢弃 {d} 条未发送的排队消息", .{dropped_n}) catch "已丢弃未发送的排队消息");
+        }
         self.clearPendingSends();
         self.session_id = session_id;
         // 记录"上次访问"：下次启动时自动恢复该会话
@@ -2377,6 +2588,12 @@ const AppState = struct {
         self.clearHistory();
         self.clearDisplay();
         self.clearSelection();
+        // 切会话丢弃排队消息：有则提示（避免“看起来已发送”的误解）
+        const dropped_n = self.pendingSendsCount();
+        if (dropped_n > 0) {
+            var db_tb: [64]u8 = undefined;
+            self.setToast(std.fmt.bufPrint(&db_tb, "已丢弃 {d} 条未发送的排队消息", .{dropped_n}) catch "已丢弃未发送的排队消息");
+        }
         self.clearPendingSends();
         self.session_id = session_id;
         db.touchSession(session_id) catch {};
@@ -2805,6 +3022,12 @@ const AppState = struct {
         const db = if (self.db) |*d| d else return;
         self.clearHistory();
         self.clearDisplay();
+        // 切会话丢弃排队消息：有则提示（避免“看起来已发送”的误解）
+        const dropped_n = self.pendingSendsCount();
+        if (dropped_n > 0) {
+            var db_tb: [64]u8 = undefined;
+            self.setToast(std.fmt.bufPrint(&db_tb, "已丢弃 {d} 条未发送的排队消息", .{dropped_n}) catch "已丢弃未发送的排队消息");
+        }
         self.clearPendingSends();
         self.last_seen_msg_id = 0;
         // 新会话无 compaction：复位 checkpoint 游标（否则首轮结束后，worker 落库
@@ -2860,6 +3083,8 @@ const AppState = struct {
             } else {
                 self.addMessage("思考强度可选: off / low / high / max", .{ .fg = .red });
             }
+        } else if (std.mem.eql(u8, name, "settings")) {
+            self.openSettings(null);
         } else if (std.mem.eql(u8, name, "cwd")) {
             const rest = std.mem.trim(u8, command[name.len..], " \t");
             if (rest.len == 0) {
@@ -3017,6 +3242,139 @@ const AppState = struct {
         return self.compact_status.load(.acquire) == 1;
     }
 
+    fn openSettings(self: *AppState, parent: ?Mode) void {
+        self.settings_edit = false;
+        self.settings_index = 0;
+        self.settingsMove(1); // 跳过组标题，定位到首个可选项
+        self.menu_parent = parent;
+        self.mode = .settings;
+    }
+
+    /// 在可选项之间移动（跳过组标题；wrap）
+    fn settingsMove(self: *AppState, dir: i32) void {
+        const n = settings_layout.len;
+        var i = self.settings_index;
+        var guard: usize = 0;
+        while (guard < n) : (guard += 1) {
+            if (dir < 0) {
+                i = if (i == 0) n - 1 else i - 1;
+            } else {
+                i = if (i + 1 >= n) 0 else i + 1;
+            }
+            if (settings_layout[i].id != null) {
+                self.settings_index = i;
+                return;
+            }
+        }
+    }
+
+    fn handleSettingsKey(self: *AppState, key: tui.KeyEvent) void {
+        // 数值输入模式：只处理编辑键（Esc 取消；Enter 提交）
+        if (self.settings_edit) {
+            switch (key.code) {
+                .esc => self.settings_edit = false,
+                .enter => self.commitSettingsEdit(),
+                .backspace => if (self.settings_edit_len > 0) {
+                    self.settings_edit_len -= 1;
+                },
+                .char => |c| {
+                    const ok = (c >= '0' and c <= '9') or c == '.' or c == 'k' or c == 'K' or c == '%';
+                    if (ok and self.settings_edit_len < self.settings_edit_buf.len) {
+                        self.settings_edit_buf[self.settings_edit_len] = @intCast(c);
+                        self.settings_edit_len += 1;
+                    }
+                },
+                else => {},
+            }
+            return;
+        }
+        switch (key.code) {
+            .up => self.settingsMove(-1),
+            .down => self.settingsMove(1),
+            .enter => {
+                if (settings_layout[self.settings_index].id) |id| {
+                    if (id == .restore_defaults) {
+                        // 恢复默认：两关确认（参考压缩确认框）
+                        self.confirm_stage = 1;
+                        self.confirm_yes = false;
+                        self.mode = .settings_reset_confirm;
+                    } else if (isNumericSetting(id)) {
+                        // 数字行：Enter 进入键盘输入（←→ 仍走预设档位）
+                        self.settings_edit = true;
+                        self.settings_edit_len = 0;
+                    } else {
+                        self.cycleSetting(id);
+                    }
+                }
+            },
+            .left, .right => {
+                if (settings_layout[self.settings_index].id) |id| self.cycleSetting(id);
+            },
+            .esc => self.closeMenu(),
+            else => {},
+        }
+    }
+
+    /// 提交设置页数值输入（空/非法 → 取消不改；越界按各字段规则钳制）
+    fn commitSettingsEdit(self: *AppState) void {
+        defer self.settings_edit = false;
+        const id = settings_layout[self.settings_index].id orelse return;
+        const raw = self.settings_edit_buf[0..self.settings_edit_len];
+        const v = parseSettingNumber(raw) orelse return;
+        switch (id) {
+            .max_output_tokens => self.config.max_output_tokens = @intCast(@min(v, 4_000_000)),
+            .auto_compact_pct => {
+                self.config.auto_compact_pct = @min(@max(v, 50), 85);
+                self.auto_compact_pct = self.config.auto_compact_pct; // 本会话立即生效
+            },
+            .keep_recent_tokens => {
+                self.config.keep_recent_tokens = @intCast(@min(v, 10_000_000));
+                self.keep_recent_tokens = self.config.keep_recent_tokens; // 本会话立即生效
+            },
+            else => return,
+        }
+        self.config.save(self.io, self.allocator);
+    }
+
+    /// 调整当前设置项（开关/预设档位循环）并即时持久化
+    fn cycleSetting(self: *AppState, id: SettingId) void {
+        const a = self.allocator;
+        switch (id) {
+            .max_output_tokens => {
+                const steps = [_]u32{ 0, 8_000, 16_000, 32_000, 50_000, 131_072, 393_216 };
+                self.config.max_output_tokens = nextInSteps(u32, &steps, self.config.max_output_tokens);
+            },
+            .interleaved_mode => {
+                const steps = [_][]const u8{ "", "on", "off" };
+                self.config.setInterleavedMode(a, nextInSteps([]const u8, &steps, self.config.interleaved_mode));
+            },
+            .auto_compact => self.config.auto_compact = !self.config.auto_compact,
+            .auto_compact_pct => {
+                const steps = [_]u64{ 70, 80, 85 };
+                self.config.auto_compact_pct = nextInSteps(u64, &steps, self.config.auto_compact_pct);
+                self.auto_compact_pct = self.config.auto_compact_pct; // 本会话立即生效
+            },
+            .keep_recent_tokens => {
+                const steps = [_]usize{ 500, 1_000, 2_000, 4_000, 8_000, 20_000, 50_000, 100_000 };
+                self.config.keep_recent_tokens = nextInSteps(usize, &steps, self.config.keep_recent_tokens);
+                self.keep_recent_tokens = self.config.keep_recent_tokens; // 本会话立即生效
+            },
+            .compaction_thinking => {
+                const steps = [_][]const u8{ "", "off", "low", "medium", "high", "max" };
+                self.config.setCompactionThinking(a, nextInSteps([]const u8, &steps, self.config.compaction_thinking));
+            },
+            .summary_garbage_check => self.config.summary_garbage_check = !self.config.summary_garbage_check,
+            .compaction_retry => self.config.compaction_retry = !self.config.compaction_retry,
+            .compaction_strip_thinking => {
+                const steps = [_][]const u8{ "", "never", "always" };
+                self.config.setCompactionStripThinking(a, nextInSteps([]const u8, &steps, self.config.compaction_strip_thinking));
+            },
+            .fold_old_tool_outputs => self.config.fold_old_tool_outputs = !self.config.fold_old_tool_outputs,
+            .restore_defaults => {},
+        }
+        self.config.save(self.io, self.allocator);
+    }
+
     /// 构造异步压缩计划（历史深拷贝，供 worker 线程独占）
     fn buildCompactionPlan(
         self: *AppState,
@@ -3035,11 +3393,27 @@ const AppState = struct {
             .io = self.io,
             .async = true,
             .session_id = self.session_id,
-            .behavior = config_mod.behavior(provider),
+            .behavior = blk: {
+                var b = config_mod.behavior(provider);
+                b.max_tokens = resolveMaxOutputTokens(&self.config, provider.preset, model);
+                break :blk b;
+            },
             .environ_map = self.environ_map,
             .counts_reasoning = countsReasoningFor(provider.preset, model),
             .keep_tokens = keep,
         };
+        // 与对话/中途压缩一致：带会话思考档（历史遗留遗漏，2026-10-13 统一）
+        {
+            const eff = sessionThinkingEffort(self, provider.preset, model);
+            plan.behavior.reasoning_effort = plan.arena.allocator().dupe(u8, eff) catch eff;
+            plan.behavior.reasoning_off_none = thinkingInfoFor(&self.config, provider.preset, model).off_none;
+            plan.behavior.interleaved = if (model_table.lookup(provider.preset, model)) |e| e.interleaved else "";
+        }
+        // 压缩相关（设置页；默认 = 现行为）
+        plan.compaction_effort = plan.arena.allocator().dupe(u8, compactionEffortFor(&self.config, provider.preset, model)) catch "";
+        plan.summary_garbage_check = self.config.summary_garbage_check;
+        plan.compaction_retry = self.config.compaction_retry;
+        plan.compaction_strip_thinking = parseStripThinkingMode(self.config.compaction_strip_thinking);
         errdefer plan.arena.deinit();
         const arena = plan.arena.allocator();
         // worker 自建连接时用实际打开的库路径（测试/CLI 可能不是默认路径）
@@ -3286,9 +3660,11 @@ const AppState = struct {
                 }
             }
         }
+        // 压缩被拒且已止损中断（自动路径连续两次失败）：气泡文案区别于"本轮继续"
+        const compaction_aborted = if (self.stream_error) |e| e == error.CompactionRejected else false;
         if (self.compact_head_idx) |idx| {
             if (failed) {
-                self.replaceDisplayMessage(idx, "▣ 上下文压缩失败（本轮继续）", .{ .fg = .red });
+                self.replaceDisplayMessage(idx, if (compaction_aborted) "▣ 压缩失败（已停止本回合）" else "▣ 压缩失败（本轮继续）", .{ .fg = .red });
             } else {
                 const len = if (self.compact_msg_idx) |mi|
                     (if (mi < self.messages.items.len) self.messages.items[mi].content.len else 0)
@@ -3300,7 +3676,7 @@ const AppState = struct {
             }
         } else if (failed) {
             // 失败发生在任何输出之前（无气泡）：单独一行提示
-            self.addMessage("▣ 上下文压缩失败（本轮继续）", .{ .fg = .red });
+            self.addMessage(if (compaction_aborted) "▣ 压缩失败（已停止本回合）" else "▣ 压缩失败（本轮继续）", .{ .fg = .red });
         }
         self.compact_head_idx = null;
         self.compact_msg_idx = null;
@@ -3389,8 +3765,8 @@ const AppState = struct {
                     self.replaceDisplayMessage(idx, "▣ 压缩已取消", .{ .fg = .dark_gray });
                 }
             } else {
-                var buf: [256]u8 = undefined;
-                const text = std.fmt.bufPrint(&buf, "▣ 压缩失败: {s}", .{e}) catch "▣ 压缩失败";
+                // 原始错误串不上屏（细节在日志；与中途压缩路径口径一致）
+                const text = "▣ 压缩失败";
                 if (self.compact_head_idx) |idx| {
                     self.replaceDisplayMessage(idx, text, .{ .fg = .red });
                 } else {
@@ -3453,6 +3829,8 @@ const AppState = struct {
             self.mode = .compact_confirm;
         } else if (std.mem.eql(u8, name, "thinking")) {
             self.openThinkingSelect(.help_select);
+        } else if (std.mem.eql(u8, name, "settings")) {
+            self.openSettings(.help_select);
         } else if (std.mem.eql(u8, name, "cwd")) {
             // 打开工作目录编辑对话框（独立输入框：不清空主输入框草稿）；
             // Esc 返回帮助菜单
@@ -4045,21 +4423,23 @@ const AppState = struct {
         // 思考强度：每模型记忆优先（显式设置尊重用户，原样发送）；全局默认则先解析到
         // 该模型支持的档位（显示与发送一致），再钳制兜底。
         // 拷进 job arena，避免主线程改动导致悬空。
-        const think = self.currentThinkingEx();
-        const eff = if (think.explicit)
-            think.level
-        else
-            clampThinking(&self.config, provider.preset, model, think.level);
-        job.behavior.reasoning_effort = try arena.dupe(u8, eff);
+        job.behavior.reasoning_effort = try arena.dupe(u8, sessionThinkingEffort(self, provider.preset, model));
         job.behavior.reasoning_off_none = thinkingInfoFor(&self.config, provider.preset, model).off_none;
-        // 思考回传字段（能力表）：部分网关要求 assistant 消息带回 reasoning
-        job.behavior.interleaved = if (model_table.lookup(provider.preset, model)) |e| e.interleaved else "";
+        // 思考回传字段：设置页可强制开/关（auto = 跟随能力表）
+        job.behavior.interleaved = interleavedFieldFor(&self.config, provider.preset, model);
+        // 输出上限（含思考）：用户配置按模型钳制；0 = 不发
+        job.behavior.max_tokens = resolveMaxOutputTokens(&self.config, provider.preset, model);
+        // 压缩相关（设置页；默认 = 现行为）：思考档 / 垃圾审核 / 失败重试 / 剥离思考
+        job.compaction_effort = try arena.dupe(u8, compactionEffortFor(&self.config, provider.preset, model));
+        job.summary_garbage_check = self.config.summary_garbage_check;
+        job.compaction_retry = self.config.compaction_retry;
+        job.compaction_strip_thinking = parseStripThinkingMode(self.config.compaction_strip_thinking);
         job.environ_map = self.environ_map;
         // worker 自建连接时用实际打开的库路径（测试/CLI 可能不是默认路径）
         const db_path: []const u8 = if (self.db) |*d| d.path else self.db_path;
         job.db_path = try arena.dupeZ(u8, db_path);
         job.session_id_num = self.session_id;
-        job.auto_compact_pct = self.auto_compact_pct;
+        job.auto_compact_pct = if (self.config.auto_compact) self.auto_compact_pct else 0;
         job.context_window = self.contextWindowCurrent();
         job.keep_recent_tokens = self.keep_recent_tokens;
         // create() 不应用结构体默认值：以下字段必须显式清零（否则是未初始化内存）
@@ -4072,6 +4452,7 @@ const AppState = struct {
             job.anchor_tokens = self.usage_anchor_tokens;
         }
         job.compacted_midturn = false;
+        job.compact_rejected_midturn = false; // 同上：漏清零 → 随机跳过本回合自动压缩（2026-10-13 修复）
         job.overflow_recovery_attempted = false;
         job.error_detail = "";
         job.usage_input = 0;
@@ -4314,6 +4695,24 @@ const AppState = struct {
         return self.pending_sends.orderedRemove(0);
     }
 
+    /// 当前排队消息条数（会话切换提示用）
+    fn pendingSendsCount(self: *AppState) usize {
+        self.pending_sends_mutex.lockUncancelable(self.io);
+        defer self.pending_sends_mutex.unlock(self.io);
+        return self.pending_sends.items.len;
+    }
+
+    /// 把取出的排队消息放回队首（flush 拦截用）；失败则释放文本
+    fn pushFrontPendingSend(self: *AppState, item: PendingSend) bool {
+        self.pending_sends_mutex.lockUncancelable(self.io);
+        defer self.pending_sends_mutex.unlock(self.io);
+        self.pending_sends.insert(self.allocator, 0, item) catch {
+            self.allocator.free(item.text);
+            return false;
+        };
+        return true;
+    }
+
     /// 清空排队消息并释放文本（会话切换 / 退出清理）
     fn clearPendingSends(self: *AppState) void {
         self.pending_sends_mutex.lockUncancelable(self.io);
@@ -4349,6 +4748,13 @@ const AppState = struct {
                     self.addSystemNotice(item.text);
                 },
                 .user => {
+                    // 发送拦截（自动压缩关闭 + 估算 ≥90%）：消息放回队首保留，
+                    // 等条件解除（手动压缩/打开自动压缩）后由下一次 flush 发出
+                    if (self.contextLimitSendBlocked()) {
+                        _ = self.pushFrontPendingSend(item);
+                        self.notifyContextLimitBlocked();
+                        return;
+                    }
                     defer self.allocator.free(item.text);
                     self.askAI(item.text);
                     return;
@@ -4474,6 +4880,15 @@ const AppState = struct {
                             self.last_usage = ev.usage;
                             self.context_usage = ev.usage;
                             self.usage_estimated = false;
+                            // worker 当轮估算：中途压缩后显示立即正确（主线程历史要回合结束才重建）
+                            self.worker_est = if (ev.est > 0) ev.est else null;
+                        } else if (ev.est > 0) {
+                            // 估算刷新（压缩完成时 worker 主动推）：真实账本已过期 → 清零，
+                            // 显示立即切到压缩后的新估算（否则状态栏挂着压缩前的旧数）
+                            self.last_usage = .{};
+                            self.context_usage = .{};
+                            self.usage_estimated = true;
+                            self.worker_est = ev.est;
                         }
                     },
                     .system_notice => {
@@ -4829,6 +5244,8 @@ const AppState = struct {
             self.stream_job = null;
             // 回合结束：停止输入框标题的计时（flushPendingSends 会为新回合重新落时间）
             self.stream_start_ms = -1;
+            // 回合结束：worker 估算退场（主线程历史/锚点即将按 checkpoint 重建为权威口径）
+            self.worker_est = null;
             // 工具循环中途压缩过：主线程历史按 checkpoint 重建（显示保持不变）
             if (compacted_midturn) {
                 self.rebuildHistoryFromDb();
@@ -4897,6 +5314,7 @@ const AppState = struct {
     /// UI/导出始终用全文。返回折叠条数（0 = 未触发）。判定规则见 FoldScanner
     /// （回合保护/窗口/stub 边界），与 /context 的模拟共用同一实现，避免展示与实际不一致。
     fn maybeFoldOldToolOutputs(self: *AppState) usize {
+        if (!self.config.fold_old_tool_outputs) return 0; // 设置页：折叠开关
         const db = if (self.db) |*d| d else return 0;
         if (self.history.items.len == 0) return 0;
 
@@ -5528,6 +5946,54 @@ const AppState = struct {
         }
     }
 
+    /// 恢复默认设置的确认框（两关确认，参考压缩确认交互；确认后返回设置页）
+    fn handleSettingsResetConfirmKey(self: *AppState, key: tui.KeyEvent) void {
+        switch (key.code) {
+            .left, .right, .tab, .back_tab => self.confirm_yes = !self.confirm_yes,
+            .enter => {
+                if (!self.confirm_yes) {
+                    self.confirm_stage = 0;
+                    self.mode = .settings;
+                    return;
+                }
+                if (self.confirm_stage == 1) {
+                    self.confirm_stage = 2;
+                    self.confirm_yes = false;
+                } else {
+                    self.confirm_stage = 0;
+                    self.mode = .settings;
+                    self.resetSettingsToDefaults();
+                    self.setToast("已恢复默认设置");
+                }
+            },
+            .esc, .delete => {
+                self.confirm_stage = 0;
+                self.mode = .settings;
+            },
+            else => {},
+        }
+    }
+
+    /// 恢复设置页全部选项为默认值（取自 Config 字段默认；提供商/模型等不受影响）并即时保存
+    fn resetSettingsToDefaults(self: *AppState) void {
+        const a = self.allocator;
+        const d = config_mod.Config{};
+        self.config.max_output_tokens = d.max_output_tokens;
+        self.config.setInterleavedMode(a, d.interleaved_mode);
+        self.config.auto_compact = d.auto_compact;
+        self.config.auto_compact_pct = d.auto_compact_pct;
+        self.config.keep_recent_tokens = d.keep_recent_tokens;
+        self.config.setCompactionThinking(a, d.compaction_thinking);
+        self.config.summary_garbage_check = d.summary_garbage_check;
+        self.config.compaction_retry = d.compaction_retry;
+        self.config.setCompactionStripThinking(a, d.compaction_strip_thinking);
+        self.config.fold_old_tool_outputs = d.fold_old_tool_outputs;
+        // 本会话立即生效
+        self.auto_compact_pct = self.config.auto_compact_pct;
+        self.keep_recent_tokens = self.config.keep_recent_tokens;
+        self.config.save(self.io, self.allocator);
+    }
+
     fn handleProviderModelsKey(self: *AppState, key: tui.KeyEvent) void {
         if (isCtrlE(key)) {
             self.startProviderEdit(self.model_select_provider);
@@ -5639,6 +6105,31 @@ const AppState = struct {
         }
     }
 
+    /// 发送拦截：自动压缩关闭且估算已达窗口 90% 时禁止发送（提示用户手动压缩/开自动压缩）
+    fn contextLimitSendBlocked(self: *AppState) bool {
+        if (self.config.auto_compact) return false;
+        const window = self.contextWindowCurrent();
+        if (window == 0) return false;
+        const est: u64 = @intCast(self.estimateRequestTokens());
+        return est * 100 >= window * 90;
+    }
+
+    /// 上限拦截提示：只上屏（addMessage = 显示层）——不入库、不进请求历史，不会发给 AI。
+    /// 一次封锁只提示一条（limit_notice_active；封锁解除时由 refreshLimitNoticeFlag 复位）。
+    fn notifyContextLimitBlocked(self: *AppState) void {
+        if (self.limit_notice_active) return;
+        self.limit_notice_active = true;
+        self.addMessage("⚠ 上下文已达上限（约 90%）：消息未发送。如需继续，可手动 /compact 压缩，或到设置页把「自动压缩」打开。", .{ .fg = .red });
+    }
+
+    /// 封锁解除（估算回落/手动压缩/开自动压缩）时复位拦截提示标志（每帧调用；
+    /// 标志位未置位时零成本，不计算估算）
+    fn refreshLimitNoticeFlag(self: *AppState) void {
+        if (self.limit_notice_active and !self.contextLimitSendBlocked()) {
+            self.limit_notice_active = false;
+        }
+    }
+
     fn handleNormalKey(self: *AppState, key: tui.KeyEvent) void {
         // 任意按键打断拖动（保留选区）
         if (self.sel_dragging) self.stopDragging();
@@ -5715,6 +6206,12 @@ const AppState = struct {
                         } else {
                             self.setToast("生成中：该指令暂不可用（可先用 Ctrl+Q 中断）");
                         }
+                        return;
+                    }
+                    // 上下文达上限（自动压缩关闭 + 估算 ≥90%）：拦截发送；
+                    // 提示仅上屏（不入库、不进请求历史，不会发给 AI），输入框内容保留
+                    if (self.contextLimitSendBlocked()) {
+                        self.notifyContextLimitBlocked();
                         return;
                     }
                     // 生成/压缩中：排队，稍后在工具轮次边界注入或本轮结束后发出
@@ -6155,6 +6652,12 @@ const SummaryCollector = struct {
     reasoning_end_ms: i64 = 0,
     /// 非空时把增量同时回传主线程渲染（worker 路径；手动压缩与中途压缩共用）
     stream_app: ?*AppState = null,
+    /// 摘要正文垃圾扫描（增量；与落库前校验同一实现）：命中 ≥3 → 早停
+    scanner: context_mod.SummaryScanner = .{},
+    /// 早停信号（指向摘要请求 client 的 abort_requested；null = 不早停）
+    abort_flag: ?*std.atomic.Value(bool) = null,
+    /// 摘要垃圾审核（设置页）：false = 不扫描、不早停
+    garbage_check: bool = true,
 
     fn deinit(self: *SummaryCollector) void {
         self.list.deinit(self.allocator);
@@ -6170,7 +6673,17 @@ const SummaryCollector = struct {
     fn cb(ctx: *anyopaque, kind: ai.DeltaKind, delta: []const u8) void {
         const self: *SummaryCollector = @ptrCast(@alignCast(ctx));
         switch (kind) {
-            .content => self.list.appendSlice(self.allocator, delta) catch {},
+            .content => {
+                self.list.appendSlice(self.allocator, delta) catch {};
+                // 流式垃圾早停：与落库前校验同一扫描器；命中 → 掐流（最终裁决仍走落库前校验）
+                // 受"摘要垃圾审核"设置控制（关 = 不扫描、不早停）
+                if (self.garbage_check) {
+                    self.scanner.feed(delta);
+                    if (self.scanner.isGarbage()) {
+                        if (self.abort_flag) |a| a.store(true, .release);
+                    }
+                }
+            },
             .reasoning => {
                 const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
                 if (self.reasoning.items.len == 0) self.reasoning_start_ms = now;
@@ -6204,6 +6717,14 @@ const CompactionPlan = struct {
     model: []const u8 = "",
     provider_name: []const u8 = "",
     behavior: config_mod.Behavior = .{},
+    /// 压缩时思考档（设置页）："" = follow（跟随会话）；否则为指定档（已按模型钳制）
+    compaction_effort: []const u8 = "",
+    /// 摘要垃圾审核（设置页）
+    summary_garbage_check: bool = true,
+    /// 压缩失败重试（设置页）
+    compaction_retry: bool = true,
+    /// 压缩时剥离思考（设置页）
+    compaction_strip_thinking: StripThinkingMode = .retry_only,
     environ_map: ?*const std.process.Environ.Map = null,
     history: []ai.Message = &.{},
     /// 本计划所属模型是否回传思考（决定保留区选择/记录估算是否计入 reasoning）
@@ -6252,7 +6773,7 @@ fn compactionExecute(plan: *CompactionPlan) void {
         plan.history[range.summarize_start - 1].content
     else
         "";
-    const built = buildBudgetedCompactionPayload(plan.arena.allocator(), plan.history, range, prev_summary, app.contextWindowCurrent()) catch {
+    const built = buildBudgetedCompactionPayload(plan.arena.allocator(), plan.history, range, prev_summary, app.contextWindowCurrent(), .{ .include_thinking = plan.compaction_strip_thinking != .always }) catch {
         plan.err = "构建摘要输入失败";
         return;
     };
@@ -6274,10 +6795,12 @@ fn compactionExecute(plan: *CompactionPlan) void {
     var beh = plan.behavior;
     beh.cache_key = false;
     beh.retention = .none;
-    var client = ai.AI.init(app.allocator, plan.io, .{
-        .api_key = plan.api_key,
-        .endpoint = plan.endpoint,
-        .model = plan.model,
+        // 压缩时思考档（设置页；"" = follow）
+        if (plan.compaction_effort.len > 0) beh.reasoning_effort = plan.compaction_effort;
+        var client = ai.AI.init(app.allocator, plan.io, .{
+            .api_key = plan.api_key,
+            .endpoint = plan.endpoint,
+            .model = plan.model,
         .session_id = &fresh_hex,
         .behavior = beh,
     });
@@ -6299,11 +6822,15 @@ fn compactionExecute(plan: *CompactionPlan) void {
         .allocator = app.allocator,
         .io = plan.io,
         .stream_app = if (plan.async) app else null,
+        .abort_flag = &client.abort_requested,
+        .garbage_check = plan.summary_garbage_check,
     };
     defer collector.deinit();
     // 断连自动重试（与主流请求同一策略：网络错误/流截断/服务端瞬时故障，
     // 上限 stream_retry_max 次；重试丢弃失败尝试的摘要产出与流式气泡）
     var attempt: u32 = 0;
+    var garbage_retries: u32 = 0;
+    var retry_hint: []const u8 = "";
     while (true) {
         client.streamMessage(&msgs, &.{}, &app.compact_cancel, &collector, SummaryCollector.cb, null) catch |e| {
             if (!streamErrorRetryable(e) or attempt >= stream_retry_max or app.compact_cancel.load(.acquire)) {
@@ -6314,6 +6841,9 @@ fn compactionExecute(plan: *CompactionPlan) void {
                         plan.err = "构建摘要输入失败";
                         return;
                     };
+                    if (retry_hint.len > 0) {
+                        if (appendRetryHint(plan.arena.allocator(), payload, retry_hint)) |p| payload = p;
+                    }
                     payload_thinking = false;
                     msgs[1].content = payload;
                     collector.list.clearRetainingCapacity();
@@ -6359,11 +6889,50 @@ fn compactionExecute(plan: *CompactionPlan) void {
             }
             continue;
         };
-        break;
-    }
-    if (collector.list.items.len == 0) {
-        plan.err = "摘要为空";
-        return;
+        if (collector.list.items.len == 0) {
+            plan.err = "摘要为空";
+            return;
+        }
+        // 摘要输出异常校验（只查正文；思考不查）：续写垃圾（≥3 次 / 行首 1 次）、
+        // 被上限截断、大范围压缩却过短——都视为坏输出。
+        // 受"摘要垃圾审核"设置控制（关 = 盲采：拿到什么输出都采用，含半截）
+        const garbage = plan.summary_garbage_check and
+            (summaryTooShort(range.retain_start - range.summarize_start, collector.list.items.len) or
+                context_mod.summaryLooksGarbage(collector.list.items) or
+                client.last_stopped_by_length);
+        if (!garbage) break;
+        if (garbage_retries >= 1 or !plan.compaction_retry) {
+            plan.err = "摘要输出异常（疑似续写垃圾/被截断/过短），已放弃本次压缩";
+            return;
+        }
+        garbage_retries += 1;
+        Log.warn(.compact, "摘要输出异常（续写垃圾/截断/过短）→ 重试一次（剥思考）", .{});
+        // 剥离思考重试（按设置：retry_only/always 剥、never 保留）：
+        // 第一人称思考是漂移燃料，且思考同样吃输出上限（2026-10-13）
+        const keep_thinking = plan.compaction_strip_thinking == .never;
+        payload = buildCompactionPayload(plan.arena.allocator(), plan.history, range, prev_summary, .{ .include_thinking = keep_thinking }) catch {
+            plan.err = "构建摘要输入失败";
+            return;
+        };
+        payload_thinking = keep_thinking;
+        // 定向提示：追加到载荷**末尾**（前缀不变 → 提示缓存仍命中，只失效尾部一小段）
+        retry_hint = if (client.last_stopped_by_length)
+            context_mod.compaction_retry_hint_truncated
+        else
+            context_mod.compaction_retry_hint_garbage;
+        if (appendRetryHint(plan.arena.allocator(), payload, retry_hint)) |p| {
+            payload = p;
+            msgs[1].content = payload;
+        }
+        collector.list.clearRetainingCapacity();
+        collector.reasoning.clearRetainingCapacity();
+        collector.reasoning_start_ms = 0;
+        collector.reasoning_end_ms = 0;
+        if (plan.async and !compactRetryHandshake(app, &app.compact_cancel)) {
+            plan.err = "已取消";
+            return;
+        }
+        continue;
     }
 
     // 保留区首条已落库消息的 id
@@ -6429,6 +6998,65 @@ fn estimateJobRequestTokens(job: *const StreamJob) usize {
     return pure;
 }
 
+/// 会话当前思考档（显式设置尊重用户、原样发送；否则全局档钳制到模型可用集）——
+/// 对话 / 中途压缩 / 手动压缩统一口径（2026-10-13 起）。
+fn sessionThinkingEffort(self: *AppState, preset: []const u8, model: []const u8) []const u8 {
+    const think = self.currentThinkingEx();
+    return if (think.explicit) think.level else clampThinking(&self.config, preset, model, think.level);
+}
+
+/// 大范围压缩的摘要过短判定：1903 条消息不可能总结成 114 字符（2026-10-13 二次事故）。
+/// 小范围（<100 条）不设下限，避免误伤。
+fn summaryTooShort(summarized_count: usize, content_len: usize) bool {
+    return summarized_count >= 100 and content_len < 200;
+}
+
+/// 压缩时剥离思考模式（设置页）：never = 从不剥；always = 首试即剥；retry_only = 仅坏输出重试时剥
+pub const StripThinkingMode = enum { never, always, retry_only };
+
+fn parseStripThinkingMode(s: []const u8) StripThinkingMode {
+    if (std.mem.eql(u8, s, "never")) return .never;
+    if (std.mem.eql(u8, s, "always")) return .always;
+    return .retry_only;
+}
+
+/// 压缩时思考档（设置页）：""/follow = 跟随会话；否则按模型能力钳制后的档位。
+/// （未知模型按用户显式选择原样使用——设置是显式行为，不做自动安全降级。）
+fn compactionEffortFor(config: *config_mod.Config, preset: []const u8, model: []const u8) []const u8 {
+    const want = config.compaction_thinking;
+    if (want.len == 0 or std.mem.eql(u8, want, "follow")) return "";
+    return clampThinking(config, preset, model, want);
+}
+
+/// 回传思考字段（设置页覆盖）：auto = 跟随能力表；on = 强制开（表里没有按最常见字段）；
+/// off = 强制关（部分网关会 400，风险自负）。
+fn interleavedFieldFor(config: *config_mod.Config, preset: []const u8, model: []const u8) []const u8 {
+    const table = if (model_table.lookup(preset, model)) |e| e.interleaved else "";
+    if (std.mem.eql(u8, config.interleaved_mode, "off")) return "";
+    if (std.mem.eql(u8, config.interleaved_mode, "on")) {
+        return if (table.len > 0) table else "reasoning_content";
+    }
+    return table;
+}
+
+/// 重试定向提示追加：放在载荷**末尾**（前缀不变 → 提示缓存仍命中，只失效尾部一小段）。
+/// 无提示返回 null；返回切片为 arena 新分配，可直接赋给可变 payload。
+fn appendRetryHint(arena: Allocator, payload: []const u8, hint: []const u8) ?[]u8 {
+    if (hint.len == 0) return null;
+    return std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ payload, hint }) catch null;
+}
+
+/// 用户配置的输出上限（config.json: max_output_tokens，0 = 不限/不发）。
+/// 按模型能力表钳制：min(用户值, 表内 max_out)；表标记 no_max_tokens 或用户值 0 → 返回 0（不发）。
+fn resolveMaxOutputTokens(config: *const config_mod.Config, preset: []const u8, model: []const u8) u32 {
+    const want: u32 = config.max_output_tokens;
+    if (want == 0) return 0;
+    const e = model_table.lookup(preset, model) orelse return want;
+    if (e.no_max_tokens) return 0;
+    if (e.max_out == 0) return want;
+    return @intCast(@min(@as(u64, want), e.max_out));
+}
+
 /// 回合中途压缩：worker 已实时落库，整段 job.history（含当前回合）都可参与压缩。
 /// `force`（手动排队请求）：跳过阈值检查（用户显式要求压缩），
 /// 但仍需有可压缩内容；无可压内容时发一个 toast 提示。
@@ -6436,6 +7064,8 @@ fn estimateJobRequestTokens(job: *const StreamJob) usize {
 /// 返回 true 表示发生了压缩（job.compacted_midturn 置位）。
 fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override: usize) bool {
     if (job.history.len < 2) return false;
+    // 本回合摘要曾判垃圾：不再自动尝试（防每轮重试风暴；手动/救援 force 不受限）
+    if (!force and job.compact_rejected_midturn) return false;
     const est = estimateJobRequestTokens(job);
     if (!force) {
         if (job.auto_compact_pct == 0 or job.context_window == 0) return false;
@@ -6482,7 +7112,7 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
     else
         "";
 
-    const built = buildBudgetedCompactionPayload(arena, hist, rng, prev_summary, job.context_window) catch return false;
+    const built = buildBudgetedCompactionPayload(arena, hist, rng, prev_summary, job.context_window, .{ .include_thinking = job.compaction_strip_thinking != .always }) catch return false;
     var payload = built.payload;
     var payload_thinking = built.include_thinking;
     Log.info(.compact, "摘要输入 {d} 字节（预算 {d}）：{s}{s}{s}（丢最老 {d} 条）", .{
@@ -6501,6 +7131,8 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
     var beh = job.behavior;
     beh.cache_key = false;
     beh.retention = .none;
+    // 压缩时思考档（设置页；"" = follow）
+    if (job.compaction_effort.len > 0) beh.reasoning_effort = job.compaction_effort;
     var client = ai.AI.init(job.app.allocator, job.io, .{
         .api_key = job.api_key,
         .endpoint = job.endpoint,
@@ -6526,6 +7158,8 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
         .allocator = job.app.allocator,
         .io = job.io,
         .stream_app = job.app, // 与手动 /compact 一致：思考 + 正文流式回传主线程
+        .abort_flag = &client.abort_requested,
+        .garbage_check = job.summary_garbage_check,
     };
     defer collector.deinit();
     // 取消信号：跟随本轮生成（Ctrl+Q 置位 stream_cancel）
@@ -6544,6 +7178,8 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
     };
     // 断连自动重试（与主流请求同一策略；重试丢弃失败尝试的摘要与气泡）
     var attempt: u32 = 0;
+    var garbage_retries: u32 = 0;
+    var retry_hint: []const u8 = "";
     while (true) {
         client.streamMessage(&msgs, &.{}, cancel, &collector, SummaryCollector.cb, null) catch |e| {
             if (!streamErrorRetryable(e) or attempt >= stream_retry_max or cancel.load(.acquire)) {
@@ -6551,6 +7187,9 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
                 if (payload_thinking and e != error.Canceled and !cancel.load(.acquire)) {
                     if (client.takeErrorBody()) |body| job.app.allocator.free(body);
                     payload = buildCompactionPayload(arena, hist, rng, prev_summary, .{ .include_thinking = false }) catch return false;
+                    if (retry_hint.len > 0) {
+                        if (appendRetryHint(arena, payload, retry_hint)) |p| payload = p;
+                    }
                     payload_thinking = false;
                     msgs[1].content = payload;
                     collector.list.clearRetainingCapacity();
@@ -6581,9 +7220,43 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
             if (!cancelableSleep(job.app, delay_ms, cancel)) return false;
             continue;
         };
-        break;
+        if (collector.list.items.len == 0) return false;
+        // 摘要输出异常校验（只查正文；思考不查）：续写垃圾（≥3 次 / 行首 1 次）、
+        // 被上限截断、大范围压缩却过短——都视为坏输出。
+        // 受"摘要垃圾审核"设置控制（关 = 盲采：拿到什么输出都采用，含半截）
+        const garbage = job.summary_garbage_check and
+            (summaryTooShort(rng.retain_start - rng.summarize_start, collector.list.items.len) or
+                context_mod.summaryLooksGarbage(collector.list.items) or
+                client.last_stopped_by_length);
+        if (!garbage) break;
+        if (garbage_retries >= 1 or !job.compaction_retry) {
+            job.compact_rejected_midturn = true; // 本回合不再自动重试（防每轮重试风暴）
+            Log.warn(.compact, "摘要输出异常（续写垃圾/截断/过短）→ 放弃本次压缩（不落库）", .{});
+            return false;
+        }
+        garbage_retries += 1;
+        Log.warn(.compact, "摘要输出异常（续写垃圾/截断/过短）→ 重试一次（剥思考）", .{});
+        // 剥离思考重试（按设置：retry_only/always 剥、never 保留）：
+        // 第一人称思考是漂移燃料，且思考同样吃输出上限（2026-10-13）
+        const keep_thinking = job.compaction_strip_thinking == .never;
+        payload = buildCompactionPayload(arena, hist, rng, prev_summary, .{ .include_thinking = keep_thinking }) catch return false;
+        payload_thinking = keep_thinking;
+        // 定向提示：追加到载荷**末尾**（前缀不变 → 提示缓存仍命中，只失效尾部一小段）
+        retry_hint = if (client.last_stopped_by_length)
+            context_mod.compaction_retry_hint_truncated
+        else
+            context_mod.compaction_retry_hint_garbage;
+        if (appendRetryHint(arena, payload, retry_hint)) |p| {
+            payload = p;
+            msgs[1].content = payload;
+        }
+        collector.list.clearRetainingCapacity();
+        collector.reasoning.clearRetainingCapacity();
+        collector.reasoning_start_ms = 0;
+        collector.reasoning_end_ms = 0;
+        if (!compactRetryHandshake(job.app, cancel)) return false;
+        continue;
     }
-    if (collector.list.items.len == 0) return false;
 
     // 保留区首条已落库消息的行 id（实时落库后当前回合消息也有 id）
     var tail_start: i64 = 0;
@@ -7010,6 +7683,8 @@ fn cmdCompact(init: std.process.Init, opt: CliOptions) u8 {
     };
     defer allocator.free(cfg_path);
     state.config.loadFile(io, allocator, cfg_path, opt.config_path.len == 0);
+    state.keep_recent_tokens = state.config.keep_recent_tokens; // 设置页：保留窗口默认值
+    state.auto_compact_pct = state.config.auto_compact_pct; // 设置页：自动压缩阈值
     const db_path = cliResolveDefaultPath(allocator, io, opt.db_path, "skynet.db") orelse {
         cliWriteStderr(io, "内存不足\n");
         return 4;
@@ -7127,6 +7802,8 @@ fn cmdAsk(init: std.process.Init, opt: CliOptions) u8 {
     };
     defer allocator.free(cfg_path);
     state.config.loadFile(io, allocator, cfg_path, opt.config_path.len == 0);
+    state.keep_recent_tokens = state.config.keep_recent_tokens; // 设置页：保留窗口默认值
+    state.auto_compact_pct = state.config.auto_compact_pct; // 设置页：自动压缩阈值
     const db_path = cliResolveDefaultPath(allocator, io, opt.db_path, "skynet.db") orelse {
         cliWriteStderr(io, "内存不足\n");
         return 4;
@@ -7803,6 +8480,8 @@ pub fn main(init: std.process.Init) !u8 {
         break :blk allocator.dupe(u8, z) catch &.{};
     };
     state.config.loadFile(io, allocator, tui_cfg_path_owned orelse "config.json", true);
+    state.keep_recent_tokens = state.config.keep_recent_tokens; // 设置页：保留窗口默认值
+    state.auto_compact_pct = state.config.auto_compact_pct; // 设置页：自动压缩阈值
     // 模糊宽度策略（①←≤…按 1 列还是 2 列）：必须在首次绘制前应用
     applyAmbiguousWidth(&state);
 
@@ -7931,6 +8610,8 @@ pub fn main(init: std.process.Init) !u8 {
         state.streamWatchdog();
         // 异步压缩：消费摘要增量 / 完成收尾
         state.pumpCompaction();
+        // 发送拦截提示：封锁解除后复位提示标志（一次封锁只提示一条）
+        state.refreshLimitNoticeFlag();
 
         // 其他进程（CLI）写入当前会话时增量刷新
         state.pollExternalUpdates();
@@ -8036,6 +8717,8 @@ fn handleTerminalEvent(state: *AppState, terminal: *Terminal, event: tui.Event) 
                 .provider_confirm => state.handleProviderConfirmKey(key),
                 .compact_confirm => state.handleCompactConfirmKey(key),
                 .thinking_select => state.handleThinkingSelectKey(key),
+                 .settings => state.handleSettingsKey(key),
+                 .settings_reset_confirm => state.handleSettingsResetConfirmKey(key),
                 .preset_select => state.handlePresetSelectKey(key),
                 .session_select => state.handleSessionSelectKey(key),
                 .session_confirm => state.handleSessionConfirmKey(key),
@@ -8626,12 +9309,13 @@ fn summarizeToolResult(arena: Allocator, result: tools_mod.Result) error{OutOfMe
 }
 
 /// 推一个 usage 事件（worker 每轮拿到服务端真实用量后调用；线程安全）
-fn pushUsageEvent(app: *AppState, usage: ai.Usage) void {
+fn pushUsageEvent(app: *AppState, usage: ai.Usage, est: usize) void {
     app.stream_mutex.lockUncancelable(app.io);
     defer app.stream_mutex.unlock(app.io);
     app.stream_events.append(app.allocator, .{
         .kind = .usage_update,
         .usage = usage,
+        .est = est,
     }) catch {};
 }
 
@@ -8985,9 +9669,26 @@ fn streamWorker(job: *StreamJob) void {
             if (ensureWorkerDb(job, &worker_db)) |wdb| {
                 if (manual_queued) {
                     // 手动排队：不受阈值限制（用户就是要压）；保留窗口用 /compact N 或配置值
-                    _ = compactJobHistory(job, wdb, true, manual_keep);
+                    if (compactJobHistory(job, wdb, true, manual_keep)) {
+                        // 压缩完成立即刷新显示：真实账本已过期 → 清空，切到压缩后的新估算
+                        pushUsageEvent(app, .{}, estimateJobRequestTokens(job));
+                    }
                 } else {
-                    _ = compactJobHistory(job, wdb, false, 0);
+                    // 本次自动尝试是否产生了"最终拒绝"（而非继承已有 latch，如手动失败的残留）
+                    const was_rejected = job.compact_rejected_midturn;
+                    const compacted = compactJobHistory(job, wdb, false, 0);
+                    if (!was_rejected and job.compact_rejected_midturn) {
+                        // 自动压缩连续两次被拒（模型摘要输出异常）：止损——中断本回合，
+                        // 把决定权交给用户（手动压缩 / 换模型 / 提醒 AI 注意写摘要）。
+                        Log.warn(.compact, "自动压缩连续两次被拒 → 中断本回合（止损）", .{});
+                        queueNoticeFromWorker(app, "⚠ 自动压缩连续两次失败，本回合已停止。\n原因：模型没按要求输出摘要正文——典型两种：把对话\"续写\"下去（复述工具调用/结果），或摘要被输出上限截断；两次产出均未通过摘要审核。\n垃圾/不完整的摘要已被丢弃不会进入历史、不会落库。\n可尝试（推荐顺序）：\n① 设置页 →「压缩时剥离思考」改为「总是」（推荐先试）\n② 手动 /compact 再压一次\n③ 换模型后重试");
+                        app.stream_error = error.CompactionRejected;
+                        app.setStreamStatus(.failed);
+                        return;
+                    } else if (compacted) {
+                        // 中途自动压缩完成：同样立即刷新显示（不等下一轮响应，网络卡住时也能立即变小）
+                        pushUsageEvent(app, .{}, estimateJobRequestTokens(job));
+                    }
                 }
             }
         }
@@ -9029,7 +9730,8 @@ fn streamWorker(job: *StreamJob) void {
                     job.anchor_tokens = client.usage.input_tokens;
                 }
                 // 每轮请求即时刷新主线程的上下文占用/缓存命中（不必等回合结束）
-                pushUsageEvent(app, client.usage);
+                // 同时带上 worker 的当轮估算：中途压缩后显示立即变小（主线程历史未重建）
+                pushUsageEvent(app, client.usage, estimateJobRequestTokens(job));
                 break :attempt_loop;
             } else |err| {
                 if (!streamErrorRetryable(err) or attempt >= stream_retry_max or
@@ -9139,6 +9841,11 @@ fn streamWorker(job: *StreamJob) void {
                 }
             } else |_| {}
         }
+        // 输出上限截断（finish_reason="length"）：无工具调用 → 保留文本 + 系统通知提示
+        if (client.last_stopped_by_length and !has_calls) {
+            Log.warn(.api, "输出达到上限（max_output_tokens）：回复被截断", .{});
+            queueNoticeFromWorker(app, "⚠ 输出达到上限（config.json: max_output_tokens），本轮回复被截断");
+        }
         if (!has_calls) {
             app.setStreamStatus(.done);
             return;
@@ -9147,6 +9854,30 @@ fn streamWorker(job: *StreamJob) void {
         // 确保主线程已显示完本轮正文，再进入工具阶段
         waitDrained(app);
         pushStreamEventDb(app, .turn_end, "", "", "", "", false, turn_db_id);
+
+        // 截断的响应里工具调用参数可能不完整 → 全部按失败记录、不执行（pi 同款）
+        if (client.last_stopped_by_length) {
+            for (tool_calls.items.items) |tc| {
+                job.tool_meta.append(arena, .{ .id = tc.id, .name = tc.name, .display = "", .is_error = true }) catch {};
+                const tool_msg = ai.Message{
+                    .role = "tool",
+                    .content = "Tool call not executed: the model output was truncated by the output token limit (max_output_tokens); arguments may be incomplete. Re-issue the call if needed.",
+                    .tool_call_id = tc.id,
+                };
+                job.transcript.append(arena, .{ .msg = tool_msg }) catch break;
+                job.history = extendHistory(arena, job.history, &[_]ai.Message{tool_msg}) catch break;
+                var tool_db_id: i64 = 0;
+                if (ensureWorkerDb(job, &worker_db)) |wdb| {
+                    persistTranscriptEntry(job, wdb, job.transcript.items.len - 1, job.history.len - 1);
+                    tool_db_id = job.transcript.items[job.transcript.items.len - 1].msg.db_id;
+                }
+                pushStreamEventDb(app, .tool_end, tc.name, "未执行（输出被上限截断）", tc.arguments, "", true, tool_db_id);
+            }
+            Log.warn(.api, "输出达到上限：{d} 个工具调用未执行（按失败处理）", .{tool_calls.items.items.len});
+            queueNoticeFromWorker(app, "⚠ 输出达到上限（config.json: max_output_tokens），本轮工具调用未执行");
+            waitDrained(app);
+            continue :rounds;
+        }
 
         for (tool_calls.items.items) |tc| {
             if (app.stream_cancel.load(.acquire)) {
@@ -9350,6 +10081,12 @@ fn drawFrame(state: *AppState, buf: *Buffer) void {
             drawCompactConfirmOverlay(state, area, buf);
         },
         .thinking_select => drawOverlayMenu(state, area, buf, thinkingMenuRows(state), drawThinkingSelect),
+         .settings => drawOverlayMenu(state, area, buf, settingsMenuRows(state), drawSettings),
+         .settings_reset_confirm => {
+             // 设置页在下，确认对话框叠在上面
+             drawOverlayMenu(state, area, buf, settingsMenuRows(state), drawSettings);
+             drawSettingsResetConfirmOverlay(state, area, buf);
+         },
         .preset_select => drawOverlayMenu(state, area, buf, config_mod.presets.len + 1, drawPresetSelect),
         .session_select => drawOverlayMenu(state, area, buf, state.session_list.len + 1, drawSessionSelect),
         .session_confirm => {
@@ -10803,6 +11540,70 @@ fn thinkingMenuRows(state: *AppState) usize {
     return info.levels.len + @as(usize, if (info.known) 0 else 1);
 }
 
+/// 设置页的菜单行数（条目 + 底部提示行）
+fn settingsMenuRows(state: *AppState) usize {
+    _ = state;
+    return settings_layout.len + 1;
+}
+
+fn drawSettings(state: *AppState, area: Rect, buf: *Buffer) void {
+    const blk = Block{
+        .title = " 设置 ",
+        .borders = Borders.ALL,
+        .border_style = .{ .fg = .yellow },
+        .title_style = .{ .fg = .white, .modifier = .{ .bold = true } },
+        .border_symbols = BorderSymbols.rounded(),
+    };
+    blk.render(area, buf);
+    const inner = blk.inner(area);
+    if (inner.height == 0 or inner.width == 0) return;
+
+    var y = inner.y;
+    for (settings_layout, 0..) |row, i| {
+        if (y >= inner.y + inner.height) break;
+        if (row.id == null) {
+            _ = drawTextAt(buf, inner.x + 1, y, row.group, .{ .fg = .dark_gray, .modifier = .{ .bold = true } });
+            y += 1;
+            continue;
+        }
+        const id = row.id.?;
+        const is_selected = i == state.settings_index;
+        var prefix: []const u8 = "  ";
+        var style: Style = .{ .fg = .white };
+        var value_style: Style = .{ .fg = .yellow };
+        if (is_selected) {
+            prefix = "> ";
+            style = .{ .fg = .black, .bg = .white };
+            // 纯黑（不加 bold：部分终端把粗体黑渲染成亮黑/灰，白底上发灰）
+            value_style = .{ .fg = .black, .bg = .white };
+        }
+        var x = inner.x;
+        x = drawTextAt(buf, x, y, prefix, style);
+        _ = drawTextAt(buf, x, y, settingLabel(id), style);
+        var vb: [64]u8 = undefined;
+        const editing = state.settings_edit and is_selected;
+        const vt = if (editing)
+            std.fmt.bufPrint(&vb, "{s}_", .{state.settings_edit_buf[0..state.settings_edit_len]}) catch "_"
+        else
+            settingValueText(state, id, &vb);
+        // 右对齐按**显示宽度**（中文 1 字 3 字节但占 2 列；用字节长度会参差不齐）
+        const vw: u16 = @intCast(@min(tui.render.stringWidth(vt), 0xFFFF));
+        const fits = if (editing) vw + 2 < inner.width else vw + 4 < inner.width;
+        if (vt.len > 0 and fits) {
+            const vx: u16 = inner.x + inner.width - 2 - vw;
+            _ = drawTextAt(buf, vx, y, vt, value_style);
+        }
+        y += 1;
+    }
+    if (y < inner.y + inner.height) {
+        const hint = if (state.settings_edit)
+            "输入数值：可带 k（20k、0.5k）或 %；Enter 确认 · Esc 取消 · Backspace 删除"
+        else
+            "（←→/Enter 调整；数字行 Enter 可键盘输入、←→ 走预设档位）";
+        _ = drawTextAt(buf, inner.x + 1, y, hint, .{ .fg = .dark_gray });
+    }
+}
+
 fn drawProviderModels(state: *AppState, area: Rect, buf: *Buffer) void {
     var title_buf: [256]u8 = undefined;
     const provider_name = if (state.model_select_provider < state.config.providers.items.len)
@@ -11288,6 +12089,70 @@ fn drawCompactConfirmDialog(state: *AppState, area: Rect, buf: *Buffer) void {
     _ = drawTextAt(buf, x + @as(u16, @intCast(gap)), y, yes_text, yes_style);
 }
 
+fn drawSettingsResetConfirmOverlay(state: *AppState, area: Rect, buf: *Buffer) void {
+    var w: u16 = @intCast(@as(u32, area.width) * 50 / 100);
+    w = @min(@max(w, 40), 64);
+    var h: u16 = 6;
+    if (h > area.height) h = area.height;
+    const popup = tui.centeredRectFixed(area, w, h);
+
+    dimOutsidePopup(buf, popup);
+    clearArea(buf, popup);
+    drawSettingsResetConfirmDialog(state, popup, buf);
+}
+
+fn drawSettingsResetConfirmDialog(state: *AppState, area: Rect, buf: *Buffer) void {
+    const blk = Block{
+        .title = " 恢复默认设置 ",
+        .borders = Borders.ALL,
+        .border_style = .{ .fg = busy_accent },
+        .title_style = .{ .fg = .white, .modifier = .{ .bold = true } },
+        .border_symbols = BorderSymbols.rounded(),
+    };
+    blk.render(area, buf);
+
+    const inner = blk.inner(area);
+    if (inner.height == 0 or inner.width == 0) return;
+
+    var y = inner.y;
+    if (state.confirm_stage == 1) {
+        buf.setString(inner.x, y, "把设置页全部选项恢复为默认值？", .{ .fg = .white });
+    } else {
+        buf.setString(inner.x, y, "真的要恢复默认吗？", .{ .fg = .red, .modifier = .{ .bold = true } });
+    }
+    y += 1;
+
+    if (inner.height > 1) {
+        if (state.confirm_stage == 1) {
+            buf.setString(inner.x, y, "压缩与上下文相关选项回到出厂值（提供商、模型、会话不受影响）", .{ .fg = .dark_gray });
+        } else {
+            buf.setString(inner.x, y, "立即生效并写入 config.json", .{ .fg = .dark_gray });
+        }
+    }
+    y += 2;
+
+    if (y >= inner.y + inner.height) return;
+    const no_text = "[ 否 ]";
+    const yes_text = "[ 是 ]";
+    const no_w = tui.render.stringWidth(no_text);
+    const gap: usize = 4;
+    const yes_w = tui.render.stringWidth(yes_text);
+    const total_w: u16 = @intCast(no_w + gap + yes_w);
+    var x = inner.x + (inner.width -| total_w) / 2;
+
+    const no_style: Style = if (!state.confirm_yes)
+        .{ .fg = .black, .bg = .white, .modifier = .{ .bold = true } }
+    else
+        .{ .fg = .white };
+    const yes_style: Style = if (state.confirm_yes)
+        .{ .fg = .black, .bg = .white, .modifier = .{ .bold = true } }
+    else
+        .{ .fg = .white };
+
+    x = drawTextAt(buf, x, y, no_text, no_style);
+    _ = drawTextAt(buf, x + @as(u16, @intCast(gap)), y, yes_text, yes_style);
+}
+
 fn formatRelativeTime(buf: []u8, now: i64, ts: i64) []const u8 {
     var diff = now - ts;
     if (diff < 0) diff = 0;
@@ -11558,7 +12423,7 @@ fn drawInputStatus(state: *AppState, area: Rect, buf: *Buffer) void {
 
     if (model.len > 0) {
         // 最左：上下文占用（已用/窗口 + 百分比，按压力着色）。
-        // 取大：服务端最近一次真实回传 vs 当前估算（与压缩决策同口径）——
+        // 取大：服务端最近一次真实回传 vs 当前估算（回合中为 worker 权威估算）——
         // 账本过期偏低时显示真实大小；估算胜出时加 ~ 前缀。
         const real_tokens = state.context_usage.input_tokens + state.context_usage.output_tokens;
         const est_tokens: u64 = @intCast(state.estimateRequestTokens());
@@ -11663,6 +12528,8 @@ fn drawHelp(state: *AppState, area: Rect, buf: *Buffer) void {
         .provider_confirm => " [←→] 切换选项  [Enter] 确认  [Esc] 取消 ",
         .compact_confirm => " [←→] 切换选项  [Enter] 确认  [Esc] 取消 ",
         .thinking_select => " [↑↓] 选择思考强度  [Enter] 确认  [Esc] 返回 ",
+        .settings => " [↑↓] 选择  [←→/Enter] 调整  [Esc] 返回 ",
+        .settings_reset_confirm => " [←→] 切换选项  [Enter] 确认  [Esc] 取消 ",
         .provider_add => " [Tab] 切换字段  [Enter] 下一项/保存  [Esc] 取消 ",
         .session_select => " [↑↓] 选择会话  [Enter] 加载/新建  [Ctrl+R] 重命名  [Del] 删除  [Esc] 取消 ",
         .session_rename => " [Enter] 保存  [Esc] 取消  [Ctrl+A] 全选  [Ctrl+X] 剪切  [Ctrl+C] 复制 ",
@@ -11776,6 +12643,88 @@ test "绘制非法 UTF-8 不崩溃（宽容输出）" {
     try std.testing.expect(written > 0);
 }
 
+test "输出上限：用户配置按模型钳制（表 max_out / no_max_tokens / 0=不发）" {
+    var cfg = config_mod.Config{};
+    defer cfg.deinit(std.testing.allocator);
+    cfg.max_output_tokens = 50_000;
+    // 表里有上限：取 min
+    try std.testing.expectEqual(@as(u32, 50_000), resolveMaxOutputTokens(&cfg, "opencode-go", "deepseek-v4.1-flash"));
+    cfg.max_output_tokens = 500_000;
+    try std.testing.expectEqual(@as(u32, 393216), resolveMaxOutputTokens(&cfg, "opencode-go", "deepseek-v4.1-flash"));
+    // 表里无数据：原样
+    try std.testing.expectEqual(@as(u32, 500_000), resolveMaxOutputTokens(&cfg, "nope", "nope"));
+    // 0 = 不发
+    cfg.max_output_tokens = 0;
+    try std.testing.expectEqual(@as(u32, 0), resolveMaxOutputTokens(&cfg, "opencode-go", "deepseek-v4.1-flash"));
+}
+
+test "设置页助手：压缩思考档 / 回传思考覆盖 / 剥离思考模式 + 提示追加" {
+    var cfg = config_mod.Config{};
+    defer cfg.deinit(std.testing.allocator);
+    // 压缩思考档：缺省/ follow → ""（跟随会话）；显式值按模型钳制
+    try std.testing.expectEqualStrings("", compactionEffortFor(&cfg, "opencode-go", "deepseek-v4.1-flash"));
+    cfg.setCompactionThinking(std.testing.allocator, "low");
+    try std.testing.expectEqualStrings("low", compactionEffortFor(&cfg, "opencode-go", "deepseek-v4.1-flash"));
+    cfg.setCompactionThinking(std.testing.allocator, "follow");
+    try std.testing.expectEqualStrings("", compactionEffortFor(&cfg, "opencode-go", "deepseek-v4.1-flash"));
+    // 回传思考：auto 跟随能力表 / off 强制关 / on 强制开（表里没有按常见字段）
+    try std.testing.expectEqualStrings("reasoning_content", interleavedFieldFor(&cfg, "opencode-go", "deepseek-v4.1-flash"));
+    cfg.setInterleavedMode(std.testing.allocator, "off");
+    try std.testing.expectEqualStrings("", interleavedFieldFor(&cfg, "opencode-go", "deepseek-v4.1-flash"));
+    cfg.setInterleavedMode(std.testing.allocator, "on");
+    try std.testing.expectEqualStrings("reasoning_content", interleavedFieldFor(&cfg, "nope", "nope"));
+    // 剥离思考模式解析
+    try std.testing.expectEqual(StripThinkingMode.retry_only, parseStripThinkingMode(""));
+    try std.testing.expectEqual(StripThinkingMode.never, parseStripThinkingMode("never"));
+    try std.testing.expectEqual(StripThinkingMode.always, parseStripThinkingMode("always"));
+    try std.testing.expectEqual(StripThinkingMode.retry_only, parseStripThinkingMode("??"));
+    // 提示追加在末尾（前缀不变 → 缓存保前缀）
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = appendRetryHint(arena.allocator(), "PAYLOAD", "HINT").?;
+    try std.testing.expectEqualStrings("PAYLOAD\n\nHINT", p);
+    try std.testing.expect(appendRetryHint(arena.allocator(), "PAYLOAD", "") == null);
+}
+
+test "思考档统一：sessionThinkingEffort（未设置 / 全局档钳制 / 未知放行）" {
+    var state = AppState{};
+    state.allocator = std.testing.allocator;
+    defer state.config.deinit(std.testing.allocator);
+    // 未设置 → 空（不发送）
+    try std.testing.expectEqualStrings("", sessionThinkingEffort(&state, "opencode-go", "deepseek-v4.1-flash"));
+    // 全局 max（模型支持）→ max
+    state.config.setThinking(std.testing.allocator, "max");
+    try std.testing.expectEqualStrings("max", sessionThinkingEffort(&state, "opencode-go", "deepseek-v4.1-flash"));
+    // 未知模型 → 原样放行（不钳制）
+    try std.testing.expectEqualStrings("max", sessionThinkingEffort(&state, "nope", "nope"));
+}
+
+test "摘要过短判定：大范围压缩 114 字符 → 垃圾；小范围不设下限" {
+    try std.testing.expect(summaryTooShort(1903, 114));
+    try std.testing.expect(!summaryTooShort(1903, 3000));
+    try std.testing.expect(!summaryTooShort(20, 50));
+}
+
+test "回合进行中：显示优先用 worker 估算（中途压缩后立即变小）" {
+    var state = AppState{};
+    state.allocator = std.testing.allocator;
+    defer state.config.deinit(std.testing.allocator);
+    const base = state.estimateRequestTokens();
+    state.worker_est = 12345;
+    try std.testing.expectEqual(@as(usize, 12345), state.estimateRequestTokens());
+    state.worker_est = null;
+    try std.testing.expectEqual(base, state.estimateRequestTokens());
+}
+
+/// mock 服务器端口探测（测试跳过判定用）：标记文件可能陈旧（脚本被硬杀时 finally 不执行），
+/// 直接 TCP 连接最可靠——连不上就跳过，避免测试在死服务器上跑出崩溃/泄漏。
+fn mockServerAlive(io: Io, port: u16) bool {
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return false;
+    const stream = addr.connect(io, .{ .mode = .stream }) catch return false;
+    stream.close(io);
+    return true;
+}
+
 test "集成：HTTP 400 错误路径（需本地 mock 服务器 127.0.0.1:18124）" {
     var threaded: std.Io.Threaded = undefined;
     threaded = .init(std.testing.allocator, .{});
@@ -11784,6 +12733,7 @@ test "集成：HTTP 400 错误路径（需本地 mock 服务器 127.0.0.1:18124�
 
     // mock 脚本会在启动时写标记文件；没有标记就不连接（避免无谓的报错噪声）
     std.Io.Dir.cwd().access(io, "test/mock_18124.running", .{}) catch return error.SkipZigTest;
+    if (!mockServerAlive(io, 18124)) return error.SkipZigTest;
 
     var state = AppState{};
     state.io = io;
@@ -11830,6 +12780,7 @@ test "集成：响应流被截断（需 mock 18126，中途断开无 [DONE]/fini
 
     // mock 脚本会在启动时写标记文件；没有标记就不连接（避免无谓的报错噪声）
     std.Io.Dir.cwd().access(io, "test/mock_18126.running", .{}) catch return error.SkipZigTest;
+    if (!mockServerAlive(io, 18126)) return error.SkipZigTest;
 
     var state = AppState{};
     state.io = io;
@@ -12138,6 +13089,7 @@ test "集成：工具调用循环（需本地 mock 服务器 127.0.0.1:18123）"
 
     // mock 脚本会在启动时写标记文件；没有标记就不连接（避免无谓的报错噪声）
     std.Io.Dir.cwd().access(io, "test/mock_18123.running", .{}) catch return error.SkipZigTest;
+    if (!mockServerAlive(io, 18123)) return error.SkipZigTest;
 
     var state = AppState{};
     state.io = io;
@@ -12331,6 +13283,120 @@ test "生成中回车排队：入队+显示+清空输入；指令与空输入保
     try std.testing.expectEqualStrings("第二条", state.pending_sends.items[1].text);
 }
 
+test "上下文上限拦截：自动压缩关闭 + 估算≥90% 时拒发（提示只上屏，不入库不进历史）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    defer {
+        state.clearPendingSends();
+        state.pending_sends.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        state.input.deinit();
+        state.dialog_input.deinit();
+        state.config.deinit(std.testing.allocator);
+    }
+
+    // 小窗口 + 大历史：估算 ≥ 90%（自动压缩关闭）
+    state.context_window_override = 10_000;
+    state.config.auto_compact = false;
+    const big = try std.testing.allocator.alloc(u8, 60_000);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    state.appendHistory("user", big);
+    try std.testing.expect(state.contextLimitSendBlocked());
+
+    // 发送被拦：不清空输入、不排队、出提示（显示层）
+    state.input.insertBytes("hi");
+    state.last_key_ms = 0;
+    state.handleNormalKey(.{ .code = .enter });
+    try std.testing.expectEqualStrings("hi", state.input.value());
+    try std.testing.expectEqual(@as(usize, 0), state.pending_sends.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.messages.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.messages.items[0].content, "上下文已达上限") != null);
+    // 提示不进请求历史（历史里只有那条大消息）
+    try std.testing.expectEqual(@as(usize, 1), state.history.items.len);
+
+    // 重复尝试：不重复刷屏（标志位去重）
+    state.last_key_ms = 0;
+    state.handleNormalKey(.{ .code = .enter });
+    try std.testing.expectEqual(@as(usize, 1), state.messages.items.len);
+    try std.testing.expect(state.limit_notice_active);
+
+    // 封锁解除（估算回落）→ 每帧刷新复位标志 → 再次封锁会重新提示一条
+    state.context_window_override = 10_000_000;
+    state.refreshLimitNoticeFlag();
+    try std.testing.expect(!state.limit_notice_active);
+    state.context_window_override = 10_000;
+    state.last_key_ms = 0;
+    state.handleNormalKey(.{ .code = .enter });
+    try std.testing.expectEqual(@as(usize, 2), state.messages.items.len);
+
+    // 自动压缩打开 → 放行；估算回落 → 放行
+    state.config.auto_compact = true;
+    try std.testing.expect(!state.contextLimitSendBlocked());
+    state.config.auto_compact = false;
+    state.context_window_override = 10_000_000;
+    try std.testing.expect(!state.contextLimitSendBlocked());
+}
+
+test "flush 拦截：自动压缩关闭 + 估算≥90% 时排队消息不发出（留队+提示）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    state.running = true;
+    defer {
+        state.clearPendingSends();
+        state.pending_sends.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        state.input.deinit();
+        state.dialog_input.deinit();
+        state.config.deinit(std.testing.allocator);
+    }
+
+    _ = state.config.appendProvider(std.testing.allocator, .{
+        .name = "mock",
+        .endpoint = "http://127.0.0.1:1/v1", // 不应被触达（拦截发生在请求之前）
+        .preset = "openai",
+    });
+    state.config.setCurrentProvider(std.testing.allocator, "mock");
+    state.config.setCurrentModel(std.testing.allocator, "mock-model");
+
+    // 小窗口 + 大历史 + 自动压缩关闭 → 拦截
+    state.context_window_override = 10_000;
+    state.config.auto_compact = false;
+    const big = try std.testing.allocator.alloc(u8, 60_000);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    state.appendHistory("user", big);
+
+    state.queuePendingSend("排队消息");
+    try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len);
+
+    state.flushPendingSends();
+    // 消息未被发出：留在队列（原顺序）、未启动回合、出提示
+    try std.testing.expectEqual(@as(usize, 1), state.pending_sends.items.len);
+    try std.testing.expectEqualStrings("排队消息", state.pending_sends.items[0].text);
+    try std.testing.expectEqual(StreamStatus.idle, state.streamStatus());
+    try std.testing.expect(state.messages.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, state.messages.items[state.messages.items.len - 1].content, "上下文已达上限") != null);
+}
+
 test "排队消息：FIFO 取用/清空；flush 在无提供商或生成中时不取走" {
     var threaded: std.Io.Threaded = undefined;
     threaded = .init(std.testing.allocator, .{});
@@ -12383,6 +13449,7 @@ test "排队消息：生成中提交，在工具轮次间注入（需本地 mock
     defer threaded.deinit();
 
     std.Io.Dir.cwd().access(io, "test/mock_18123.running", .{}) catch return error.SkipZigTest;
+    if (!mockServerAlive(io, 18123)) return error.SkipZigTest;
 
     var state = AppState{};
     state.io = io;
@@ -12498,6 +13565,7 @@ test "排队消息：无活动生成时 flush 作为新回合发出（需本地 
     defer threaded.deinit();
 
     std.Io.Dir.cwd().access(io, "test/mock_18123.running", .{}) catch return error.SkipZigTest;
+    if (!mockServerAlive(io, 18123)) return error.SkipZigTest;
 
     var state = AppState{};
     state.io = io;
@@ -12610,6 +13678,7 @@ test "断连重试：截断后自动重试成功，丢弃失败尝试的部分�
     defer threaded.deinit();
 
     std.Io.Dir.cwd().access(io, "test/mock_18127.running", .{}) catch return error.SkipZigTest;
+    if (!mockServerAlive(io, 18127)) return error.SkipZigTest;
 
     var state = AppState{};
     state.io = io;
@@ -12710,6 +13779,7 @@ test "断连重试：HTTP 503 属瞬时故障，自动重试（需 mock 18127）
     defer threaded.deinit();
 
     std.Io.Dir.cwd().access(io, "test/mock_18127.running", .{}) catch return error.SkipZigTest;
+    if (!mockServerAlive(io, 18127)) return error.SkipZigTest;
 
     var state = AppState{};
     state.io = io;
@@ -12781,6 +13851,7 @@ test "断连重试：退避期间 Ctrl+Q 可取消（需 mock 18126）" {
     defer threaded.deinit();
 
     std.Io.Dir.cwd().access(io, "test/mock_18126.running", .{}) catch return error.SkipZigTest;
+    if (!mockServerAlive(io, 18126)) return error.SkipZigTest;
 
     var state = AppState{};
     state.io = io;
@@ -13261,6 +14332,9 @@ test "旧工具输出折叠：批量触发、全文保留、重启后请求体�
     _ = live.persistMessage(.{ .role = "user", .content = "开始" });
     live.appendHistory("user", "开始");
 
+    // 折叠机制测试：默认已改为关（2026-10-14），这里显式打开
+    live.config.fold_old_tool_outputs = true;
+
     // 三条 100KB 工具输出：保护窗口 160KB → 最旧的 1 条应被折叠
     const call_ids = [_][]const u8{ "call_1", "call_2", "call_3" };
     const tool_names = [_][]const u8{ "read", "grep", "bash" };
@@ -13536,6 +14610,7 @@ test "集成：compaction（需本地 mock 服务器 127.0.0.1:18125）" {
     defer threaded.deinit();
 
     std.Io.Dir.cwd().access(io, "test/mock_18125.running", .{}) catch return error.SkipZigTest;
+    if (!mockServerAlive(io, 18125)) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     const db_path = "skynet_test_compact.db";
@@ -13656,6 +14731,7 @@ test "中途压缩：工具循环中压缩整段历史（含当前回合，需 m
     defer threaded.deinit();
 
     std.Io.Dir.cwd().access(io, "test/mock_18125.running", .{}) catch return error.SkipZigTest;
+    if (!mockServerAlive(io, 18125)) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     const db_path: [:0]const u8 = "skynet_test_midcompact.db";
@@ -13975,6 +15051,7 @@ test "排队压缩：生成中入队去重、间隙强制压、无内容可压�
     defer threaded.deinit();
 
     std.Io.Dir.cwd().access(io, "test/mock_18125.running", .{}) catch return error.SkipZigTest;
+    if (!mockServerAlive(io, 18125)) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     const db_path = "skynet_test_queued_compact.db";
@@ -14113,6 +15190,7 @@ test "手动压缩：小会话自适应缩小保留窗口（需 mock 18125）" {
     defer threaded.deinit();
 
     std.Io.Dir.cwd().access(io, "test/mock_18125.running", .{}) catch return error.SkipZigTest;
+    if (!mockServerAlive(io, 18125)) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     const db_path = "skynet_test_adaptive.db";
@@ -14401,6 +15479,112 @@ test "思考强度：选单、设置与候选" {
     try std.testing.expectEqualStrings("high", state.config.thinkingFor("", "deepseek-v4.1-flash"));
     try std.testing.expect(state.messages.items.len == 0);
     try std.testing.expect(std.mem.indexOf(u8, state.toast[0..state.toast_len], "思考强度: high") != null);
+}
+
+test "设置页：打开/导航跳过组标题/循环与即时保存" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    defer state.config.deinit(std.testing.allocator);
+
+    // 隔离持久化：把“即时保存”重定向到 tmp/，避免写到仓库根目录的 config.json（测试污染）
+    // 先删除上次运行留下的文件，保证测试可重复
+    std.Io.Dir.cwd().deleteFile(io, "tmp/test_settings_config.json") catch {};
+    state.config.loadFile(io, std.testing.allocator, "tmp/test_settings_config.json", false);
+
+    state.openSettings(null);
+    try std.testing.expectEqual(Mode.settings, state.mode);
+    try std.testing.expectEqual(@as(usize, 1), state.settings_index); // 跳过组标题 → 首个可选项
+
+    // 开关：自动压缩
+    state.settings_index = 4;
+    try std.testing.expectEqual(SettingId.auto_compact, settings_layout[4].id.?);
+    state.handleSettingsKey(.{ .code = .enter });
+    try std.testing.expect(!state.config.auto_compact);
+    state.handleSettingsKey(.{ .code = .enter });
+    try std.testing.expect(state.config.auto_compact);
+
+    // 档位循环：压缩时思考档 follow → off（行下标随新增行后移）
+    state.settings_index = 7;
+    state.handleSettingsKey(.{ .code = .right });
+    try std.testing.expectEqualStrings("off", state.config.compaction_thinking);
+
+    // 档位循环（←→）：自动压缩阈值 85 → 70（wrap；预设 70/80/85）
+    state.settings_index = 5;
+    state.handleSettingsKey(.{ .code = .right });
+    try std.testing.expectEqual(@as(u64, 70), state.config.auto_compact_pct);
+
+    // 数值键盘输入：Enter 进入编辑，"75%" → 75；Esc 取消不改值
+    state.handleSettingsKey(.{ .code = .enter });
+    try std.testing.expect(state.settings_edit);
+    for ("75%") |c| state.handleSettingsKey(.{ .code = .{ .char = c } });
+    state.handleSettingsKey(.{ .code = .enter });
+    try std.testing.expect(!state.settings_edit);
+    try std.testing.expectEqual(@as(u64, 75), state.config.auto_compact_pct);
+    state.handleSettingsKey(.{ .code = .enter });
+    for ("9") |c| state.handleSettingsKey(.{ .code = .{ .char = c } });
+    state.handleSettingsKey(.{ .code = .esc });
+    try std.testing.expectEqual(@as(u64, 75), state.config.auto_compact_pct);
+
+    // 保留窗口键盘输入："0.5k" → 500，且本会话立即生效
+    state.settings_index = 6;
+    state.handleSettingsKey(.{ .code = .enter });
+    for ("0.5k") |c| state.handleSettingsKey(.{ .code = .{ .char = c } });
+    state.handleSettingsKey(.{ .code = .enter });
+    try std.testing.expectEqual(@as(usize, 500), state.config.keep_recent_tokens);
+    try std.testing.expectEqual(@as(usize, 500), state.keep_recent_tokens);
+
+    // 阈值钳制：输入 95% → 85（上限）；输入 1 → 50（下限）
+    state.settings_index = 5;
+    state.handleSettingsKey(.{ .code = .enter });
+    for ("95%") |c| state.handleSettingsKey(.{ .code = .{ .char = c } });
+    state.handleSettingsKey(.{ .code = .enter });
+    try std.testing.expectEqual(@as(u64, 85), state.config.auto_compact_pct);
+    state.handleSettingsKey(.{ .code = .enter });
+    for ("1") |c| state.handleSettingsKey(.{ .code = .{ .char = c } });
+    state.handleSettingsKey(.{ .code = .enter });
+    try std.testing.expectEqual(@as(u64, 50), state.config.auto_compact_pct);
+
+    // 恢复默认：两关确认 → 全部回默认
+    state.settings_index = 14;
+    try std.testing.expectEqual(SettingId.restore_defaults, settings_layout[14].id.?);
+    state.handleSettingsKey(.{ .code = .enter });
+    try std.testing.expectEqual(Mode.settings_reset_confirm, state.mode);
+    try std.testing.expectEqual(@as(u8, 1), state.confirm_stage);
+    state.handleSettingsResetConfirmKey(.{ .code = .right }); // 选"是"
+    state.handleSettingsResetConfirmKey(.{ .code = .enter }); // 第二关（光标回"否"）
+    try std.testing.expectEqual(@as(u8, 2), state.confirm_stage);
+    state.handleSettingsResetConfirmKey(.{ .code = .right });
+    state.handleSettingsResetConfirmKey(.{ .code = .enter }); // 执行
+    try std.testing.expectEqual(Mode.settings, state.mode);
+    try std.testing.expectEqual(@as(u64, 85), state.config.auto_compact_pct);
+    try std.testing.expectEqual(@as(usize, 20_000), state.config.keep_recent_tokens);
+    try std.testing.expectEqual(@as(usize, 20_000), state.keep_recent_tokens);
+    try std.testing.expect(!state.config.fold_old_tool_outputs);
+    try std.testing.expect(state.config.auto_compact);
+
+    // 导航 wrap 且跳过组标题
+    state.settings_index = 1;
+    state.settingsMove(-1);
+    try std.testing.expectEqual(@as(usize, 14), state.settings_index);
+    state.settingsMove(1);
+    try std.testing.expectEqual(@as(usize, 1), state.settings_index);
+
+    // 帮助菜单入口：executeHelpCommand("settings") → 打开设置页；Esc 返回帮助菜单
+    state.executeHelpCommand("settings");
+    try std.testing.expectEqual(Mode.settings, state.mode);
+    try std.testing.expectEqual(Mode.help_select, state.menu_parent.?);
+    state.handleSettingsKey(.{ .code = .esc });
+    try std.testing.expectEqual(Mode.help_select, state.mode);
+
+    // 帮助菜单再 Esc → 回主界面
+    state.handleHelpSelectKey(.{ .code = .esc });
+    try std.testing.expectEqual(Mode.normal, state.mode);
 }
 
 test "思考块 auto（硬编码）：思考时展开，正文开始时折叠" {
@@ -15632,6 +16816,9 @@ test "独立验证：折叠阈值边界与保护窗口（批量）" {
         _ = st.persistMessage(.{ .role = "user", .content = "开始" });
         st.appendHistory("user", "开始");
 
+        // 折叠机制测试：默认已改为关（2026-10-14），这里显式打开
+        st.config.fold_old_tool_outputs = true;
+
         const n = sc.sizes.len;
         const calls = try alloc.alloc(ai.ToolCall, n);
         defer alloc.free(calls);
@@ -15759,6 +16946,9 @@ test "独立验证：重启后块工具用全文重建、大小统计按原文�
     live.appendHistory("system", system_prompt);
     _ = live.persistMessage(.{ .role = "user", .content = "开始" });
     live.appendHistory("user", "开始");
+
+    // 折叠机制测试：默认已改为关（2026-10-14），这里显式打开
+    live.config.fold_old_tool_outputs = true;
 
     // read 输出 50000 字节（非块工具；重启后大小统计应显示 48.8KB）
     const read_buf = try alloc.alloc(u8, 50_000);
@@ -17972,6 +19162,7 @@ test "空闲看门狗：半开连接（不发送不关闭）时唤醒阻塞读�
     defer threaded.deinit();
 
     if (std.Io.Dir.cwd().access(io, "test/mock_halfopen_18131.running", .{})) |_| {} else |_| return error.SkipZigTest;
+    if (!mockServerAlive(io, 18131)) return error.SkipZigTest;
 
     var state = AppState{};
     state.io = io;
@@ -18035,6 +19226,7 @@ test "空闲看门狗：卡死时 Ctrl+Q 立即生效（需 mock 18131）" {
     defer threaded.deinit();
 
     if (std.Io.Dir.cwd().access(io, "test/mock_halfopen_18131.running", .{})) |_| {} else |_| return error.SkipZigTest;
+    if (!mockServerAlive(io, 18131)) return error.SkipZigTest;
 
     var state = AppState{};
     state.io = io;
@@ -18091,6 +19283,7 @@ test "空闲看门狗：手动压缩（异步）半开卡死时自动收尾（�
     defer threaded.deinit();
 
     if (std.Io.Dir.cwd().access(io, "test/mock_halfopen_18131.running", .{})) |_| {} else |_| return error.SkipZigTest;
+    if (!mockServerAlive(io, 18131)) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     const db_path = "skynet_test_wd_compact_async.db";
@@ -18177,6 +19370,7 @@ test "空闲看门狗：工具轮中途压缩半开卡死时自动收尾（需 m
     defer threaded.deinit();
 
     if (std.Io.Dir.cwd().access(io, "test/mock_halfopen_18131.running", .{})) |_| {} else |_| return error.SkipZigTest;
+    if (!mockServerAlive(io, 18131)) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     const db_path = "skynet_test_wd_compact_mid.db";
@@ -18314,6 +19508,7 @@ test "空闲看门狗：同步压缩（主线程）半开卡死时自动收尾�
     defer threaded.deinit();
 
     if (std.Io.Dir.cwd().access(io, "test/mock_halfopen_18131.running", .{})) |_| {} else |_| return error.SkipZigTest;
+    if (!mockServerAlive(io, 18131)) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     const db_path = "skynet_test_wd_compact_sync.db";
@@ -18387,6 +19582,7 @@ test "空闲看门狗：模型列表拉取半开卡死时自动收尾（需 mock
     defer threaded.deinit();
 
     if (std.Io.Dir.cwd().access(io, "test/mock_halfopen_18131.running", .{})) |_| {} else |_| return error.SkipZigTest;
+    if (!mockServerAlive(io, 18131)) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var state = AppState{};

@@ -57,6 +57,7 @@ zig build
 | `thinking` | 全局思考强度（未在 `thinking_by_model` 里单独设置的模型用这个）：`""`（不发送）/ `off` / `low` / `high` / `max` 等。TUI 的 `/thinking` 会写回这里 |
 | `thinking_by_model` | 每模型思考强度记忆：`[{"provider": "opencode-go", "model": "mimo-v2.6-flash", "thinking": "low"}]`。`provider` 可省略（按模型名匹配）。TUI 切换档位时自动写入 |
 | `model_overrides` | 模型能力用户覆盖（最高优先）：`[{"provider": "opencode-go", "model": "x", "context_window": 262144, "efforts": ["low", "high"]}]`。`provider` 可省略；`context_window` 覆盖上下文窗口，`efforts` 覆盖可用档位（含 `off` 无需写）。用途：内置能力表判错/滞后时自行修正 |
+| `max_output_tokens` | 输出上限（**含思考**）。省略或 `0` = 不发送，交给模型/网关自身的默认上限；设值时应用值按模型能力表钳制为 `min(用户值, 模型输出上限)`，不收该字段的模型自动跳过。**对话与压缩统一应用**。撞上限时（含模型原生默认截断）：纯文本回复保留并在会话里提示；带工具调用的回合**不执行**这些工具（参数可能被截断）；压缩则重试一次、仍超则放弃本次压缩 |
 | `ambiguous_width` | 模糊宽度字符（`①②③`、`→≤…` 等）排版档位：省略或 `"auto"`（默认）= 窄基底 + 内置推荐名单（带圈/带括号字母数字按两列）；`"wide"` = 全部两列；`"narrow"` = 全部一列 |
 | `width_overrides` | 在档位之外的按字符覆盖，**永远最高优先**。`wide` 名单强制两列、`narrow` 名单强制一列；格式：空白/逗号分隔，支持码点范围 `U+2460-U+249B`（`U+` 前缀可省）或字面字符 `— → ←`。上限各 1024 个码点 |
 

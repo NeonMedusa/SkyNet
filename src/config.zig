@@ -125,6 +125,9 @@ pub const Behavior = struct {
     /// "reasoning" / "reasoning_content" / "reasoning_text"；空 = 不回传。
     /// 由调用方从能力表查出后填入（见 main.zig createStreamJob）。
     interleaved: []const u8 = "",
+    /// 输出上限（含思考；0 = 不发该字段）。由调用方按 config.max_output_tokens
+    /// 与模型能力表钳制后填入（见 main.zig resolveMaxOutputTokens）
+    max_tokens: u32 = 0,
 };
 
 pub fn behavior(p: *const Provider) Behavior {
@@ -266,6 +269,17 @@ const ConfigJson = struct {
     ambiguous_width: []const u8 = "",
     /// 用户宽度覆盖名单（在策略之外按字符覆盖）
     width_overrides: WidthOverridesJson = .{},
+    /// 输出上限（含思考；0 = 不发）。缺省 0（不发送，交给模型/网关默认）
+    max_output_tokens: ?u64 = null,
+    interleaved_mode: []const u8 = "",
+    auto_compact: ?bool = null,
+    auto_compact_pct: ?u64 = null,
+    keep_recent_tokens: ?u64 = null,
+    compaction_thinking: []const u8 = "",
+    summary_garbage_check: ?bool = null,
+    compaction_retry: ?bool = null,
+    compaction_strip_thinking: []const u8 = "",
+    fold_old_tool_outputs: ?bool = null,
 };
 
 const ThinkingByModelJson = struct {
@@ -352,6 +366,16 @@ const SaveConfig = struct {
     model_overrides: ?[]const SaveModelOverride = null,
     ambiguous_width: ?[]const u8 = null,
     width_overrides: ?SaveWidthOverrides = null,
+    max_output_tokens: ?u64 = null,
+    interleaved_mode: ?[]const u8 = null,
+    auto_compact: bool = true,
+    auto_compact_pct: u64 = 85,
+    keep_recent_tokens: u64 = 20_000,
+    compaction_thinking: ?[]const u8 = null,
+    summary_garbage_check: bool = true,
+    compaction_retry: bool = true,
+    compaction_strip_thinking: ?[]const u8 = null,
+    fold_old_tool_outputs: bool = false,
 };
 
 fn dupeOptional(allocator: Allocator, s: []const u8) ![]u8 {
@@ -418,6 +442,27 @@ pub const Config = struct {
     thinking: []u8 = &.{},
     /// 模糊宽度策略："" = auto（平台/区域猜测）/ wide / narrow
     ambiguous_width: []u8 = &.{},
+    /// 输出上限（含思考；0 = 不发该字段，交给模型/网关默认）。config.json: max_output_tokens；
+    /// 默认 0；应用时按模型能力表钳制（min(用户值, 模型表 max_out)）
+    max_output_tokens: u32 = 0,
+    /// 回传思考覆盖："" = auto（跟随能力表）/ "on" = 强制开 / "off" = 强制关
+    interleaved_mode: []u8 = &.{},
+    /// 自动压缩总开关（false = 不自动触发中途压缩；手动 /compact 不受限）
+    auto_compact: bool = true,
+    /// 自动压缩阈值（百分比，10..100）：上下文估算到该占比触发中途压缩
+    auto_compact_pct: u64 = 85,
+    /// 保留窗口（tokens）：/compact N 的默认值（“除最近几条消息以外”的“几条”）
+    keep_recent_tokens: usize = 20_000,
+    /// 压缩时思考档："" = follow（跟随会话）/ off / low / medium / high / max
+    compaction_thinking: []u8 = &.{},
+    /// 摘要垃圾审核总开关（false = 盲采：拿到什么输出都采用）
+    summary_garbage_check: bool = true,
+    /// 压缩失败（坏输出）重试开关
+    compaction_retry: bool = true,
+    /// 压缩时剥离思考："" = retry_only（仅失败重试时）/ "never" / "always"
+    compaction_strip_thinking: []u8 = &.{},
+    /// 旧工具输出折叠开关（默认关：折叠会改历史 → 前缀缓存命中频繁归零；2026-10-14 用户定）
+    fold_old_tool_outputs: bool = false,
     /// 用户宽度覆盖名单（原始字符串，启动时解析；格式见 README）
     width_overrides_wide: []u8 = &.{},
     width_overrides_narrow: []u8 = &.{},
@@ -548,6 +593,20 @@ pub const Config = struct {
         if (v.width_overrides.narrow.len > 0) {
             self.setWidthOverridesNarrow(allocator, v.width_overrides.narrow);
         }
+        // 输出上限（含思考；0 = 不发）。缺省 0（交给模型/网关默认）；上限做 sanity 钳制
+        if (v.max_output_tokens) |n| {
+            self.max_output_tokens = @intCast(@min(n, 4_000_000));
+        }
+        // 设置页新字段（缺省 = 现行为；显式值才覆盖）
+        if (v.interleaved_mode.len > 0) self.setInterleavedMode(allocator, v.interleaved_mode);
+        if (v.auto_compact) |b| self.auto_compact = b;
+        if (v.auto_compact_pct) |n| self.auto_compact_pct = @min(@max(n, 50), 85);
+        if (v.keep_recent_tokens) |n| self.keep_recent_tokens = @intCast(@min(n, 10_000_000));
+        if (v.compaction_thinking.len > 0) self.setCompactionThinking(allocator, v.compaction_thinking);
+        if (v.summary_garbage_check) |b| self.summary_garbage_check = b;
+        if (v.compaction_retry) |b| self.compaction_retry = b;
+        if (v.compaction_strip_thinking.len > 0) self.setCompactionStripThinking(allocator, v.compaction_strip_thinking);
+        if (v.fold_old_tool_outputs) |b| self.fold_old_tool_outputs = b;
 
         for (v.providers) |pj| {
             if (pj.endpoint.len == 0) continue;
@@ -651,6 +710,27 @@ pub const Config = struct {
         const copy = allocator.dupe(u8, value) catch return;
         allocator.free(self.ambiguous_width);
         self.ambiguous_width = copy;
+    }
+
+    /// 设置回传思考模式（""/auto/on/off；未知值按 auto 处理）
+    pub fn setInterleavedMode(self: *Config, allocator: Allocator, value: []const u8) void {
+        const copy = allocator.dupe(u8, value) catch return;
+        allocator.free(self.interleaved_mode);
+        self.interleaved_mode = copy;
+    }
+
+    /// 设置压缩时思考档（""/follow/off/low/medium/high/max；未知值按 follow 处理）
+    pub fn setCompactionThinking(self: *Config, allocator: Allocator, value: []const u8) void {
+        const copy = allocator.dupe(u8, value) catch return;
+        allocator.free(self.compaction_thinking);
+        self.compaction_thinking = copy;
+    }
+
+    /// 设置压缩剥离思考模式（""/retry_only/never/always；未知值按 retry_only 处理）
+    pub fn setCompactionStripThinking(self: *Config, allocator: Allocator, value: []const u8) void {
+        const copy = allocator.dupe(u8, value) catch return;
+        allocator.free(self.compaction_strip_thinking);
+        self.compaction_strip_thinking = copy;
     }
 
     /// 设置宽度覆盖名单（wide：强制 2 列；narrow：强制 1 列。格式见 README）
@@ -803,6 +883,16 @@ pub const Config = struct {
             .thinking_by_model = if (tbm_list.items.len > 0) tbm_list.items else null,
             .model_overrides = if (mo_list.items.len > 0) mo_list.items else null,
             .ambiguous_width = if (self.ambiguous_width.len > 0) self.ambiguous_width else null,
+            .max_output_tokens = self.max_output_tokens,
+            .interleaved_mode = if (self.interleaved_mode.len > 0) self.interleaved_mode else null,
+            .auto_compact = self.auto_compact,
+            .auto_compact_pct = self.auto_compact_pct,
+            .keep_recent_tokens = @intCast(self.keep_recent_tokens),
+            .compaction_thinking = if (self.compaction_thinking.len > 0) self.compaction_thinking else null,
+            .summary_garbage_check = self.summary_garbage_check,
+            .compaction_retry = self.compaction_retry,
+            .compaction_strip_thinking = if (self.compaction_strip_thinking.len > 0) self.compaction_strip_thinking else null,
+            .fold_old_tool_outputs = self.fold_old_tool_outputs,
             .width_overrides = if (self.width_overrides_wide.len > 0 or self.width_overrides_narrow.len > 0)
                 .{
                     .wide = if (self.width_overrides_wide.len > 0) self.width_overrides_wide else null,
@@ -838,6 +928,12 @@ pub const Config = struct {
         self.thinking = &.{};
         allocator.free(self.ambiguous_width);
         self.ambiguous_width = &.{};
+        allocator.free(self.interleaved_mode);
+        self.interleaved_mode = &.{};
+        allocator.free(self.compaction_thinking);
+        self.compaction_thinking = &.{};
+        allocator.free(self.compaction_strip_thinking);
+        self.compaction_strip_thinking = &.{};
         allocator.free(self.width_overrides_wide);
         self.width_overrides_wide = &.{};
         allocator.free(self.width_overrides_narrow);
@@ -1004,6 +1100,50 @@ test "config：JSON 解析新字段并应用" {
         .opt_include_usage = @constCast(pj.options.include_usage),
     };
     try std.testing.expect(!behavior(&p).include_usage);
+}
+
+test "config：max_output_tokens 解析（缺省 0 / 显式值 / 0 = 不发）" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{};
+    defer cfg.deinit(allocator);
+    // 缺省 0（不发送）
+    try std.testing.expectEqual(@as(u32, 0), cfg.max_output_tokens);
+    // 解析字段
+    var parsed = try std.json.parseFromSlice(ConfigJson, allocator, "{ \"max_output_tokens\": 1234 }", .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u64, 1234), parsed.value.max_output_tokens);
+    // 0 = 显式关闭（不发该字段）
+    var p0 = try std.json.parseFromSlice(ConfigJson, allocator, "{ \"max_output_tokens\": 0 }", .{ .ignore_unknown_fields = true });
+    defer p0.deinit();
+    try std.testing.expectEqual(@as(?u64, 0), p0.value.max_output_tokens);
+}
+
+test "config：设置页新字段解析（缺省=现行为 / 显式值）" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{};
+    defer cfg.deinit(allocator);
+    // 缺省 = 现行为
+    try std.testing.expectEqual(@as(usize, 20_000), cfg.keep_recent_tokens);
+    try std.testing.expect(cfg.auto_compact);
+    try std.testing.expect(cfg.summary_garbage_check);
+    try std.testing.expect(cfg.compaction_retry);
+    try std.testing.expect(!cfg.fold_old_tool_outputs);
+    try std.testing.expectEqualStrings("", cfg.interleaved_mode);
+    try std.testing.expectEqualStrings("", cfg.compaction_thinking);
+    try std.testing.expectEqualStrings("", cfg.compaction_strip_thinking);
+    // 显式值
+    var parsed = try std.json.parseFromSlice(ConfigJson, allocator, "{ \"interleaved_mode\": \"off\", \"auto_compact\": false, \"auto_compact_pct\": 85, \"keep_recent_tokens\": 5000, \"compaction_thinking\": \"low\", \"summary_garbage_check\": false, \"compaction_retry\": false, \"compaction_strip_thinking\": \"always\", \"fold_old_tool_outputs\": false }", .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const v = parsed.value;
+    try std.testing.expectEqualStrings("off", v.interleaved_mode);
+    try std.testing.expectEqual(@as(?bool, false), v.auto_compact);
+    try std.testing.expectEqual(@as(?u64, 5000), v.keep_recent_tokens);
+    try std.testing.expectEqual(@as(?u64, 85), v.auto_compact_pct);
+    try std.testing.expectEqualStrings("low", v.compaction_thinking);
+    try std.testing.expectEqual(@as(?bool, false), v.summary_garbage_check);
+    try std.testing.expectEqual(@as(?bool, false), v.compaction_retry);
+    try std.testing.expectEqualStrings("always", v.compaction_strip_thinking);
+    try std.testing.expectEqual(@as(?bool, false), v.fold_old_tool_outputs);
 }
 
 test "config：ambiguous_width 解析、设置与覆盖" {
