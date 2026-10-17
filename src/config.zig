@@ -459,7 +459,7 @@ pub const Config = struct {
     summary_garbage_check: bool = true,
     /// 压缩失败（坏输出）重试开关
     compaction_retry: bool = true,
-    /// 压缩时剥离思考："" = retry_only（仅失败重试时）/ "never" / "always"
+    /// 压缩时剥离思考："" = always（缺省：不剥时模型续写“抽风”概率高，2026-10-16 用户定）/ "retry_only" / "never"
     compaction_strip_thinking: []u8 = &.{},
     /// 旧工具输出折叠开关（默认关：折叠会改历史 → 前缀缓存命中频繁归零；2026-10-14 用户定）
     fold_old_tool_outputs: bool = false,
@@ -726,7 +726,7 @@ pub const Config = struct {
         self.compaction_thinking = copy;
     }
 
-    /// 设置压缩剥离思考模式（""/retry_only/never/always；未知值按 retry_only 处理）
+    /// 设置压缩剥离思考模式（""=always 缺省 / "retry_only" / "never" / "always"）
     pub fn setCompactionStripThinking(self: *Config, allocator: Allocator, value: []const u8) void {
         const copy = allocator.dupe(u8, value) catch return;
         allocator.free(self.compaction_strip_thinking);

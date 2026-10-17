@@ -211,13 +211,15 @@ fn settingValueText(state: *AppState, id: SettingId, buf: []u8) []const u8 {
         .summary_garbage_check => if (state.config.summary_garbage_check) "开" else "关（盲采）",
         .compaction_retry => if (state.config.compaction_retry) "开" else "关",
         .compaction_strip_thinking => if (state.config.compaction_strip_thinking.len == 0)
-            "仅失败重试时"
+            "总是" // 缺省 = 总是（2026-10-16 用户定）
         else if (std.mem.eql(u8, state.config.compaction_strip_thinking, "never"))
             "从不"
+        else if (std.mem.eql(u8, state.config.compaction_strip_thinking, "retry_only"))
+            "仅失败重试时"
         else if (std.mem.eql(u8, state.config.compaction_strip_thinking, "always"))
             "总是"
         else
-            "仅失败重试时",
+            "总是",
         .fold_old_tool_outputs => if (state.config.fold_old_tool_outputs) "开" else "关",
         .restore_defaults => "Enter 确认",
     };
@@ -872,7 +874,7 @@ const StreamJob = struct {
     /// 压缩失败重试（设置页）
     compaction_retry: bool = true,
     /// 压缩时剥离思考（设置页）
-    compaction_strip_thinking: StripThinkingMode = .retry_only,
+    compaction_strip_thinking: StripThinkingMode = .always,
     /// 救援：本回合是否已因请求失败压缩重发过（一次性，防死循环）
     overflow_recovery_attempted: bool = false,
     /// 服务端错误详情（失败时带回给主线程展示）
@@ -3001,6 +3003,15 @@ const AppState = struct {
         self.last_seen_msg_id = 0;
         self.last_compaction_id = if (checkpoint) |c| c.id else 0;
         self.applyLoadedMessagesWithCheckpoint(rows, checkpoint, compactions, false, true);
+        // apply 末尾会 seedUsageFromDb（那是为“会话加载”设计的：从库里最后一次真实
+        // usage 播种显示）。但**压缩后的重建不能保留它**：库里最后一条 usage 属于
+        // 压缩前那一轮，种回去会表现为“压完显示不刷新”（且锚点复活 → 触发决策误判）。
+        // 重建完成即清账，让显示回到估算/下次响应回填：
+        self.last_usage = .{};
+        self.context_usage = .{};
+        self.usage_anchor_len = null;
+        self.usage_anchor_tokens = 0;
+        self.usage_anchor_key = 0;
     }
 
     /// 把压缩摘要作为历史中的 checkpoint 伪消息（user 角色，内容固定利于缓存稳定）
@@ -3366,7 +3377,7 @@ const AppState = struct {
             .summary_garbage_check => self.config.summary_garbage_check = !self.config.summary_garbage_check,
             .compaction_retry => self.config.compaction_retry = !self.config.compaction_retry,
             .compaction_strip_thinking => {
-                const steps = [_][]const u8{ "", "never", "always" };
+                const steps = [_][]const u8{ "always", "retry_only", "never" };
                 self.config.setCompactionStripThinking(a, nextInSteps([]const u8, &steps, self.config.compaction_strip_thinking));
             },
             .fold_old_tool_outputs => self.config.fold_old_tool_outputs = !self.config.fold_old_tool_outputs,
@@ -6724,7 +6735,7 @@ const CompactionPlan = struct {
     /// 压缩失败重试（设置页）
     compaction_retry: bool = true,
     /// 压缩时剥离思考（设置页）
-    compaction_strip_thinking: StripThinkingMode = .retry_only,
+    compaction_strip_thinking: StripThinkingMode = .always,
     environ_map: ?*const std.process.Environ.Map = null,
     history: []ai.Message = &.{},
     /// 本计划所属模型是否回传思考（决定保留区选择/记录估算是否计入 reasoning）
@@ -7016,8 +7027,19 @@ pub const StripThinkingMode = enum { never, always, retry_only };
 
 fn parseStripThinkingMode(s: []const u8) StripThinkingMode {
     if (std.mem.eql(u8, s, "never")) return .never;
+    if (std.mem.eql(u8, s, "retry_only")) return .retry_only;
     if (std.mem.eql(u8, s, "always")) return .always;
-    return .retry_only;
+    // ""（缺省/老配置）与未知值 = 总是：不剥思考时模型续写“抽风”概率高
+    // （2026-10-16 实测用户定；显式“仅失败重试时”存 "retry_only"）
+    return .always;
+}
+
+test "剥离思考取值解析：空串/未知 = 总是；retry_only 显式表示仅失败重试时" {
+    try std.testing.expectEqual(StripThinkingMode.always, parseStripThinkingMode(""));
+    try std.testing.expectEqual(StripThinkingMode.always, parseStripThinkingMode("always"));
+    try std.testing.expectEqual(StripThinkingMode.retry_only, parseStripThinkingMode("retry_only"));
+    try std.testing.expectEqual(StripThinkingMode.never, parseStripThinkingMode("never"));
+    try std.testing.expectEqual(StripThinkingMode.always, parseStripThinkingMode("garbage"));
 }
 
 /// 压缩时思考档（设置页）：""/follow = 跟随会话；否则按模型能力钳制后的档位。
@@ -12673,11 +12695,12 @@ test "设置页助手：压缩思考档 / 回传思考覆盖 / 剥离思考模�
     try std.testing.expectEqualStrings("", interleavedFieldFor(&cfg, "opencode-go", "deepseek-v4.1-flash"));
     cfg.setInterleavedMode(std.testing.allocator, "on");
     try std.testing.expectEqualStrings("reasoning_content", interleavedFieldFor(&cfg, "nope", "nope"));
-    // 剥离思考模式解析
-    try std.testing.expectEqual(StripThinkingMode.retry_only, parseStripThinkingMode(""));
+    // 剥离思考模式解析（2026-10-16 起缺省 = 总是；retry_only 显式表示仅失败重试时）
+    try std.testing.expectEqual(StripThinkingMode.always, parseStripThinkingMode(""));
+    try std.testing.expectEqual(StripThinkingMode.retry_only, parseStripThinkingMode("retry_only"));
     try std.testing.expectEqual(StripThinkingMode.never, parseStripThinkingMode("never"));
     try std.testing.expectEqual(StripThinkingMode.always, parseStripThinkingMode("always"));
-    try std.testing.expectEqual(StripThinkingMode.retry_only, parseStripThinkingMode("??"));
+    try std.testing.expectEqual(StripThinkingMode.always, parseStripThinkingMode("??"));
     // 提示追加在末尾（前缀不变 → 缓存保前缀）
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -12714,6 +12737,134 @@ test "回合进行中：显示优先用 worker 估算（中途压缩后立即变
     try std.testing.expectEqual(@as(usize, 12345), state.estimateRequestTokens());
     state.worker_est = null;
     try std.testing.expectEqual(base, state.estimateRequestTokens());
+}
+
+test "rebuildHistoryFromDb 清空用量锚点（压缩后不再挂压缩前的旧账本）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+
+    const db_path = "skynet_test_rebuild_anchor.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_rebuild_anchor.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_rebuild_anchor.db-shm") catch {};
+    state.db = db_mod.Db.openFile(std.testing.allocator, io, db_path) catch null;
+    state.session_id = if (state.db != null) (state.db.?.createSession("") catch 0) else 0;
+    defer {
+        if (state.db) |*d| d.deinit();
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_rebuild_anchor.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_rebuild_anchor.db-shm") catch {};
+        state.config.deinit(std.testing.allocator);
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+    }
+
+    _ = state.persistMessage(.{ .role = "user", .content = "历史上的第一条" });
+    state.appendHistory("user", "历史上的第一条");
+
+    // 模拟“会话加载后播种”：真实用量 600k 的锚点 + 显示账本
+    state.usage_anchor_len = state.history.items.len;
+    state.usage_anchor_tokens = 600_000;
+    state.usage_anchor_key = 0;
+    state.context_usage = .{ .input_tokens = 600_000, .output_tokens = 1_000 };
+    try std.testing.expect(state.estimateRequestTokens() >= 600_000);
+
+    // 压缩收尾顺序：清真实账本 + 重建历史 → 锚点必须失效，估算回落到当前口径
+    state.last_usage = .{};
+    state.context_usage = .{};
+    state.rebuildHistoryFromDb();
+    try std.testing.expect(state.usage_anchor_len == null);
+    try std.testing.expectEqual(@as(u64, 0), state.usage_anchor_tokens);
+    try std.testing.expect(state.estimateRequestTokens() < 600_000);
+}
+
+test "finalizeCompaction：压缩成功后清账+重建（构造完成态 plan，不走网络）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+
+    const db_path = "skynet_test_finalize_clear.db";
+    Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_finalize_clear.db-wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "skynet_test_finalize_clear.db-shm") catch {};
+    state.db = db_mod.Db.openFile(std.testing.allocator, io, db_path) catch null;
+    state.session_id = if (state.db != null) (state.db.?.createSession("") catch 0) else 0;
+    defer {
+        if (state.db) |*d| d.deinit();
+        Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_finalize_clear.db-wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "skynet_test_finalize_clear.db-shm") catch {};
+        state.config.deinit(std.testing.allocator);
+        for (state.history.items) |m| freeMessage(std.testing.allocator, m);
+        state.history.deinit(std.testing.allocator);
+        for (state.messages.items) |m| state.freeDisplayMessage(m);
+        state.messages.deinit(std.testing.allocator);
+        state.clearPendingSends();
+        state.pending_sends.deinit(std.testing.allocator);
+        state.input.deinit();
+        state.dialog_input.deinit();
+    }
+
+    _ = state.config.appendProvider(std.testing.allocator, .{
+        .name = "mock",
+        .endpoint = "http://127.0.0.1:1/v1",
+        .preset = "openai",
+    });
+    state.config.setCurrentProvider(std.testing.allocator, "mock");
+    state.config.setCurrentModel(std.testing.allocator, "mock-model");
+
+    _ = state.persistMessage(.{ .role = "user", .content = "第一条" });
+    state.appendHistory("user", "第一条");
+    // 关键：库里带着“压缩前那一轮”的真实 usage（重建末尾的 seedUsageFromDb
+    // 会读它——这正是线上“压完显示不刷新”的复活源）
+    _ = state.persistMessage(.{
+        .role = "assistant",
+        .content = "回复",
+        .input_tokens = 600_000,
+        .cached_tokens = 599_000,
+        .output_tokens = 1_000,
+    });
+    state.appendHistory("assistant", "回复");
+
+    // 模拟回合后的真实账本 + 锚点（压缩前状态）
+    state.last_usage = .{ .input_tokens = 600_000, .output_tokens = 1_000 };
+    state.context_usage = state.last_usage;
+    state.usage_anchor_len = state.history.items.len;
+    state.usage_anchor_tokens = 600_000;
+    state.usage_anchor_key = 0;
+    try std.testing.expect(state.estimateRequestTokens() >= 600_000);
+
+    // 构造“成功完成”的异步 plan（不发起网络）并置完成态
+    const provider = &state.config.providers.items[0];
+    const plan = try state.buildCompactionPlan(provider, "mock-model", 20_000);
+    plan.compacted = true;
+    plan.summarized = 1;
+    plan.summary_len = 100;
+    plan.tokens_before = 600_000;
+    state.compact_plan = plan;
+    state.compact_status.store(2, .release);
+
+    // 走真实泵路径（主循环每帧调用的那个）
+    state.pumpCompaction();
+
+    try std.testing.expectEqual(@as(u8, 0), state.compact_status.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), state.context_usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 0), state.last_usage.input_tokens);
+    try std.testing.expect(state.usage_anchor_len == null);
+    try std.testing.expect(state.estimateRequestTokens() < 600_000);
 }
 
 /// mock 服务器端口探测（测试跳过判定用）：标记文件可能陈旧（脚本被硬杀时 finally 不执行），

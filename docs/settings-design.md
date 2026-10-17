@@ -17,7 +17,7 @@
 ## 设计原则（三条）
 
 1. **默认值 = 现行为**：所有开关默认不改变现状（不改就是不变）；
-   （例外：自动压缩阈值默认 85%、旧工具输出折叠默认关——用户定，2026-10-14）
+   （例外：自动压缩阈值默认 85%、旧工具输出折叠默认关、压缩时剥离思考默认 总是——用户定，2026-10-14/16）
 2. **开关语义要能用一条原则讲清**（例：审核 = 输出质量的唯一总闸）；
 3. **少隐式行为**：能显式配置的，不做隐式自动（例：不做"重试自动降思考"，用户发现压缩出问题会自己调）。
 
@@ -40,7 +40,7 @@
 | 5 | 压缩时思考档 | 循环：跟随会话 / off / low / medium / high / max | 跟随会话 | 指定后**首试与重试都用该档**；无任何隐式降档 |
 | 6 | 摘要垃圾审核 | 开/关 | 开 | **开**：流式早停 + 落库前校验（标记/过短）+ **截断检查** → 坏则重试 → 仍坏则**止损（中断本回合 + 三选项通知）**；**关**：盲采——只要成功拿到输出就采用（含半截/垃圾，照常落库并截断上下文），行内给警示 |
 | 7 | 压缩失败重试 | 开/关 | 开 | 仅"审核开"时有意义：坏输出重试一次（定向提示 + 按 #8 决定是否剥离思考）；关 = 首次坏即放弃 + 止损 |
-| 8 | 压缩时剥离思考 | 三态：从不 / 总是 / 仅失败重试时 | 仅失败重试时 | 摘要载荷是否携带 `[thinking]` 文本段 |
+| 8 | 压缩时剥离思考 | 三态：总是 / 仅失败重试时 / 从不 | **总是** | 摘要载荷是否携带 `[thinking]` 文本段；不剥时模型续写“抽风”概率显著更高（2026-10-16 实测） |
 
 ### 【上下文】
 
@@ -66,7 +66,7 @@
 5. **压缩时思考档**：现状 = 摘要请求继承会话档（`sessionThinkingEffort`）+ 坏输出重试**自动降档**（`retry_thinking_lower` 机制，2026-10-13 加、同日决定移除）；目标 = 单一设置项；接线 = 压缩请求 `reasoning_effort` 来源改为"设置档（follow 时取会话档）"，**并删除 `retry_thinking_lower` 整条机制**。
 6. **摘要垃圾审核**：现状 = `context.summary_garbage_check_enabled` 常量（true；2026-10-13 曾置 false 做观察实验：证实"关掉后模型输出 14k 字符幻觉续写照常落库"，检查机制无假阳性）+ 截断检查（`last_stopped_by_length`）独立常开；目标 = 单一配置项，**截断检查并入**；接线 = ①`SummaryCollector` 流式早停条件；②两条压缩路径（`compactJobHistory` / `compactionExecute`）的校验条件；③把 `last_stopped_by_length` 检查移入该开关。
 7. **压缩失败重试**：现状 = 坏输出必重试一次；目标 = 开关；接线 = 两条路径的 `garbage_retries` 分支入口。
-8. **压缩时剥离思考**：现状 = 首试带、坏输出重试剥；目标 = 三态；接线 = `buildCompactionPayload` 的 `include_thinking` 参数来源。
+8. **压缩时剥离思考**：现状 = 首试带、坏输出重试剥；目标 = 三态（缺省改为 **always**：不剥时模型抽风概率高，2026-10-16）；接线 = `buildCompactionPayload` 的 `include_thinking` 参数来源。
 9. **旧工具输出折叠**：**默认已改关（2026-10-14：折叠会改历史 → 前缀缓存命中频繁归零，收益/损失比待研究）**；原现状 = 常开（启发式：`fold_protect_turns=2`、`fold_min_output_bytes=1024`、`fold_min_bytes=80KB`、`fold_protect_bytes=160KB`）；目标 = 开关；接线 = 折叠执行点（worker/main 折叠调用处）。
 
 10. **恢复默认设置**（设置页操作行）：两关确认弹窗（模式 `settings_reset_confirm`，复用 confirm_stage/confirm_yes）；`resetSettingsToDefaults` 从 Config 字段默认取值并即时保存。
@@ -106,7 +106,7 @@
    - `compaction_thinking`: `follow` | `off` | `low` | `medium` | `high` | `max`（默认 follow）
    - `summary_garbage_check`: bool（默认 true）
    - `compaction_retry`: bool（默认 true）
-   - `compaction_strip_thinking`: `never` | `always` | `retry_only`（默认 retry_only）
+   - `compaction_strip_thinking`: `never` | `always` | `retry_only`（默认 always；空串 = always）
    - `fold_old_tool_outputs`: bool（默认 false，2026-10-14 起；此前 true）
 2. **TUI 设置页**：三组列表；行 = 名称 + 当前值；回车循环/编辑；Esc 关闭；改后即时持久化。
 3. **代码清理**：移除 `retry_thinking_lower` 机制；`summary_garbage_check_enabled` 常量退位为缺省值来源（或删除）。
