@@ -403,6 +403,26 @@ Claude Code / Cursor / Aider 用 `old_string`/`old_str`，我们用蛇形 `old_t
 
 ---
 
+### 2.8 终端命令的超时与中断（bash）——已实现（2026-10-17）
+
+bash 工具默认 **5 分钟超时**（模型可传 `timeout_ms` 调大，**不设上限**）；`Ctrl+Q`
+可中断**执行中的终端命令**（不只是 AI 生成）。实现方式：
+
+- **看门狗线程**（`bashWatchdog`，25ms 轮询）：到点或取消标志置位（worker 在工具
+  执行入口把 `stream_cancel` 接给 `bash_cancel_flag`）→ 杀进程；
+- **杀法两层**：① `taskkill /T /F`（System32 全路径，尽力杀整棵进程树）；
+  ② 无条件 `TerminateProcess(进程句柄)` 直杀兜底（零外部依赖，"杀必达"）；
+- 子进程一死 → 管道关闭 → 阻塞读立即返回 → 工具秒收尾；文案区分
+  "超时（引导调大 timeout_ms）/ 被用户取消"；
+- 错杀压制三件套：句柄保活（进程对象不回收 → pid 不复用）+ 杀进程持锁（worker
+  清槽先于关句柄）+ taskkill 全路径。仅直系子进程保证被杀（pwsh 内联命令即覆盖
+  死循环场景）；孙进程仅在 taskkill 可用的环境被清。
+
+**两个实测坑**（详见 3.1 第 10/11 条）：std 的 timeout 对阻塞管道读无效；
+受限环境里 taskkill 可能加载失败——故 TerminateProcess 兜底是必需的。
+
+---
+
 ## 3. 开发注意事项
 
 ### 3.1 工具链陷阱（实战积累）
@@ -431,6 +451,14 @@ Claude Code / Cursor / Aider 用 `old_string`/`old_str`，我们用蛇形 `old_t
    静默丢弃）；**非 BMP 字符（emoji 等）以"前导+后继"两条记录到达**，需缓存前导
    再合并（与微软 `terminalInput.cpp` 的 `_leadingSurrogate` 同逻辑）。修复与测试见
    `libs/zigtui/src/backend/windows.zig` 的 `codeUnitToUtf8`。
+10. **`std.process.run` 的 `timeout` 在 Threaded 后端对阻塞的管道读无效**
+    （2026-10-16 实测：`Start-Sleep 20` + 1s 超时 → 20s 后读到 EOF 才报
+    `error.Timeout`；`FileReadStreaming` 的参数结构根本没有 deadline 字段）。
+    要做"真正的执行超时/中断"，只能杀进程（见 2.8），不能指望 io 超时。
+11. **受限环境（`zig run` / 测试运行器）里子进程环境被裁剪**：`System32\taskkill.exe`
+    会因模块解析失败（"找不到指定的模块"），`cmd /c taskkill` 还会报
+    `'DOSKEY' 不是内部或外部命令`（PATH 缺 System32）——所以**不要依赖外部 exe
+    完成关键动作**；有句柄就用 Win32 API 直调（如 `TerminateProcess`）。
 
 ### 3.2 必须遵守的契约（摘要，详情在 AGENTS.md）
 

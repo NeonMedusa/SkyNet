@@ -3,6 +3,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Dir = Io.Dir;
 const regex = @import("regex.zig");
+const Log = @import("log.zig");
 
 // ── 工具定义（供模型调用的 JSON Schema）──
 
@@ -36,9 +37,9 @@ pub const tool_defs = [_]ToolDef{
     },
     .{
         .name = "bash",
-        .description = "Execute a shell command in the session working directory and return its output. Each invocation runs in a fresh shell: `cd` inside a command only affects that single call (use the cd tool for persistent changes). On Windows this runs PowerShell (pwsh); on other platforms it runs sh. Output is truncated to the last 2000 lines or 50KB. Set timeout_ms to limit execution time.",
+        .description = "Execute a shell command in the session working directory and return its output. Each invocation runs in a fresh shell: `cd` inside a command only affects that single call (use the cd tool for persistent changes). On Windows this runs PowerShell (pwsh); on other platforms it runs sh. Output is truncated to the last 2000 lines or 50KB. Commands time out after 5 minutes by default; pass timeout_ms (milliseconds) to raise the limit for long-running commands.",
         .parameters =
-        \\{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout_ms":{"type":"integer","description":"Optional timeout in milliseconds"}},"required":["command"]}
+        \\{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout_ms":{"type":"integer","description":"Optional timeout in milliseconds (default 300000 = 5 minutes; raise it for long-running commands, no upper limit)"}},"required":["command"]}
         ,
     },
     .{
@@ -1324,6 +1325,171 @@ const BashArgs = struct {
     timeout_ms: i64 = 0,
 };
 
+/// bash 默认超时（毫秒）：模型不传 timeout_ms（或传 ≤0）时兜底 5 分钟——
+/// 防“死循环/卡死命令”把回合无限挂住（对齐 opencode 的默认超时思路）。
+/// 模型可按需传更大的值（不设上限）。
+pub const bash_default_timeout_ms: i64 = 5 * 60 * 1000;
+
+// ── bash 中断支持（超时 / Ctrl+Q 杀整棵进程树）──
+//
+// 背景：std.process.run 的 timeout 在 Threaded 后端对阻塞的管道读不生效（实测：
+// 只在读到 EOF 时才报 Timeout）——所以这里改为“看门狗到点/取消时杀进程树”：
+// kill → 子进程管道关闭 → 阻塞读立即返回 → 工具处收尾。
+// 错杀风险的三道压制：①句柄保活（进程对象不回收 → pid 不复用）；
+// ②杀进程尝试持锁（worker 清槽先于关句柄）；③taskkill 走 System32 全路径。
+
+/// 正在运行的 bash 子进程标识槽（0 = 无）。Windows = 进程句柄值；其他平台 = pid。
+var bash_child_slot = std.atomic.Value(i64).init(0);
+/// 保护标识槽与“杀进程”的生命周期（详见上方注释）。
+var bash_child_mutex: Io.Mutex = .init;
+/// bash 取消标志（worker 在工具执行前置为 app.stream_cancel；null = 无取消源）。
+pub var bash_cancel_flag: ?*const std.atomic.Value(bool) = null;
+
+extern "kernel32" fn GetProcessId(process: *anyopaque) callconv(.winapi) u32;
+extern "kernel32" fn TerminateProcess(process: *anyopaque, exit_code: u32) callconv(.winapi) u32;
+
+/// 杀掉指定子进程的整棵进程树。参数 = 槽位里的值（Windows 句柄 / posix pid）。
+/// 锁内复查槽值：命令恰好结束时槽已清 → 放弃（杜绝关闭竞态下误伤）。
+/// Windows：① taskkill /T /F 尽力杀树；② **无条件 TerminateProcess 直系子进程**
+/// （不依赖外部 exe——受限环境（如测试运行器）里 taskkill 可能加载失败；
+/// 直杀兜底保证“杀必达”，子进程一死管道关闭 → 阻塞读立即返回）。
+pub fn killProcessTree(
+    allocator: Allocator,
+    io: Io,
+    handle_or_pid: i64,
+    environ_map: ?*const std.process.Environ.Map,
+) void {
+    if (handle_or_pid <= 0) return;
+    bash_child_mutex.lockUncancelable(io);
+    defer bash_child_mutex.unlock(io);
+    if (bash_child_slot.load(.acquire) != handle_or_pid) return;
+    if (@import("builtin").os.tag == .windows) {
+        const proc: *anyopaque = @ptrFromInt(@as(usize, @intCast(handle_or_pid)));
+        // ① 尽力杀树（含子孙进程；失败不影响下一步）
+        const pid = GetProcessId(proc);
+        if (pid != 0) {
+            var root_buf: [512]u8 = undefined;
+            var sysroot: []const u8 = "C:\\Windows";
+            if (environ_map) |m| {
+                if (m.get("SystemRoot")) |v| {
+                    if (v.len > 0 and v.len < root_buf.len) {
+                        @memcpy(root_buf[0..v.len], v);
+                        sysroot = root_buf[0..v.len];
+                    }
+                }
+            }
+            var path_buf: [300]u8 = undefined;
+            const taskkill = std.fmt.bufPrint(&path_buf, "{s}\\System32\\taskkill.exe", .{sysroot}) catch "";
+            var pid_buf: [32]u8 = undefined;
+            const pid_text = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch "";
+            if (taskkill.len > 0 and pid_text.len > 0) {
+                if (std.process.run(allocator, io, .{
+                    .argv = &.{ taskkill, "/T", "/F", "/PID", pid_text },
+                    .stdout_limit = .limited(4096),
+                    .stderr_limit = .limited(4096),
+                })) |r| {
+                    defer allocator.free(r.stdout);
+                    defer allocator.free(r.stderr);
+                    switch (r.term) {
+                        .exited => |code| if (code != 0) Log.warn(.tools, "bash 杀树：taskkill 退出码 {d}（降级直杀）", .{code}),
+                        else => Log.warn(.tools, "bash 杀树：taskkill 异常退出（降级直杀）", .{}),
+                    }
+                } else |e| {
+                    Log.warn(.tools, "bash 杀树：taskkill 启动失败（{s}）（降级直杀）", .{@errorName(e)});
+                }
+            }
+        }
+        // ② 无条件直杀（保底：哪怕 taskkill 不可用也必杀）
+        _ = TerminateProcess(proc, 1);
+    } else {
+        std.posix.kill(@intCast(handle_or_pid), std.posix.SIG.KILL) catch {};
+    }
+}
+
+/// 看门狗：到点（超时）或取消标志置位（Ctrl+Q）→ 杀整棵进程树。
+/// wd_state 回传原因（0=无 1=超时 2=取消），供调用方出对应文案。
+fn bashWatchdog(
+    io: Io,
+    done: *std.atomic.Value(bool),
+    deadline_ms: i64,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    wd_state: *std.atomic.Value(u8),
+    environ_map: ?*const std.process.Environ.Map,
+) void {
+    while (!done.load(.acquire)) {
+        const now = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        const cancelled = if (cancel_flag) |f| f.load(.acquire) else false;
+        if (cancelled or now >= deadline_ms) {
+            wd_state.store(if (cancelled) 2 else 1, .release);
+            killProcessTree(std.heap.page_allocator, io, bash_child_slot.load(.acquire), environ_map);
+            return;
+        }
+        const remaining = deadline_ms - now;
+        const sleep_ms: i64 = @intCast(@min(@max(remaining, 1), 25));
+        Io.sleep(io, Io.Duration.fromMilliseconds(sleep_ms), .awake) catch {};
+    }
+}
+
+/// 等价 std.process.run（spawn → 多路读 → wait → defer kill），但把子进程标识发布到
+/// 槽位（超时/Ctrl+Q 时由看门狗调 killProcessTree 杀树）。主体逐行对齐本机 std 的
+/// run（Zig 0.16.0）；阻塞读不传 io deadline（后者对管道读不生效，见上方注释）。
+fn runBashTracked(
+    gpa: Allocator,
+    io: Io,
+    argv: []const []const u8,
+    cwd: []const u8,
+) !std.process.RunResult {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
+    bash_child_mutex.lockUncancelable(io);
+    bash_child_slot.store(blk: {
+        if (@import("builtin").os.tag == .windows) {
+            break :blk if (child.id) |h| @as(i64, @intCast(@intFromPtr(h))) else 0;
+        }
+        break :blk @as(i64, child.id orelse 0);
+    }, .release);
+    bash_child_mutex.unlock(io);
+    defer {
+        // 清槽先于 child.kill（defer LIFO）→ 看门狗不会碰到已关闭的句柄
+        bash_child_mutex.lockUncancelable(io);
+        bash_child_slot.store(0, .release);
+        bash_child_mutex.unlock(io);
+    }
+
+    var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: Io.File.MultiReader = undefined;
+    multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+
+    while (multi_reader.fill(8192, .none)) |_| {
+        if (stdout_reader.buffered().len > 4 * 1024 * 1024) return error.StreamTooLong;
+        if (stderr_reader.buffered().len > 4 * 1024 * 1024) return error.StreamTooLong;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+
+    try multi_reader.checkAnyError();
+
+    const term = try child.wait(io);
+
+    const stdout_slice = try multi_reader.toOwnedSlice(0);
+    errdefer gpa.free(stdout_slice);
+    const stderr_slice = try multi_reader.toOwnedSlice(1);
+    errdefer gpa.free(stderr_slice);
+
+    return .{ .stdout = stdout_slice, .stderr = stderr_slice, .term = term };
+}
+
 /// Windows 上 pwsh 默认按控制台代码页（如中文 GB2312）写输出，
 /// 重定向到管道后字节仍是 GBK，模型会看到乱码。
 /// 修复：执行前把控制台输出编码切到 UTF-8。
@@ -1405,23 +1571,38 @@ fn toolBash(
     else
         &.{ "sh", "-c", full_command };
 
-    const timeout: Io.Timeout = if (args.timeout_ms > 0)
-        .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(args.timeout_ms), .clock = .awake } }
-    else
-        .none;
+    // 默认 5 分钟兜底；模型可传更大值（不设上限）。超时/取消由看门狗杀树实现
+    // （见上方“bash 中断支持”注释——不能依赖 std 的 timeout：Threaded 后端对
+    // 阻塞的管道读不响应 deadline）。
+    const timeout_ms_eff: i64 = if (args.timeout_ms > 0) args.timeout_ms else bash_default_timeout_ms;
+    const deadline_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() + timeout_ms_eff;
+    var wd_done = std.atomic.Value(bool).init(false);
+    var wd_state = std.atomic.Value(u8).init(0);
+    const wd = std.Thread.spawn(.{}, bashWatchdog, .{
+        io,
+        &wd_done,
+        deadline_ms,
+        bash_cancel_flag,
+        &wd_state,
+        environ_map,
+    }) catch null;
 
-    const run_result = std.process.run(allocator, io, .{
-        .argv = argv,
-        .cwd = .{ .path = cwd },
-        .timeout = timeout,
-        .stdout_limit = .limited(4 * 1024 * 1024),
-        .stderr_limit = .limited(4 * 1024 * 1024),
-        .reserve_amount = 8192,
-    }) catch |err| switch (err) {
-        error.Timeout => return fail(allocator, "Command timed out after {d} ms", .{args.timeout_ms}),
-        error.StreamTooLong => return fail(allocator, "Command output exceeded the limit (4MB)", .{}),
-        else => return fail(allocator, "Failed to run command: {s}", .{@errorName(err)}),
+    const run_result = runBashTracked(allocator, io, argv, cwd) catch |err| {
+        wd_done.store(true, .release);
+        if (wd) |t| t.join();
+        switch (wd_state.load(.acquire)) {
+            1 => return fail(allocator, "Command timed out after {d} ms. If this command is expected to take longer, retry with a larger timeout_ms.", .{timeout_ms_eff}),
+            2 => return fail(allocator, "Command was cancelled by the user.", .{}),
+            else => {},
+        }
+        return switch (err) {
+            error.StreamTooLong => fail(allocator, "Command output exceeded the limit (4MB)", .{}),
+            else => fail(allocator, "Failed to run command: {s}", .{@errorName(err)}),
+        };
     };
+    wd_done.store(true, .release);
+    if (wd) |t| t.join();
+    const wd_fired = wd_state.load(.acquire);
     defer allocator.free(run_result.stdout);
     defer allocator.free(run_result.stderr);
 
@@ -1474,14 +1655,19 @@ fn toolBash(
 
     var exit_note: ?[]u8 = null;
     defer if (exit_note) |n| allocator.free(n);
-    switch (run_result.term) {
-        .exited => |code| {
-            if (code != 0) {
-                exit_note = try std.fmt.allocPrint(allocator, "Command exited with code {d}", .{code});
-            }
-        },
-        else => {
-            exit_note = try std.fmt.allocPrint(allocator, "Command terminated abnormally: {any}", .{run_result.term});
+    switch (wd_fired) {
+        // 超时/取消：杀树的退出码没意义，输出原因 + 已产生的部分输出
+        1 => exit_note = try std.fmt.allocPrint(allocator, "Command timed out after {d} ms. If this command is expected to take longer, retry with a larger timeout_ms.", .{timeout_ms_eff}),
+        2 => exit_note = try allocator.dupe(u8, "Command was cancelled by the user."),
+        else => switch (run_result.term) {
+            .exited => |code| {
+                if (code != 0) {
+                    exit_note = try std.fmt.allocPrint(allocator, "Command exited with code {d}", .{code});
+                }
+            },
+            else => {
+                exit_note = try std.fmt.allocPrint(allocator, "Command terminated abnormally: {any}", .{run_result.term});
+            },
         },
     }
 
@@ -2910,6 +3096,62 @@ test "tools: bash 输出去除 ANSI 转义序列" {
         defer testing.allocator.free(out);
         try testing.expectEqualStrings(case.want, out);
     }
+}
+
+test "tools: bash 超时——timeout_ms 到点即杀，返回超时提示" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+
+    const t0 = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const r = try execute(testing.allocator, io, cwd, "bash", "{\"command\":\"Start-Sleep -Seconds 20\",\"timeout_ms\":1000}");
+    const dt = std.Io.Timestamp.now(io, .awake).toMilliseconds() - t0;
+    defer testing.allocator.free(r.content);
+    defer if (r.display) |d| testing.allocator.free(d);
+
+    // 1 秒超时立即返回（而不是等满 20 秒）；提示带“调大 timeout_ms 重试”引导
+    try testing.expect(dt < 10_000);
+    try testing.expect(std.mem.indexOf(u8, r.content, "timed out") != null);
+    try testing.expect(std.mem.indexOf(u8, r.content, "larger timeout_ms") != null);
+}
+
+test "tools: bash Ctrl+Q——取消标志置位即杀树，长命令立即返回" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    bash_cancel_flag = &cancel;
+    defer bash_cancel_flag = null;
+
+    const Canceller = struct {
+        fn run(io2: Io, flag: *std.atomic.Value(bool)) void {
+            Io.sleep(io2, Io.Duration.fromMilliseconds(300), .awake) catch {};
+            flag.store(true, .release);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Canceller.run, .{ io, &cancel });
+
+    const t0 = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const r = try execute(testing.allocator, io, cwd, "bash", "{\"command\":\"Start-Sleep -Seconds 20\",\"timeout_ms\":600000}");
+    const dt = std.Io.Timestamp.now(io, .awake).toMilliseconds() - t0;
+    th.join();
+    defer testing.allocator.free(r.content);
+    defer if (r.display) |d| testing.allocator.free(d);
+
+    // 取消置位后立即返回（而不是等满 20 秒或 10 分钟超时）
+    try testing.expect(dt < 10_000);
+    try testing.expect(std.mem.indexOf(u8, r.content, "cancelled by the user") != null);
 }
 
 test "tools: bash 输出与错误码" {

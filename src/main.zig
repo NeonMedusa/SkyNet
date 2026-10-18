@@ -9921,11 +9921,15 @@ fn streamWorker(job: *StreamJob) void {
             // cd 工具：不走 tools.zig 执行——它改变会话工作目录（job.cwd + 落库 + 回传主线程）
             const exec_result = if (std.mem.eql(u8, tc.name, "cd"))
                 execCdTool(job, arena, tc.arguments)
-            else
-                tools_mod.executeWithEnv(arena, job.io, job.cwd, tc.name, tc.arguments, job.environ_map) catch |e| blk: {
+            else blk2: {
+                // bash 超时/Ctrl+Q 的取消源（看门狗轮询）——仅对本次工具执行生效
+                tools_mod.bash_cancel_flag = &job.app.stream_cancel;
+                defer tools_mod.bash_cancel_flag = null;
+                break :blk2 tools_mod.executeWithEnv(arena, job.io, job.cwd, tc.name, tc.arguments, job.environ_map) catch |e| blk: {
                     const msg = std.fmt.allocPrint(arena, "Tool execution failed: {s}", .{@errorName(e)}) catch "Tool execution failed";
                     break :blk tools_mod.Result{ .content = @constCast(msg), .is_error = true };
                 };
+            };
             Log.info(.tools, "完成 {s}: {d}ms {d}B err={}", .{
                 tc.name,
                 std.Io.Timestamp.now(job.io, .awake).toMilliseconds() - tool_t0,
