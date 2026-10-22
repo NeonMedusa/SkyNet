@@ -448,8 +448,11 @@ fn isPasteNewline(delta_ms: i64) bool {
 }
 
 /// 把粘贴文本插入指定输入框（清洗非法 UTF-8，避免污染历史/请求体）；
-/// 返回实际插入字节数（小于 text.len 表示达到输入框软上限被截断/未插入）
-fn insertPastedText(allocator: Allocator, input: anytype, text: []const u8) usize {
+/// 返回实际新增字节数（0 = 被拒绝：超过输入框软上限）。
+/// `sel_len` = 插入前输入框的选区长度（TextInput 有选区时 insertBytes = 替换选区；
+/// 调用方若已先删除选区则传 0）。基准 = before - sel_len，避免“替换更短文本”被
+/// 误判为 0（2026-10-20：Ctrl+A 全选旧 key 再粘贴新 key 曾误报“超过上限”）。
+fn insertPastedText(allocator: Allocator, input: anytype, text: []const u8, sel_len: usize) usize {
     const before = input.value().len;
     if (std.unicode.utf8ValidateSlice(text)) {
         input.insertBytes(text);
@@ -457,7 +460,32 @@ fn insertPastedText(allocator: Allocator, input: anytype, text: []const u8) usiz
         defer allocator.free(clean);
         input.insertBytes(clean);
     } else |_| {}
-    return input.value().len - before;
+    const after = input.value().len;
+    const base = before -| sel_len;
+    return if (after > base) after - base else 0;
+}
+
+test "insertPastedText：选区替换/上限拒绝的返回值语义（回归：粘贴误报与下溢）" {
+    var input = TextInput(256){
+        .style = .{ .fg = .white },
+        .cursor_style = .{ .fg = .black, .bg = .white },
+    };
+    input.insertBytes("oc_sk_oldkey_0123456789_abcdef"); // 31 字节
+    input.selectAll();
+    // 粘贴更短文本（5 字节）替换 31 字节选区：不应下溢，且返回值 = 实际插入的 5
+    const sel_len: usize = 31;
+    const inserted = insertPastedText(std.testing.allocator, &input, "short", sel_len);
+    try std.testing.expectEqual(@as(usize, 5), inserted); // 成功替换 → 不误报“超上限”
+    try std.testing.expectEqualStrings("short", input.value());
+    // 无选区再粘贴：正常返回新增字节数
+    const inserted2 = insertPastedText(std.testing.allocator, &input, "er", 0);
+    try std.testing.expectEqual(@as(usize, 2), inserted2);
+    try std.testing.expectEqualStrings("shorter", input.value());
+    // 超上限：无选区且剩余空间不够 → 返回 0（调用方据此提示“已忽略”）
+    var big: [300]u8 = undefined;
+    @memset(&big, 'k');
+    const inserted3 = insertPastedText(std.testing.allocator, &input, &big, 0);
+    try std.testing.expectEqual(@as(usize, 0), inserted3);
 }
 
 const RecentEntry = struct {
@@ -8761,23 +8789,24 @@ fn handleTerminalEvent(state: *AppState, terminal: *Terminal, event: tui.Event) 
                             state.clearSelection();
                         }
                     }
-                    const inserted = insertPastedText(state.allocator, &state.input, text);
-                    if (inserted < text.len) {
-                        state.setToast("粘贴内容超过输入框上限，已截断");
+                    const inserted = insertPastedText(state.allocator, &state.input, text, 0);
+                    if (inserted == 0 and text.len > 0) {
+                        state.setToast("粘贴内容超过输入框上限，已忽略");
                     }
                 },
                 .provider_add => {
-                    // 表单字段同样支持粘贴（密钥/地址通常靠粘贴输入）
-                    // 有选区：粘贴即替换（TextInput.insertBytes 已内置处理）
-                    const inserted = insertPastedText(state.allocator, state.providerFormActiveInput(), text);
-                    if (inserted < text.len) {
-                        state.setToast("粘贴内容超过字段上限，已截断");
+                    // 表单字段同样支持粘贴（密钥/地址通常靠粘贴输入）；
+                    // TextInput.insertBytes 有选区时内置替换，故传真实选区长度作基准
+                    const form_sel_len: usize = if (state.providerFormActiveInput().selectionRange()) |r| r[1] - r[0] else 0;
+                    const inserted = insertPastedText(state.allocator, state.providerFormActiveInput(), text, form_sel_len);
+                    if (inserted == 0 and text.len > 0) {
+                        state.setToast("粘贴内容超过字段上限，已忽略");
                     }
                 },
                 .session_rename, .cwd_edit => {
                     // 对话框输入框：有选区先替换（TextArea 不自动处理）
                     if (state.dialogSelectionRange()) |r| state.dialog_input.deleteRange(r[0], r[1]);
-                    _ = insertPastedText(state.allocator, &state.dialog_input, text);
+                    _ = insertPastedText(state.allocator, &state.dialog_input, text, 0);
                     if (state.mode == .cwd_edit) state.cwd_edit_error_len = 0;
                 },
                 else => {},
@@ -9759,12 +9788,20 @@ fn streamWorker(job: *StreamJob) void {
                 if (!streamErrorRetryable(err) or attempt >= stream_retry_max or
                     app.stream_cancel.load(.acquire))
                 {
-                    // 第 3 层救援：重试耗尽的失败（不管原因）→ 强制压缩一次并重发整请求
-                    // （一次性，防死循环）。不依赖错误码：实测网关超限时可能直接掐流、
-                    // 不给错误体；错误体可识别为"输入超限"时保留更具体的日志/提示。
+                    // 第 3 层救援（2026-10-20 收窄）：只救"重试治不好、但压缩能治好"
+                    // 的失败——① 错误体可识别为上下文超限；② 掐流（StreamTruncated：
+                    // 超限的典型无错误体症状）；③ 估算用量 ≥ 窗口 70%（未知症状下的
+                    // 安全网）。纯 NetworkError/ServerError 且用量不高 → 不压（白压上下文、
+                    // 解决不了病根；2026-10-20 实测：58% 用量网络错误被误压，用户会话被白白收缩）。
                     const overflow = if (client.error_body) |b| isContextOverflowText(b) else false;
+                    const est = estimateJobRequestTokens(job);
+                    const high_usage = job.context_window > 0 and est * 100 >= job.context_window * 70;
+                    const worth_rescue = overflow or err == error.StreamTruncated or high_usage;
+                    if (!worth_rescue) {
+                        Log.info(.retry, "重试耗尽（{s}，est={d}，非超限症状）→ 不压缩，直接失败", .{ @errorName(err), est });
+                    }
                     if (err != error.Canceled and !job.overflow_recovery_attempted and
-                        !app.stream_cancel.load(.acquire))
+                        worth_rescue and !app.stream_cancel.load(.acquire))
                     {
                         job.overflow_recovery_attempted = true;
                         var recovered = false;
@@ -9778,8 +9815,8 @@ fn streamWorker(job: *StreamJob) void {
                                 Log.warn(.compact, "上下文溢出 → 已自动压缩，重发请求（一次性自愈）", .{});
                                 pushStreamEvent(app, .toast, "", "上下文超限：已自动压缩并重发", "", "", false);
                             } else {
-                                Log.warn(.compact, "请求失败（{s}）→ 已自动压缩，重发请求（一次性救援）", .{@errorName(err)});
-                                pushStreamEvent(app, .toast, "", "请求失败：已自动压缩并重发", "", "", false);
+                                Log.warn(.compact, "疑似超限（{s}）→ 已自动压缩，重发请求（一次性救援）", .{@errorName(err)});
+                                pushStreamEvent(app, .toast, "", "疑似超限：已自动压缩并重发", "", "", false);
                             }
                             job.content.clearRetainingCapacity();
                             job.reasoning.clearRetainingCapacity();
@@ -14079,17 +14116,17 @@ test "粘贴文本：清洗非法 UTF-8 + 表单字段可粘贴" {
     state.allocator = std.testing.allocator;
 
     // 合法文本直接插入
-    _ = insertPastedText(state.allocator, &state.provider_form_key, "sk-abc123");
+    _ = insertPastedText(state.allocator, &state.provider_form_key, "sk-abc123", 0);
     try std.testing.expectEqualStrings("sk-abc123", state.provider_form_key.value());
 
     // 非法字节（GBK）替换为 U+FFFD，不污染输入
-    _ = insertPastedText(state.allocator, &state.provider_form_key, "sk-\xB7x");
+    _ = insertPastedText(state.allocator, &state.provider_form_key, "sk-\xB7x", 0);
     try std.testing.expectEqualStrings("sk-abc123sk-\u{FFFD}x", state.provider_form_key.value());
     try std.testing.expect(std.unicode.utf8ValidateSlice(state.provider_form_key.value()));
 
     // 表单焦点字段路由：第 3 栏（env）粘贴
     state.provider_form_field = 3;
-    _ = insertPastedText(state.allocator, state.providerFormActiveInput(), "OPENAI_API_KEY");
+    _ = insertPastedText(state.allocator, state.providerFormActiveInput(), "OPENAI_API_KEY", 0);
     try std.testing.expectEqualStrings("OPENAI_API_KEY", state.provider_form_key_env.value());
 
     // 大粘贴：动态缓冲完整保留（超过旧的 64KB 固定上限）
@@ -14101,7 +14138,7 @@ test "粘贴文本：清洗非法 UTF-8 + 表单字段可粘贴" {
     defer std.testing.allocator.free(big);
     @memset(big, 'a');
     state.input.clear();
-    const inserted = insertPastedText(state.allocator, &state.input, big);
+    const inserted = insertPastedText(state.allocator, &state.input, big, 0);
     try std.testing.expectEqual(big.len, inserted);
     try std.testing.expectEqual(big.len, state.input.value().len);
 }
