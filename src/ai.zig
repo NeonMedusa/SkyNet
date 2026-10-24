@@ -181,7 +181,7 @@ fn repairDanglingToolCalls(a: Allocator, messages: []const Message) error{OutOfM
     }
     if (!has_calls) return messages; // 快速路径：原样序列化
 
-    var out = std.ArrayListUnmanaged(Message){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(Message).empty;
     var i: usize = 0;
     while (i < messages.len) {
         const m = messages[i];
@@ -281,11 +281,11 @@ const StreamDelta = struct {
 /// 传入的 allocator 应当是短生命周期 arena（内部按需复制字符串，不做逐项释放）。
 pub const ToolCallAccumulator = struct {
     allocator: Allocator,
-    items: std.ArrayListUnmanaged(ToolCall) = .{ .items = &.{}, .capacity = 0 },
+    items: std.ArrayListUnmanaged(ToolCall) = .empty,
 
     pub fn deinit(self: *ToolCallAccumulator) void {
         self.items.deinit(self.allocator);
-        self.items = .{ .items = &.{}, .capacity = 0 };
+        self.items = .empty;
     }
 
     pub fn feed(self: *ToolCallAccumulator, deltas: []const StreamToolCall) error{OutOfMemory}!void {
@@ -457,7 +457,7 @@ pub const ModelsResponse = struct {
 
 /// 把非法 UTF-8 字节替换为 U+FFFD（返回新分配的内存）
 pub fn sanitizeUtf8(allocator: Allocator, data: []const u8) error{OutOfMemory}![]u8 {
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < data.len) {
@@ -766,7 +766,7 @@ pub const AI = struct {
         // 复用长生命周期客户端（连接池 + CA 证书包跨请求保持）
         const client = self.getClient();
 
-        var extra_headers = std.ArrayListUnmanaged(http.Header){ .items = &.{}, .capacity = 0 };
+        var extra_headers = std.ArrayListUnmanaged(http.Header).empty;
         defer extra_headers.deinit(self.allocator);
         self.appendBehaviorHeaders(&extra_headers);
 
@@ -961,7 +961,7 @@ pub const AI = struct {
         // 与 streamMessage 使用同一个复用客户端
         const client = self.getClient();
 
-        var extra_headers = std.ArrayListUnmanaged(http.Header){ .items = &.{}, .capacity = 0 };
+        var extra_headers = std.ArrayListUnmanaged(http.Header).empty;
         defer extra_headers.deinit(self.allocator);
         self.appendBehaviorHeaders(&extra_headers);
 
@@ -1057,7 +1057,7 @@ test "opencode 端点识别与请求头" {
         .session_id = "abc",
         .behavior = .{ .affinity = .opencode },
     });
-    var headers = std.ArrayListUnmanaged(http.Header){ .items = &.{}, .capacity = 0 };
+    var headers = std.ArrayListUnmanaged(http.Header).empty;
     defer headers.deinit(std.testing.allocator);
     client.appendBehaviorHeaders(&headers);
     try std.testing.expectEqual(@as(usize, 2), headers.items.len);
@@ -1073,7 +1073,7 @@ test "opencode 端点识别与请求头" {
         .model = "m",
         .session_id = "abc",
     });
-    var headers2 = std.ArrayListUnmanaged(http.Header){ .items = &.{}, .capacity = 0 };
+    var headers2 = std.ArrayListUnmanaged(http.Header).empty;
     defer headers2.deinit(std.testing.allocator);
     other.appendBehaviorHeaders(&headers2);
     try std.testing.expectEqual(@as(usize, 0), headers2.items.len);
@@ -1097,7 +1097,7 @@ test "请求头：各家会话亲和方言 + 自定义头" {
             .session_id = "sess-1",
             .behavior = .{ .affinity = case.affinity, .extra_headers = &extra },
         });
-        var headers = std.ArrayListUnmanaged(http.Header){ .items = &.{}, .capacity = 0 };
+        var headers = std.ArrayListUnmanaged(http.Header).empty;
         defer headers.deinit(std.testing.allocator);
         client.appendBehaviorHeaders(&headers);
 
@@ -1152,11 +1152,11 @@ test "请求体：缓存参数与流式 usage" {
     defer std.testing.allocator.free(no_sess);
     try std.testing.expect(std.mem.indexOf(u8, no_sess, "prompt_cache_key") == null);
 
-    const long_id = "x" ** 100;
-    const clamped = try buildRequestBody(std.testing.allocator, "m", &messages, &.{}, long_id, .{ .cache_key = true });
+    const long_id: [100]u8 = @splat('x');
+    const clamped = try buildRequestBody(std.testing.allocator, "m", &messages, &.{}, &long_id, .{ .cache_key = true });
     defer std.testing.allocator.free(clamped);
     try std.testing.expect(std.mem.indexOf(u8, clamped, "prompt_cache_key") != null);
-    try std.testing.expect(std.mem.indexOf(u8, clamped, long_id) == null);
+    try std.testing.expect(std.mem.indexOf(u8, clamped, &long_id) == null);
 }
 
 test "请求体：max_tokens 输出上限（>0 才发）" {
@@ -1501,7 +1501,7 @@ test "请求体：真实工具 schema（线程内构建，回归 arena UAF）" {
                 schemas[i] = .{ .name = d.name, .description = d.description, .parameters = d.parameters };
             }
 
-            var messages = std.ArrayListUnmanaged(Message){ .items = &.{}, .capacity = 0 };
+            var messages = std.ArrayListUnmanaged(Message).empty;
             messages.append(a, .{ .role = "user", .content = "列一下目录" }) catch return;
             const body = buildRequestBody(a, "mock-model", messages.items, &schemas, "", .{}) catch return;
             if (std.mem.indexOf(u8, body, "\"tools\"") == null) @panic("no tools");

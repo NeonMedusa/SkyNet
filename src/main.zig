@@ -447,6 +447,9 @@ fn isPasteNewline(delta_ms: i64) bool {
     return delta_ms >= 0 and delta_ms < paste_enter_threshold_ms;
 }
 
+/// 编译期字节重复的本地别名（utf8.repeat 返回指向编译期常量的指针，可直接隐式转切片）。
+const repeatBytes = utf8.repeat;
+
 /// 把粘贴文本插入指定输入框（清洗非法 UTF-8，避免污染历史/请求体）；
 /// 返回实际新增字节数（0 = 被拒绝：超过输入框软上限）。
 /// `sel_len` = 插入前输入框的选区长度（TextInput 有选区时 insertBytes = 替换选区；
@@ -683,7 +686,7 @@ fn extractSelectionText(
     const lo_pos = selPointPos(lo);
     const hi_pos = selPointPos(hi);
 
-    var out: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     var mi = lo.msg;
@@ -915,11 +918,11 @@ const StreamJob = struct {
     round_usage: ai.Usage = .{},
     history: []ai.Message,
     /// 本轮代理产生的消息（assistant 工具调用 + tool 结果 + 最终回复）
-    transcript: std.ArrayListUnmanaged(TranscriptEntry) = .{ .items = &.{}, .capacity = 0 },
+    transcript: std.ArrayListUnmanaged(TranscriptEntry) = .empty,
     /// 当前回合累积的正文（arena 所有）
-    content: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    content: std.ArrayListUnmanaged(u8) = .empty,
     /// 当前轮累积的思考内容（arena 所有，每轮清空）
-    reasoning: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    reasoning: std.ArrayListUnmanaged(u8) = .empty,
     /// 当前轮（最后一次尝试）的产出是否已写入转录。
     /// 轮开始时置 false，appendAssistantTurn 成功后置 true；
     /// finalize 据此判断"是否还需要用显示消息兜底落库"。
@@ -927,7 +930,7 @@ const StreamJob = struct {
     reasoning_start_ms: i64 = 0,
     reasoning_end_ms: i64 = 0,
     /// 工具渲染元数据（与 transcript 中的 tool 消息按 id 对应；arena 所有）
-    tool_meta: std.ArrayListUnmanaged(ToolMeta) = .{ .items = &.{}, .capacity = 0 },
+    tool_meta: std.ArrayListUnmanaged(ToolMeta) = .empty,
 
     fn deinit(self: *StreamJob) void {
         const allocator = self.arena.child_allocator;
@@ -950,7 +953,7 @@ const AppState = struct {
     /// 留空 = 未显式指定：worker 不会去猜默认路径（防止误开无关库）。
     db_path: []const u8 = "",
     session_id: i64 = 0,
-    history: std.ArrayListUnmanaged(ai.Message) = .{ .items = &.{}, .capacity = 0 },
+    history: std.ArrayListUnmanaged(ai.Message) = .empty,
 
     /// ── 会话工作目录（工具 cwd 基准）──
     /// work_dir 为空 = 用 default_cwd（程序启动目录）。
@@ -988,17 +991,17 @@ const AppState = struct {
     models_watch_mutex: Io.Mutex = .init,
     models_watch_woken: std.atomic.Value(bool) = .init(false),
     models_watch_wakes: std.atomic.Value(usize) = .init(0),
-    stream_buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    stream_buf: std.ArrayListUnmanaged(u8) = .empty,
     stream_consume_pos: usize = 0,
-    stream_reasoning_buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    stream_reasoning_buf: std.ArrayListUnmanaged(u8) = .empty,
     stream_reasoning_pos: usize = 0,
     /// 工具调用/回合事件（worker → 主线程，按序消费）
-    stream_events: std.ArrayListUnmanaged(StreamEvent) = .{ .items = &.{}, .capacity = 0 },
+    stream_events: std.ArrayListUnmanaged(StreamEvent) = .empty,
     stream_error: ?ai.AIError = null,
 
     /// 生成/压缩期间用户提交、等待发送的消息（主线程入队；worker 在工具轮次边界取走注入）
     pending_sends_mutex: Io.Mutex = .init,
-    pending_sends: std.ArrayListUnmanaged(PendingSend) = .{ .items = &.{}, .capacity = 0 },
+    pending_sends: std.ArrayListUnmanaged(PendingSend) = .empty,
     /// 生成中用户切换了工作目录：待 worker 在下一次工具执行前应用。
     /// 线程安全交换（mutex 保护；worker 取走后置 null）。
     pending_work_dir_mutex: Io.Mutex = .init,
@@ -1054,10 +1057,10 @@ const AppState = struct {
     compact_thread: ?std.Thread = null,
     compact_plan: ?*CompactionPlan = null,
     compact_mutex: Io.Mutex = .init,
-    compact_buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    compact_buf: std.ArrayListUnmanaged(u8) = .empty,
     compact_consume_pos: usize = 0,
     /// 摘要思考增量缓冲（与正文并行；同样由 compact_mutex 保护）
-    compact_reasoning_buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    compact_reasoning_buf: std.ArrayListUnmanaged(u8) = .empty,
     compact_consume_reasoning_pos: usize = 0,
     /// 工具循环中途压缩的流式显示：true = worker 正在流式产出摘要。
     /// 与 compact_status（手动 /compact 的异步状态机）互斥（生成中禁止手动压缩）。
@@ -1123,7 +1126,7 @@ const AppState = struct {
     provider_form_field: usize = 0,
     provider_edit_index: ?usize = null,
     /// 表单字段的屏幕位置（每帧由 drawProviderAdd 记录；鼠标框选用）
-    provider_form_rows: [4]ProviderFormRow = [_]ProviderFormRow{.{}} ** 4,
+    provider_form_rows: [4]ProviderFormRow = [4]ProviderFormRow{ .{}, .{}, .{}, .{} },
     provider_form_row_count: usize = 0,
     /// 表单字段拖选状态（框选：记录锚点字段与偏移）
     provider_form_drag: struct { active: bool = false, field: usize = 0, anchor: usize = 0 } = .{},
@@ -1143,7 +1146,7 @@ const AppState = struct {
     /// 设置页数值行编辑（Enter 进入；数字/./k/% 输入，Enter 提交，Esc 取消）
     settings_edit: bool = false,
     settings_edit_len: usize = 0,
-    settings_edit_buf: [12]u8 = [_]u8{0} ** 12,
+    settings_edit_buf: [12]u8 = @splat(0),
 
     // 消息滚动状态
     /// 滚动锚点（锚点模型，取代旧的"距底部行数"）：视口首行所在的**全局**显示
@@ -1254,7 +1257,7 @@ const AppState = struct {
     input_content_rows: usize = 0,
     last_key_ms: i64 = 0,
 
-    messages: std.ArrayListUnmanaged(Message) = .{ .items = &.{}, .capacity = 0 },
+    messages: std.ArrayListUnmanaged(Message) = .empty,
 
     /// ── 会话工作目录辅助 ──
     /// 当前会话的有效工作目录（绝对路径）：work_dir 非空用它（有效性由
@@ -2638,7 +2641,7 @@ const AppState = struct {
         }
 
         // 历史：摘要行（供摘要文本解析）+ 保留区。摘要行 id 均 < tail_start，拼接后仍升序
-        var combined = std.ArrayListUnmanaged(db_mod.MessageRow){ .items = &.{}, .capacity = 0 };
+        var combined = std.ArrayListUnmanaged(db_mod.MessageRow).empty;
         combined.appendSlice(a, summary_rows) catch {};
         combined.appendSlice(a, tail_rows) catch {};
         self.applyLoadedMessagesWithCheckpoint(combined.items, checkpoint, compactions, false, true);
@@ -3457,7 +3460,7 @@ const AppState = struct {
         const arena = plan.arena.allocator();
         // worker 自建连接时用实际打开的库路径（测试/CLI 可能不是默认路径）
         const db_path: []const u8 = if (self.db) |*d| d.path else self.db_path;
-        plan.db_path = try arena.dupeZ(u8, db_path);
+        plan.db_path = try arena.dupeSentinel(u8, db_path, 0);
         plan.endpoint = try arena.dupe(u8, provider.endpoint);
         plan.api_key = try arena.dupe(u8, self.resolvedApiKey(provider));
         plan.model = try arena.dupe(u8, model);
@@ -4476,7 +4479,7 @@ const AppState = struct {
         job.environ_map = self.environ_map;
         // worker 自建连接时用实际打开的库路径（测试/CLI 可能不是默认路径）
         const db_path: []const u8 = if (self.db) |*d| d.path else self.db_path;
-        job.db_path = try arena.dupeZ(u8, db_path);
+        job.db_path = try arena.dupeSentinel(u8, db_path, 0);
         job.session_id_num = self.session_id;
         job.auto_compact_pct = if (self.config.auto_compact) self.auto_compact_pct else 0;
         job.context_window = self.contextWindowCurrent();
@@ -4497,12 +4500,12 @@ const AppState = struct {
         job.usage_input = 0;
         job.usage_output = 0;
         job.usage_cached = 0;
-        job.transcript = .{ .items = &.{}, .capacity = 0 };
-        job.content = .{ .items = &.{}, .capacity = 0 };
-        job.reasoning = .{ .items = &.{}, .capacity = 0 };
+        job.transcript = .empty;
+        job.content = .empty;
+        job.reasoning = .empty;
         job.reasoning_start_ms = 0;
         job.reasoning_end_ms = 0;
-        job.tool_meta = .{ .items = &.{}, .capacity = 0 };
+        job.tool_meta = .empty;
         job.history = try arena.alloc(ai.Message, self.history.items.len);
         for (self.history.items, 0..) |m, i| {
             job.history[i] = try cloneMessage(arena, m);
@@ -4863,7 +4866,7 @@ const AppState = struct {
         // 1) 内容增量（先于事件处理，保证显示顺序）
         var content: ?[]u8 = null;
         var reasoning: ?[]u8 = null;
-        var events: std.ArrayListUnmanaged(StreamEvent) = .{ .items = &.{}, .capacity = 0 };
+        var events: std.ArrayListUnmanaged(StreamEvent) = .empty;
         self.stream_mutex.lockUncancelable(self.io);
         if (self.stream_buf.items.len > self.stream_consume_pos) {
             const slice = self.stream_buf.items[self.stream_consume_pos..];
@@ -4881,7 +4884,7 @@ const AppState = struct {
         }
         if (self.stream_events.items.len > 0) {
             events = self.stream_events;
-            self.stream_events = .{ .items = &.{}, .capacity = 0 };
+            self.stream_events = .empty;
         }
         self.stream_mutex.unlock(self.io);
 
@@ -5359,7 +5362,7 @@ const AppState = struct {
 
         // 调用 id → 工具名（stub 文案用）
         const CallName = struct { id: []const u8, name: []const u8 };
-        var calls = std.ArrayListUnmanaged(CallName){ .items = &.{}, .capacity = 0 };
+        var calls = std.ArrayListUnmanaged(CallName).empty;
         defer calls.deinit(self.allocator);
         for (self.history.items) |m| {
             if (m.tool_calls) |cs| {
@@ -6369,7 +6372,7 @@ test "CLI 默认路径：显式参数原样返回；默认指向 exe 旁数据�
 }
 
 fn cliOpenDb(allocator: Allocator, io: Io, db_path: []const u8) ?db_mod.Db {
-    const path = allocator.dupeZ(u8, db_path) catch return null;
+    const path = allocator.dupeSentinel(u8, db_path, 0) catch return null;
     defer allocator.free(path);
     return db_mod.Db.openFile(allocator, io, path) catch |e| {
         if (e == error.SchemaVersionMismatch) {
@@ -6450,7 +6453,7 @@ fn cmdSessions(allocator: Allocator, io: Io, opt: CliOptions) u8 {
             messages: i64,
             last_active_at: i64,
         };
-        var list = std.ArrayListUnmanaged(JRow){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayListUnmanaged(JRow).empty;
         defer list.deinit(allocator);
         for (rows) |r| list.append(allocator, .{
             .id = r.id,
@@ -6520,7 +6523,7 @@ fn cmdMessages(allocator: Allocator, io: Io, opt: CliOptions) u8 {
             tool_calls: []const u8,
             is_error: i64,
         };
-        var list = std.ArrayListUnmanaged(JRow){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayListUnmanaged(JRow).empty;
         defer list.deinit(allocator);
         for (rows) |r| list.append(allocator, .{
             .id = r.id,
@@ -6684,9 +6687,9 @@ const CompactionOutcome = struct {
 const SummaryCollector = struct {
     allocator: Allocator,
     io: Io = undefined,
-    list: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    list: std.ArrayListUnmanaged(u8) = .empty,
     /// 摘要生成过程中的思考内容（落库供重载显示；不进模型历史）
-    reasoning: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    reasoning: std.ArrayListUnmanaged(u8) = .empty,
     reasoning_start_ms: i64 = 0,
     reasoning_end_ms: i64 = 0,
     /// 非空时把增量同时回传主线程渲染（worker 路径；手动压缩与中途压缩共用）
@@ -7338,7 +7341,7 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
     ) catch return false;
 
     // 重建 job.history：system + checkpoint + 保留区
-    var new_hist = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
+    var new_hist = std.ArrayListUnmanaged(ai.Message).empty;
     if (hist.len > 0 and std.mem.eql(u8, hist[0].role, "system")) {
         new_hist.append(arena, hist[0]) catch return false;
     }
@@ -7451,7 +7454,7 @@ fn cmdStats(allocator: Allocator, io: Io, opt: CliOptions) u8 {
 
     // 工具输出明细 + 折叠模拟（只看仍在发送的）
     const Largest = struct { id: i64, tool: []const u8, bytes: usize };
-    var largest = std.ArrayListUnmanaged(Largest){ .items = &.{}, .capacity = 0 };
+    var largest = std.ArrayListUnmanaged(Largest).empty;
     defer largest.deinit(allocator);
     var tool_bytes: usize = 0;
     // 折叠模拟：与实时折叠共用同一扫描器（回合保护/窗口/stub 边界）
@@ -7536,7 +7539,7 @@ fn cmdStats(allocator: Allocator, io: Io, opt: CliOptions) u8 {
             context_used_percent: u64,
             tool_output: JTool,
         };
-        var jroles = std.ArrayListUnmanaged(JRole){ .items = &.{}, .capacity = 0 };
+        var jroles = std.ArrayListUnmanaged(JRole).empty;
         defer jroles.deinit(allocator);
         for (aggs) |a| {
             jroles.append(allocator, .{
@@ -7547,7 +7550,7 @@ fn cmdStats(allocator: Allocator, io: Io, opt: CliOptions) u8 {
             }) catch {};
         }
         const top = @min(largest.items.len, 5);
-        var jlargest = std.ArrayListUnmanaged(JLargest){ .items = &.{}, .capacity = 0 };
+        var jlargest = std.ArrayListUnmanaged(JLargest).empty;
         defer jlargest.deinit(allocator);
         for (largest.items[0..top]) |l| {
             jlargest.append(allocator, .{ .id = l.id, .tool = l.tool, .bytes = l.bytes }) catch {};
@@ -8338,7 +8341,7 @@ const GateOutcome = enum {
 /// 文案中的版本号与备份名均取实际值。
 fn runVersionGate(allocator: Allocator, io: Io, backend: *tui.backend.NativeBackend, db_path: []const u8) GateOutcome {
     // 尊重 -db（与 TUI 打开库的路径一致）；CLI 子命令的 -db 走 fail-fast（见 cliOpenDb）
-    const path_z = allocator.dupeZ(u8, db_path) catch return .normal;
+    const path_z = allocator.dupeSentinel(u8, db_path, 0) catch return .normal;
     defer allocator.free(path_z);
     const path: [:0]const u8 = path_z;
     const mm = db_mod.probeVersionMismatch(allocator, io, path) orelse return .normal;
@@ -8462,7 +8465,7 @@ pub fn main(init: std.process.Init) !u8 {
         var arg_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
         defer arg_it.deinit();
         _ = arg_it.next(); // 程序名
-        var arg_list = std.ArrayListUnmanaged([]const u8){ .items = &.{}, .capacity = 0 };
+        var arg_list = std.ArrayListUnmanaged([]const u8).empty;
         defer arg_list.deinit(allocator);
         while (arg_it.next()) |a| try arg_list.append(allocator, a);
         if (arg_list.items.len > 0 and isCliCommand(arg_list.items[0])) {
@@ -8537,7 +8540,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // 打开数据库并恢复/新建会话（尊重 -db；默认 skynet.db，与 CLI 子命令一致）
     var db_open_err: ?anyerror = null;
-    const db_path_z = allocator.dupeZ(u8, tui_db_path) catch null;
+    const db_path_z = allocator.dupeSentinel(u8, tui_db_path, 0) catch null;
     defer if (db_path_z) |p| allocator.free(p);
     state.db = if (db_path_z) |p|
         db_mod.Db.openFile(allocator, io, p) catch |e| blk: {
@@ -9065,9 +9068,9 @@ fn applyAmbiguousWidth(state: *AppState) void {
     };
 
     // 用户覆盖名单（可只配一侧；空名单即清空）
-    var wide_list: std.ArrayListUnmanaged(u21) = .{ .items = &.{}, .capacity = 0 };
+    var wide_list: std.ArrayListUnmanaged(u21) = .empty;
     defer wide_list.deinit(state.allocator);
-    var narrow_list: std.ArrayListUnmanaged(u21) = .{ .items = &.{}, .capacity = 0 };
+    var narrow_list: std.ArrayListUnmanaged(u21) = .empty;
     defer narrow_list.deinit(state.allocator);
     parseWidthOverrides(state.allocator, state.config.width_overrides_wide, &wide_list);
     parseWidthOverrides(state.allocator, state.config.width_overrides_narrow, &narrow_list);
@@ -9577,7 +9580,7 @@ fn queueNoticeFromWorker(app: *AppState, text: []const u8) void {
 
 fn injectPendingSends(job: *StreamJob, worker_db: *?db_mod.Db) void {
     const app = job.app;
-    var taken: std.ArrayListUnmanaged(PendingSend) = .{ .items = &.{}, .capacity = 0 };
+    var taken: std.ArrayListUnmanaged(PendingSend) = .empty;
     defer taken.deinit(app.allocator);
     {
         app.pending_sends_mutex.lockUncancelable(app.io);
@@ -13228,7 +13231,7 @@ test "加载历史：工具交互恢复与提示词政策（前置当前值）" 
     try std.testing.expectEqualStrings("call_1", state.history.items[3].tool_call_id.?);
 
     // 界面：⚙/↳ 提示行 + 最终回答
-    var joined = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var joined = std.ArrayListUnmanaged(u8).empty;
     defer joined.deinit(std.testing.allocator);
     for (state.messages.items) |m| {
         try joined.appendSlice(std.testing.allocator, m.content);
@@ -13336,7 +13339,7 @@ test "集成：工具调用循环（需本地 mock 服务器 127.0.0.1:18123）"
     if (connection_failure) return error.SkipZigTest;
     try std.testing.expectEqual(StreamStatus.idle, state.streamStatus());
 
-    var display = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var display = std.ArrayListUnmanaged(u8).empty;
     defer display.deinit(std.testing.allocator);
     for (state.messages.items) |m| {
         try display.appendSlice(std.testing.allocator, m.content);
@@ -13935,7 +13938,7 @@ test "断连重试：截断后自动重试成功，丢弃失败尝试的部分�
     if (connection_failure) return error.SkipZigTest;
     try std.testing.expectEqual(StreamStatus.idle, state.streamStatus());
 
-    var display = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var display = std.ArrayListUnmanaged(u8).empty;
     defer display.deinit(std.testing.allocator);
     for (state.messages.items) |m| {
         try display.appendSlice(std.testing.allocator, m.content);
@@ -14023,7 +14026,7 @@ test "断连重试：HTTP 503 属瞬时故障，自动重试（需 mock 18127）
     if (connection_failure) return error.SkipZigTest;
     try std.testing.expectEqual(StreamStatus.idle, state.streamStatus());
 
-    var display = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var display = std.ArrayListUnmanaged(u8).empty;
     defer display.deinit(std.testing.allocator);
     for (state.messages.items) |m| {
         try display.appendSlice(std.testing.allocator, m.content);
@@ -15006,18 +15009,18 @@ test "中途压缩：工具循环中压缩整段历史（含当前回合，需 m
         }
     };
 
-    var hist = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
+    var hist = std.ArrayListUnmanaged(ai.Message).empty;
     // system 仅存在于内存历史（政策A：不落库）
     try hist.append(arena, .{ .role = "system", .content = try arena.dupe(u8, system_prompt) });
-    const old_u = "uuuu" ** 500;
-    const old_a = "aaaa" ** 500;
+    const old_u = repeatBytes("uuuu", 500);
+    const old_a = repeatBytes("aaaa", 500);
     try hist.append(arena, try Turn.u(arena, &state, old_u));
     try hist.append(arena, try Turn.a(arena, &state, old_a, ""));
-    const cur_u = "vvvv" ** 125;
-    const a1 = "bbbb" ** 500;
-    const t1 = "cccc" ** 500;
-    const a2 = "dddd" ** 500;
-    const t2 = "eeee" ** 500;
+    const cur_u = repeatBytes("vvvv", 125);
+    const a1 = repeatBytes("bbbb", 500);
+    const t1 = repeatBytes("cccc", 500);
+    const a2 = repeatBytes("dddd", 500);
+    const t2 = repeatBytes("eeee", 500);
     try hist.append(arena, try Turn.u(arena, &state, cur_u)); // 当前回合 user
     try hist.append(arena, try Turn.a(arena, &state, a1, "c1"));
     try hist.append(arena, try Turn.t(arena, &state, t1, "c1"));
@@ -15175,7 +15178,7 @@ test "实时落库：persistTranscriptEntry 写入 DB 并回填 db_id（幂等�
 
     // assistant：带工具调用 + 思考 + 单轮用量
     const calls = try cloneToolCalls(arena, &[_]ai.ToolCall{.{ .id = "call_9", .name = "bash", .arguments = "{\"command\":\"echo hi\"}" }});
-    var hist = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
+    var hist = std.ArrayListUnmanaged(ai.Message).empty;
     try hist.append(arena, .{ .role = "assistant", .content = try arena.dupe(u8, "先跑一下"), .tool_calls = calls });
     job.history = try hist.toOwnedSlice(arena);
     try job.transcript.append(arena, .{
@@ -15207,7 +15210,7 @@ test "实时落库：persistTranscriptEntry 写入 DB 并回填 db_id（幂等�
 
     // tool 结果：渲染元数据（tool_name / is_error）随行落库
     try job.tool_meta.append(arena, .{ .id = "call_9", .name = "bash", .display = "", .is_error = true });
-    var hist2 = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
+    var hist2 = std.ArrayListUnmanaged(ai.Message).empty;
     try hist2.appendSlice(arena, job.history);
     try hist2.append(arena, .{ .role = "tool", .content = try arena.dupe(u8, "boom"), .tool_call_id = try arena.dupe(u8, "call_9") });
     job.history = try hist2.toOwnedSlice(arena);
@@ -15333,17 +15336,17 @@ test "排队压缩：生成中入队去重、间隙强制压、无内容可压�
         .keep_recent_tokens = 100,
     };
     const arena = job.arena.allocator();
-    var hist = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
+    var hist = std.ArrayListUnmanaged(ai.Message).empty;
     try hist.append(arena, .{ .role = "system", .content = try arena.dupe(u8, system_prompt) });
     {
         // 直接落库并构造带 db_id 的历史条目（模拟 worker 已实时落库）
-        const txt_u = try arena.dupe(u8, "AAAA" ** 2000);
+        const txt_u = try arena.dupe(u8, repeatBytes("AAAA", 2000));
         const row_u = state.persistMessage(.{ .role = "user", .content = txt_u });
         try hist.append(arena, .{ .role = "user", .content = txt_u, .db_id = row_u });
-        const txt_a = try arena.dupe(u8, "BBBB" ** 2000);
+        const txt_a = try arena.dupe(u8, repeatBytes("BBBB", 2000));
         const row_a = state.persistMessage(.{ .role = "assistant", .content = txt_a });
         try hist.append(arena, .{ .role = "assistant", .content = txt_a, .db_id = row_a });
-        const txt_u2 = try arena.dupe(u8, "CCCC" ** 500);
+        const txt_u2 = try arena.dupe(u8, repeatBytes("CCCC", 500));
         const row_u2 = state.persistMessage(.{ .role = "user", .content = txt_u2 });
         try hist.append(arena, .{ .role = "user", .content = txt_u2, .db_id = row_u2 });
     }
@@ -15420,14 +15423,14 @@ test "手动压缩：小会话自适应缩小保留窗口（需 mock 18125）" {
 
     const sid = try state.db.?.createSession("");
     state.session_id = sid;
-    const f0 = "F0" ** 4000;
+    const f0 = repeatBytes("F0", 4000);
     const r1 = state.persistMessage(.{ .role = "user", .content = f0 });
     _ = r1;
-    const f1 = "F1" ** 4000;
+    const f1 = repeatBytes("F1", 4000);
     _ = state.persistMessage(.{ .role = "assistant", .content = f1 });
-    const f2 = "F2" ** 4000;
+    const f2 = repeatBytes("F2", 4000);
     _ = state.persistMessage(.{ .role = "user", .content = f2 });
-    const f3 = "F3" ** 4000;
+    const f3 = repeatBytes("F3", 4000);
     _ = state.persistMessage(.{ .role = "assistant", .content = f3 });
 
     state.loadSessionContent(sid);
@@ -15983,7 +15986,7 @@ test "窗口化：卸载后行数保持，重载后内容与行数一致（含�
         .session_id = sid,
         .role = "assistant",
         .content = "正文内容 here\n第二行",
-        .reasoning = "思考内容" ** 20,
+        .reasoning = repeatBytes("思考内容", 20),
         .reasoning_ms = 1234,
     });
     const tool_id = try state.db.?.insertMessage(.{
@@ -16024,7 +16027,7 @@ test "窗口化：卸载后行数保持，重载后内容与行数一致（含�
         try std.testing.expect(m.content_loaded);
     }
     try std.testing.expectEqualStrings("正文内容 here\n第二行", state.messages.items[0].content);
-    try std.testing.expectEqualStrings("思考内容" ** 20, state.messages.items[0].reasoning.?);
+    try std.testing.expectEqualStrings(repeatBytes("思考内容", 20), state.messages.items[0].reasoning.?);
     try std.testing.expect(state.messages.items[0].md != null);
     try std.testing.expectEqualStrings("用户消息", state.messages.items[2].content);
     // 工具块：重载后含标题 + 正文（capBlockBody 后的形态）
@@ -16161,13 +16164,13 @@ test "usage 锚点：估算 = 真实 usage + 其后增量；历史重建后失�
     state.usage_anchor_len = state.history.items.len;
 
     // 锚定估算 = 20500 + 新增消息的估算增量
-    state.appendHistory("user", "x" ** 400); // 400B ≈ 100 tokens
+    state.appendHistory("user", repeatBytes("x", 400)); // 400B ≈ 100 tokens
     const anchored = state.estimateRequestTokens();
     try std.testing.expectEqual(@as(usize, 20_500 + 100), anchored);
     try std.testing.expect(anchored > pure);
 
     // 变量变化：任意新增消息只按增量估算，锚点不变
-    state.appendHistory("assistant", "y" ** 40); // 40B = 10 tokens
+    state.appendHistory("assistant", repeatBytes("y", 40)); // 40B = 10 tokens
     try std.testing.expectEqual(@as(usize, 20_500 + 100 + 10), state.estimateRequestTokens());
 
     // 历史重建（clearHistory / 加载 / 新建会话）→ 锚点失效，回退纯估算
@@ -16185,7 +16188,7 @@ test "usage 锚点：估算 = 真实 usage + 其后增量；历史重建后失�
     dummy_state.allocator = std.testing.allocator;
     var msgs = [_]ai.Message{
         .{ .role = "system", .content = "sys" },
-        .{ .role = "user", .content = "x" ** 400 },
+        .{ .role = "user", .content = repeatBytes("x", 400) },
     };
     var job = StreamJob{
         .app = &dummy_state,
@@ -16213,7 +16216,7 @@ test "usage 锚点：估算 = 真实 usage + 其后增量；历史重建后失�
     try std.testing.expectEqual(@as(usize, 900_000), estimateJobRequestTokens(&job));
     // 本轮回复/工具结果追加后：估算 = 900k + 新增估算（误差仅限单轮增量）
     job.history = try extendHistory(job.arena.allocator(), job.history, &[_]ai.Message{
-        .{ .role = "assistant", .content = "x" ** 400 }, // 400B ≈ 100 tokens
+        .{ .role = "assistant", .content = repeatBytes("x", 400) }, // 400B ≈ 100 tokens
     });
     try std.testing.expectEqual(@as(usize, 900_100), estimateJobRequestTokens(&job));
 }
@@ -16269,7 +16272,7 @@ test "估算：回传思考的模型把 reasoning 计入请求量（集成）" {
     state.appendHistory("system", "sys");
     state.appendHistory("user", "u");
     state.appendHistory("assistant", "a");
-    state.history.items[2].reasoning = try std.testing.allocator.dupe(u8, "r" ** 400);
+    state.history.items[2].reasoning = try std.testing.allocator.dupe(u8, repeatBytes("r", 400));
 
     const no_reasoning = estimateTokens(historyRequestBytesSlice(state.history.items, false) + toolsSchemaBytes());
     try std.testing.expect(state.estimateRequestTokens() > no_reasoning);
@@ -16296,7 +16299,7 @@ test "估算取大：账本过期偏低（口径漂移）时用字节估算防�
     state.appendHistory("system", "sys");
     state.appendHistory("user", "u");
     state.appendHistory("assistant", "a");
-    state.history.items[2].reasoning = try std.testing.allocator.dupe(u8, "r" ** 400);
+    state.history.items[2].reasoning = try std.testing.allocator.dupe(u8, repeatBytes("r", 400));
 
     // 账本 = 旧口径（不含思考）的小数字：纯字节估算（含思考）明显更大 → 取大用字节估算
     state.usage_anchor_tokens = 100;
@@ -16766,7 +16769,7 @@ test "模糊宽度应用：auto = 窄基底 + 推荐名单；wide/narrow 为纯�
 
 test "宽度覆盖名单：解析（范围/单点/字面/非法 token）" {
     const alloc = std.testing.allocator;
-    var list: std.ArrayListUnmanaged(u21) = .{ .items = &.{}, .capacity = 0 };
+    var list: std.ArrayListUnmanaged(u21) = .empty;
     defer list.deinit(alloc);
 
     parseWidthOverrides(alloc, "U+2460-U+2462", &list);
@@ -16976,11 +16979,11 @@ test "独立验证：折叠阈值边界与保护窗口（批量）" {
 
     for (scenarios, 0..) |sc, si| {
         var path_buf: [64]u8 = undefined;
-        const db_path = try std.fmt.bufPrintZ(&path_buf, "skynet_verify_fold_{d}.db", .{si});
+        const db_path = try std.fmt.bufPrintSentinel(&path_buf, "skynet_verify_fold_{d}.db", .{si}, 0);
         var wal_buf: [80]u8 = undefined;
-        const wal_path = try std.fmt.bufPrintZ(&wal_buf, "{s}-wal", .{db_path});
+        const wal_path = try std.fmt.bufPrintSentinel(&wal_buf, "{s}-wal", .{db_path}, 0);
         var shm_buf: [80]u8 = undefined;
-        const shm_path = try std.fmt.bufPrintZ(&shm_buf, "{s}-shm", .{db_path});
+        const shm_path = try std.fmt.bufPrintSentinel(&shm_buf, "{s}-shm", .{db_path}, 0);
         Io.Dir.cwd().deleteFile(io, db_path) catch {};
         Io.Dir.cwd().deleteFile(io, wal_path) catch {};
         Io.Dir.cwd().deleteFile(io, shm_path) catch {};
@@ -17148,7 +17151,7 @@ test "独立验证：重启后块工具用全文重建、大小统计按原文�
     @memset(read_buf, 'r');
 
     // bash 输出：10 行、含标记（块工具；重启后应看到 BASH_MARKER 全文而非 stub）
-    var bash_out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var bash_out = std.ArrayListUnmanaged(u8).empty;
     defer bash_out.deinit(alloc);
     var pad: [4900]u8 = undefined;
     @memset(&pad, 'b');
@@ -18655,7 +18658,7 @@ test "cd 工具：切目录（job.cwd/落库/事件）与错误路径" {
         job.cwd = try job_arena.dupe(u8, z);
     }
     job.session_id_num = sid;
-    job.db_path = try job_arena.dupeZ(u8, db_path); // ensureWorkerDb 需要真实路径
+    job.db_path = try job_arena.dupeSentinel(u8, db_path, 0); // ensureWorkerDb 需要真实路径
 
     // 1) 正常切换：相对路径 → 绝对路径、job.cwd 更新、落库
     {
@@ -19150,7 +19153,7 @@ test "worker 目录失效：通知入队 + 事件清内存 + DB 清空（下个�
     const ja = job.arena.allocator();
     job.cwd = try ja.dupe(u8, "C:\\no_such_heal_dir");
     job.default_cwd = try ja.dupe(u8, state.default_cwd);
-    job.db_path = try ja.dupeZ(u8, db_path);
+    job.db_path = try ja.dupeSentinel(u8, db_path, 0);
     job.session_id_num = sid;
 
     // 执行：应回退 cwd、入队通知、推 work_dir_changed（空文本）、清 DB
@@ -19245,7 +19248,7 @@ test "usage 播种：加载后用最后一条真实 usage 替代纯估算（含�
         .cached_tokens = 99_000,
         .output_tokens = 500,
     });
-    _ = try state.db.?.insertMessage(.{ .session_id = sid, .role = "user", .content = "x" ** 400 }); // 400B ≈ 100 tokens
+    _ = try state.db.?.insertMessage(.{ .session_id = sid, .role = "user", .content = repeatBytes("x", 400) }); // 400B ≈ 100 tokens
 
     // 加载（走完整加载路径 → seedUsageFromDb 应用真实值）
     state.loadSessionContent(sid);
@@ -19515,13 +19518,13 @@ test "空闲看门狗：手动压缩（异步）半开卡死时自动收尾（�
     const sid = try state.db.?.createSession("");
     state.session_id = sid;
     // 足够长的历史（保证自适应缩小时选得中可压缩区间）
-    const f0 = "G0" ** 4000;
+    const f0 = repeatBytes("G0", 4000);
     _ = state.persistMessage(.{ .role = "user", .content = f0 });
-    const f1 = "G1" ** 4000;
+    const f1 = repeatBytes("G1", 4000);
     _ = state.persistMessage(.{ .role = "assistant", .content = f1 });
-    const f2 = "G2" ** 4000;
+    const f2 = repeatBytes("G2", 4000);
     _ = state.persistMessage(.{ .role = "user", .content = f2 });
-    const f3 = "G3" ** 4000;
+    const f3 = repeatBytes("G3", 4000);
     _ = state.persistMessage(.{ .role = "assistant", .content = f3 });
     state.loadSessionContent(sid);
 
@@ -19624,17 +19627,17 @@ test "空闲看门狗：工具轮中途压缩半开卡死时自动收尾（需 m
         .keep_recent_tokens = 100,
     };
     const arena = job.arena.allocator();
-    var hist = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
+    var hist = std.ArrayListUnmanaged(ai.Message).empty;
     try hist.append(arena, .{ .role = "system", .content = try arena.dupe(u8, system_prompt) });
     {
         // 直接落库并构造带 db_id 的历史条目（模拟 worker 已实时落库）
-        const txt_u = try arena.dupe(u8, "AAAA" ** 2000);
+        const txt_u = try arena.dupe(u8, repeatBytes("AAAA", 2000));
         const row_u = state.persistMessage(.{ .role = "user", .content = txt_u });
         try hist.append(arena, .{ .role = "user", .content = txt_u, .db_id = row_u });
-        const txt_a = try arena.dupe(u8, "BBBB" ** 2000);
+        const txt_a = try arena.dupe(u8, repeatBytes("BBBB", 2000));
         const row_a = state.persistMessage(.{ .role = "assistant", .content = txt_a });
         try hist.append(arena, .{ .role = "assistant", .content = txt_a, .db_id = row_a });
-        const txt_u2 = try arena.dupe(u8, "CCCC" ** 500);
+        const txt_u2 = try arena.dupe(u8, repeatBytes("CCCC", 500));
         const row_u2 = state.persistMessage(.{ .role = "user", .content = txt_u2 });
         try hist.append(arena, .{ .role = "user", .content = txt_u2, .db_id = row_u2 });
     }

@@ -81,7 +81,7 @@ pub fn formatToolCallLine(arena: Allocator, name: []const u8, args_json: []const
         const offset = extractJsonInt(arena, args_json, "offset") orelse 0;
         const limit = extractJsonInt(arena, args_json, "limit") orelse 0;
         if (limit <= 0 and offset <= 0) return std.fmt.allocPrint(arena, "→ Read {s}", .{path}) catch "→ Read";
-        var opts = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+        var opts = std.ArrayListUnmanaged(u8).empty;
         if (limit > 0) appendToolOpt(arena, &opts, "limit={d}", .{limit});
         if (offset > 0) appendToolOpt(arena, &opts, "offset={d}", .{offset});
         return std.fmt.allocPrint(arena, "→ Read {s} [{s}]", .{ path, opts.items }) catch "→ Read";
@@ -92,7 +92,7 @@ pub fn formatToolCallLine(arena: Allocator, name: []const u8, args_json: []const
         const glob = extractJsonString(arena, args_json, "glob") orelse "";
         const ignore_case = extractJsonBool(arena, args_json, "ignore_case");
         const literal = extractJsonBool(arena, args_json, "literal");
-        var opts = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+        var opts = std.ArrayListUnmanaged(u8).empty;
         if (path.len > 0 and !std.mem.eql(u8, path, ".")) appendToolOpt(arena, &opts, "path={s}", .{path});
         if (glob.len > 0) appendToolOpt(arena, &opts, "glob={s}", .{glob});
         if (ignore_case) appendToolOpt(arena, &opts, "ignore_case", .{});
@@ -155,7 +155,7 @@ pub fn summarizeToolArgs(arena: Allocator, args_json: []const u8) error{OutOfMem
         else => return "",
     };
 
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     var it = obj.iterator();
     var first = true;
     while (it.next()) |entry| {
@@ -190,7 +190,7 @@ pub fn summarizeToolArgs(arena: Allocator, args_json: []const u8) error{OutOfMem
 
 /// 截断块正文到 max_lines 行，超出用 `…` 收尾
 pub fn capBlockBody(allocator: Allocator, body: []const u8, max_lines: usize) error{OutOfMemory}![]u8 {
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
     var shown: usize = 0;

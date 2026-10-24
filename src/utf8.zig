@@ -32,6 +32,29 @@ pub fn decodeAt(bytes: []const u8, index: usize) Decoded {
     return .{ .cp = cp, .len = len };
 }
 
+/// 编译期把字节串重复 n 次，返回指针（指向编译期常量；0.17 移除了 `x ** n` 数组重复运算符，
+/// 且数组值到切片需显式 & ——返回指针可直接隐式转切片，调用点无需改）。
+/// 实现注意（0.17 踩坑记录，三个失败方案都试过）：
+///  - 循环里 comptime @memcpy 切片 = 解释器逐元素执行，100KB 要 60 秒+；
+///  - 递归“返回 &局部” = 0.17 会编出部分损坏的常量（NUL 混入）；
+///  - comptime @memset = 大量实例化时编译器确定性 OOM；
+///  → 单字节走原生 @splat（快、无损坏、不吃内存），多字节实例都小（≤几 KB）走小循环。
+pub fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    if (s.len == 1) {
+        const a: [n]u8 = @splat(s[0]);
+        return &a;
+    }
+    const out = comptime blk: {
+        @setEvalBranchQuota(1_000_000);
+        var o: [s.len * n]u8 = undefined;
+        if (s.len == 0 or n == 0) break :blk o;
+        var idx: usize = 0;
+        while (idx < o.len) : (idx += s.len) @memcpy(o[idx..][0..s.len], s);
+        break :blk o;
+    };
+    return &out;
+}
+
 /// 只算 `bytes[index]` 处码点的字节长度（不解码，用于只需前进的场景）。
 /// 调用方须保证 index < bytes.len；返回至少 1。
 pub fn nextLen(bytes: []const u8, index: usize) usize {

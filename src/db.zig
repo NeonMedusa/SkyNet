@@ -340,7 +340,7 @@ pub const Db = struct {
             .foreign_keys = .on,
         });
         errdefer sess.deinit();
-        const path_copy = try allocator.dupeZ(u8, filename);
+        const path_copy = try allocator.dupeSentinel(u8, filename, 0);
         errdefer allocator.free(path_copy);
 
         try sess.conn.execAll("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");

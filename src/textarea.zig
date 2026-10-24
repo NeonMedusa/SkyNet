@@ -19,7 +19,7 @@ pub const TextArea = struct {
 
     /// 缓冲分配器（默认 page_allocator，实际使用时应设置为应用分配器）
     allocator: Allocator = std.heap.page_allocator,
-    buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    buf: std.ArrayListUnmanaged(u8) = .empty,
     /// 字节偏移，始终位于码点边界
     cursor: usize = 0,
     /// 视口顶部所在的可视行（绝对行号）
@@ -47,7 +47,7 @@ pub const TextArea = struct {
     /// 释放缓冲（使用应用分配器时必须调用）
     pub fn deinit(self: *Self) void {
         self.buf.deinit(self.allocator);
-        self.buf = .{ .items = &.{}, .capacity = 0 };
+        self.buf = .empty;
     }
 
     pub fn value(self: *const Self) []const u8 {

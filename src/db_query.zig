@@ -26,10 +26,10 @@ pub fn queryAll(
     args: anytype,
 ) ![]const R {
     // 1) 参数数组：分配在调用者 allocator（fridge 的 Session.prepare 会分配在 session arena）
-    const fields = std.meta.fields(@TypeOf(args));
+    const fields = @typeInfo(@TypeOf(args)).@"struct".field_names;
     const values = try allocator.alloc(fr.Value, fields.len);
     inline for (fields, 0..) |f, i| {
-        values[i] = try fr.Value.from(@field(args, f.name), allocator);
+        values[i] = try fr.Value.from(@field(args, f), allocator);
     }
 
     // 2) prepare + 逐行读取：Statement.next 接受 allocator，结果直接落调用者 arena

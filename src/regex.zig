@@ -92,7 +92,7 @@ const Parser = struct {
     }
 
     fn parseAlt(self: *Parser) ParseError!Node {
-        var branches = std.ArrayListUnmanaged(Node){ .items = &.{}, .capacity = 0 };
+        var branches = std.ArrayListUnmanaged(Node).empty;
         try branches.append(self.arena, try self.parseConcat());
         while (self.peek() == @as(u8, '|')) {
             _ = self.next();
@@ -104,7 +104,7 @@ const Parser = struct {
     }
 
     fn parseConcat(self: *Parser) ParseError!Node {
-        var items = std.ArrayListUnmanaged(Node){ .items = &.{}, .capacity = 0 };
+        var items = std.ArrayListUnmanaged(Node).empty;
         while (self.peek()) |c| {
             if (c == '|' or c == ')') break;
             try items.append(self.arena, try self.parseRepeat());
@@ -268,7 +268,7 @@ fn decodeChar(pattern: []const u8, pos: *usize, c: u8) ParseError!u21 {
 }
 
 const Compiler = struct {
-    out: std.ArrayListUnmanaged(Inst) = .{ .items = &.{}, .capacity = 0 },
+    out: std.ArrayListUnmanaged(Inst) = .empty,
     allocator: Allocator,
     scratch: Allocator,
 
@@ -294,7 +294,7 @@ const Compiler = struct {
             try self.emit(branches[0]);
             return;
         }
-        var end_jumps = std.ArrayListUnmanaged(usize){ .items = &.{}, .capacity = 0 };
+        var end_jumps = std.ArrayListUnmanaged(usize).empty;
         defer end_jumps.deinit(self.scratch);
 
         for (branches, 0..) |branch, i| {

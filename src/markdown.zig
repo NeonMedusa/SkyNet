@@ -74,7 +74,7 @@ pub fn parse(allocator: Allocator, content: []const u8, styles: Styles) ![]Line 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var items: std.ArrayListUnmanaged(Line) = .{ .items = &.{}, .capacity = 0 };
+    var items: std.ArrayListUnmanaged(Line) = .empty;
     errdefer {
         for (items.items) |line| {
             if (line.runs.len > 0) allocator.free(line.runs);
@@ -129,7 +129,7 @@ pub fn parse(allocator: Allocator, content: []const u8, styles: Styles) ![]Line 
         if (trimmed[0] == '>') {
             var rest = trimmed[1..];
             rest = std.mem.trimStart(u8, rest, " ");
-            var runs: std.ArrayListUnmanaged(Run) = .{ .items = &.{}, .capacity = 0 };
+            var runs: std.ArrayListUnmanaged(Run) = .empty;
             try runs.append(arena, .{ .text = "│ ", .style = styles.quote });
             try parseInline(arena, &runs, rest, base, styles);
             try appendOwnedRuns(allocator, &items, try runs.toOwnedSlice(arena));
@@ -139,7 +139,7 @@ pub fn parse(allocator: Allocator, content: []const u8, styles: Styles) ![]Line 
         // 列表
         if (listMarker(trimmed)) |lm| {
             const indent = raw[0 .. raw.len - trimmed.len];
-            var runs: std.ArrayListUnmanaged(Run) = .{ .items = &.{}, .capacity = 0 };
+            var runs: std.ArrayListUnmanaged(Run) = .empty;
             if (indent.len > 0) {
                 try runs.append(arena, .{ .text = indent, .style = base });
             }
@@ -151,7 +151,7 @@ pub fn parse(allocator: Allocator, content: []const u8, styles: Styles) ![]Line 
 
         // 表格（以 | 开头且至少两个 |）
         if (trimmed[0] == '|' and countChar(trimmed, '|') >= 2) {
-            var rows: std.ArrayListUnmanaged([]const u8) = .{ .items = &.{}, .capacity = 0 };
+            var rows: std.ArrayListUnmanaged([]const u8) = .empty;
             try rows.append(arena, raw);
             while (true) {
                 const save = pos;
@@ -410,7 +410,7 @@ fn appendOwnedRuns(allocator: Allocator, items: *std.ArrayListUnmanaged(Line), r
 fn appendInline(allocator: Allocator, items: *std.ArrayListUnmanaged(Line), text: []const u8, base: Style, styles: Styles) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
-    var runs: std.ArrayListUnmanaged(Run) = .{ .items = &.{}, .capacity = 0 };
+    var runs: std.ArrayListUnmanaged(Run) = .empty;
     try parseInline(arena_state.allocator(), &runs, text, base, styles);
     if (runs.items.len == 0) {
         try items.append(allocator, .{});
@@ -520,18 +520,18 @@ fn renderTable(
     styles: Styles,
 ) !void {
     // 逐行解析单元格（中间结果放在 arena，最终复制到 allocator）
-    var view_rows: std.ArrayListUnmanaged([]CellView) = .{ .items = &.{}, .capacity = 0 };
+    var view_rows: std.ArrayListUnmanaged([]CellView) = .empty;
     var ncols: usize = 0;
     for (rows) |raw| {
         var s = std.mem.trim(u8, raw, " \t");
         if (s.len > 0 and s[0] == '|') s = s[1..];
         if (s.len > 0 and s[s.len - 1] == '|') s = s[0 .. s.len - 1];
 
-        var cells: std.ArrayListUnmanaged(CellView) = .{ .items = &.{}, .capacity = 0 };
+        var cells: std.ArrayListUnmanaged(CellView) = .empty;
         var it = std.mem.splitScalar(u8, s, '|');
         while (it.next()) |c| {
             const cell_text = std.mem.trim(u8, c, " \t");
-            var runs: std.ArrayListUnmanaged(Run) = .{ .items = &.{}, .capacity = 0 };
+            var runs: std.ArrayListUnmanaged(Run) = .empty;
             try parseInline(arena, &runs, cell_text, styles.base, styles);
             var w: usize = 0;
             for (runs.items) |r| w += stringWidth(r.text);
@@ -574,7 +574,7 @@ fn buildTable(
         }
     }
 
-    var table_rows: std.ArrayListUnmanaged(TableRowSpec) = .{ .items = &.{}, .capacity = 0 };
+    var table_rows: std.ArrayListUnmanaged(TableRowSpec) = .empty;
     errdefer {
         for (table_rows.items) |row| freeCells(allocator, row.cells);
         table_rows.deinit(allocator);
@@ -981,7 +981,7 @@ const testing = std.testing;
 
 /// 读取缓冲区某一行的文本（跳过宽字符的续列，去除行尾空格）
 fn bufferRowText(allocator: Allocator, buf: *Buffer, y: u16, width: u16) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     var x: u16 = 0;
     while (x < width) {

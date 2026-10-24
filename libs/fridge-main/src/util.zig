@@ -68,9 +68,9 @@ pub fn columns(comptime T: type) []const u8 {
     return comptime brk: {
         var res: []const u8 = "";
 
-        for (@typeInfo(T).@"struct".fields) |f| {
+        for (@typeInfo(T).@"struct".field_names) |f| {
             if (res.len > 0) res = res ++ ", ";
-            res = res ++ f.name;
+            res = res ++ f;
         }
 
         break :brk res;
@@ -81,7 +81,7 @@ pub fn placeholders(comptime T: type) []const u8 {
     return comptime brk: {
         var res: []const u8 = "";
 
-        for (@typeInfo(T).@"struct".fields) |_| {
+        for (@typeInfo(T).@"struct".field_names) |_| {
             if (res.len > 0) res = res ++ ", ";
             res = res ++ "?";
         }
@@ -94,9 +94,9 @@ pub fn setters(comptime T: type) []const u8 {
     return comptime brk: {
         var res: []const u8 = "";
 
-        for (@typeInfo(T).@"struct".fields) |f| {
+        for (@typeInfo(T).@"struct".field_names) |f| {
             if (res.len > 0) res = res ++ ", ";
-            res = res ++ f.name ++ " = ?";
+            res = res ++ f ++ " = ?";
         }
 
         break :brk res;
@@ -145,22 +145,22 @@ pub fn isJsonRepresentable(comptime T: type) bool {
 
 pub fn checkFields(comptime T: type, comptime D: type) void {
     comptime {
-        outer: for (@typeInfo(D).@"struct".fields) |f| {
-            for (@typeInfo(T).@"struct".fields) |f2| {
-                if (std.mem.eql(u8, f.name, f2.name)) {
-                    if (isAssignableTo(f.type, f2.type)) {
+        outer: for (@typeInfo(D).@"struct".field_names, @typeInfo(D).@"struct".field_types) |fname, ftype| {
+            for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |f2name, f2type| {
+                if (std.mem.eql(u8, fname, f2name)) {
+                    if (isAssignableTo(ftype, f2type)) {
                         continue :outer;
                     }
 
                     @compileError(
-                        "Type mismatch for field " ++ f.name ++
-                            " found:" ++ @typeName(f.type) ++
-                            " expected:" ++ @typeName(f2.type),
+                        "Type mismatch for field " ++ fname ++
+                            " found:" ++ @typeName(ftype) ++
+                            " expected:" ++ @typeName(f2type),
                     );
                 }
             }
 
-            @compileError("Unknown field " ++ f.name);
+            @compileError("Unknown field " ++ fname);
         }
     }
 }
@@ -198,18 +198,18 @@ pub fn upcast(handle: anytype, comptime T: type) T {
 
             // Check the types first.
             var impl: T.VTable(Handle) = undefined;
-            for (@typeInfo(@TypeOf(impl)).@"struct".fields) |f| {
-                if (std.meta.hasFn(Impl, f.name)) {
-                    @field(impl, f.name) = @field(Impl, f.name);
+            for (@typeInfo(@TypeOf(impl)).@"struct".field_names) |f| {
+                if (std.meta.hasFn(Impl, f)) {
+                    @field(impl, f) = @field(Impl, f);
                 } else {
-                    @compileError("Impl " ++ @typeName(Impl) ++ " is missing " ++ f.name);
+                    @compileError("Impl " ++ @typeName(Impl) ++ " is missing " ++ f);
                 }
             }
 
             // Get erased vtable.
             var res: T.VTable(*anyopaque) = undefined;
-            for (@typeInfo(@TypeOf(res)).@"struct".fields) |f| {
-                @field(res, f.name) = @ptrCast(@field(impl, f.name));
+            for (@typeInfo(@TypeOf(res)).@"struct".field_names) |f| {
+                @field(res, f) = @ptrCast(@field(impl, f));
             }
 
             const copy = res;

@@ -100,7 +100,7 @@ pub fn isDeepSeekHost(endpoint: []const u8) bool {
     if (std.mem.indexOfAny(u8, rest, "/:?#")) |i| host_end = i;
     var host = rest[0..host_end];
     if (std.mem.lastIndexOfScalar(u8, host, '@')) |at| host = host[at + 1 ..];
-    return std.ascii.indexOfIgnoreCase(host, "deepseek.com") != null;
+    return std.ascii.findIgnoreCase(host, "deepseek.com") != null;
 }
 
 /// 请求行为（预设 + 显式覆盖 + 主机名兜底三者合成）
@@ -433,7 +433,7 @@ fn buildProvider(allocator: Allocator, spec: ProviderSpec) !Provider {
 }
 
 pub const Config = struct {
-    providers: std.ArrayListUnmanaged(Provider) = .{ .items = &.{}, .capacity = 0 },
+    providers: std.ArrayListUnmanaged(Provider) = .empty,
     /// 当前使用提供商的名称（为空表示未选择）
     current_provider_name: []u8 = &.{},
     /// 当前使用的模型名（为空表示未选择）
@@ -781,10 +781,10 @@ pub const Config = struct {
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
 
-        var save_list = std.ArrayListUnmanaged(SaveProvider){ .items = &.{}, .capacity = 0 };
+        var save_list = std.ArrayListUnmanaged(SaveProvider).empty;
         defer save_list.deinit(allocator);
 
-        var header_lists = std.ArrayListUnmanaged([]SaveHeader){ .items = &.{}, .capacity = 0 };
+        var header_lists = std.ArrayListUnmanaged([]SaveHeader).empty;
         defer {
             for (header_lists.items) |hl| {
                 if (hl.len > 0) allocator.free(hl);
@@ -823,7 +823,7 @@ pub const Config = struct {
         }
 
         // 每模型档位记忆（key "provider/model" 或 "model" 拆回两字段存储）
-        var tbm_list = std.ArrayListUnmanaged(SaveThinkingByModel){ .items = &.{}, .capacity = 0 };
+        var tbm_list = std.ArrayListUnmanaged(SaveThinkingByModel).empty;
         defer tbm_list.deinit(allocator);
         for (self.thinking_by_model.keys(), self.thinking_by_model.values()) |k, v| {
             if (v.len == 0) continue;
@@ -836,8 +836,8 @@ pub const Config = struct {
         }
 
         // 用户模型覆盖（efforts 字符串拆成数组）
-        var mo_list = std.ArrayListUnmanaged(SaveModelOverride){ .items = &.{}, .capacity = 0 };
-        var mo_effort_lists = std.ArrayListUnmanaged([]const []const u8){ .items = &.{}, .capacity = 0 };
+        var mo_list = std.ArrayListUnmanaged(SaveModelOverride).empty;
+        var mo_effort_lists = std.ArrayListUnmanaged([]const []const u8).empty;
         defer {
             for (mo_effort_lists.items) |el| allocator.free(el);
             mo_effort_lists.deinit(allocator);
@@ -847,7 +847,7 @@ pub const Config = struct {
             if (ov.context_window == 0 and ov.efforts.len == 0) continue;
             var efforts_arr: ?[]const []const u8 = null;
             if (ov.efforts.len > 0) {
-                var list = std.ArrayListUnmanaged([]const u8){ .items = &.{}, .capacity = 0 };
+                var list = std.ArrayListUnmanaged([]const u8).empty;
                 var tok = std.mem.tokenizeScalar(u8, ov.efforts, ' ');
                 while (tok.next()) |t| list.append(allocator, t) catch {
                     allocator.free(list.items);
@@ -919,7 +919,7 @@ pub const Config = struct {
             p.deinit(allocator);
         }
         self.providers.deinit(allocator);
-        self.providers = .{ .items = &.{}, .capacity = 0 };
+        self.providers = .empty;
         allocator.free(self.current_provider_name);
         self.current_provider_name = &.{};
         allocator.free(self.current_model);

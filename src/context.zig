@@ -5,6 +5,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ai = @import("ai.zig");
 const tools_mod = @import("tools.zig");
+const utf8 = @import("utf8.zig");
 
 // ── token 估算 ──
 
@@ -404,7 +405,7 @@ pub fn buildCompactionPayload(
     }
 
     const CallName = struct { id: []const u8, name: []const u8 };
-    var call_names = std.ArrayListUnmanaged(CallName){ .items = &.{}, .capacity = 0 };
+    var call_names = std.ArrayListUnmanaged(CallName).empty;
     defer call_names.deinit(allocator);
     for (history[range.summarize_start..range.retain_start]) |m| {
         if (m.tool_calls) |cs| {
@@ -516,14 +517,14 @@ test "摘要输入：默认带思考；超预算按阶梯降级（剥思考 → 
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    const calls = [_]ai.ToolCall{.{ .id = "c1", .name = "read", .arguments = "x" ** 800 }};
-    var msgs = std.ArrayListUnmanaged(ai.Message){ .items = &.{}, .capacity = 0 };
+    const calls = [_]ai.ToolCall{.{ .id = "c1", .name = "read", .arguments = utf8.repeat("x", 800) }};
+    var msgs = std.ArrayListUnmanaged(ai.Message).empty;
     try msgs.append(a, .{ .role = "system", .content = "sys" });
-    try msgs.append(a, .{ .role = "user", .content = "U" ** 40 });
-    try msgs.append(a, .{ .role = "assistant", .content = "A" ** 40, .reasoning = "R" ** 200, .tool_calls = &calls });
-    try msgs.append(a, .{ .role = "tool", .content = "T" ** 3000, .tool_call_id = "c1" });
-    try msgs.append(a, .{ .role = "user", .content = "V" ** 40 });
-    try msgs.append(a, .{ .role = "assistant", .content = "B" ** 40, .reasoning = "S" ** 200 });
+    try msgs.append(a, .{ .role = "user", .content = utf8.repeat("U", 40) });
+    try msgs.append(a, .{ .role = "assistant", .content = utf8.repeat("A", 40), .reasoning = utf8.repeat("R", 200), .tool_calls = &calls });
+    try msgs.append(a, .{ .role = "tool", .content = utf8.repeat("T", 3000), .tool_call_id = "c1" });
+    try msgs.append(a, .{ .role = "user", .content = utf8.repeat("V", 40) });
+    try msgs.append(a, .{ .role = "assistant", .content = utf8.repeat("B", 40), .reasoning = utf8.repeat("S", 200) });
 
     const range = CompactionRange{ .summarize_start = 1, .retain_start = 6 };
     const prev = "PSPSPSPSPSPSPSPSPSPS";
@@ -535,7 +536,7 @@ test "摘要输入：默认带思考；超预算按阶梯降级（剥思考 → 
     try t.expect(full.len > stripped.len + 200);
     try t.expect(stripped.len > hard.len + 200);
     try t.expect(std.mem.indexOf(u8, full, "[thinking]") != null);
-    try t.expect(std.mem.indexOf(u8, full, "R" ** 200) != null);
+    try t.expect(std.mem.indexOf(u8, full, utf8.repeat("R", 200)) != null);
     try t.expect(std.mem.indexOf(u8, stripped, "[thinking]") == null);
 
     const windowFor = struct {
@@ -550,7 +551,7 @@ test "摘要输入：默认带思考；超预算按阶梯降级（剥思考 → 
     {
         const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, 1_000_000, .{});
         try t.expect(built.include_thinking);
-        try t.expect(std.mem.indexOf(u8, built.payload, "R" ** 200) != null);
+        try t.expect(std.mem.indexOf(u8, built.payload, utf8.repeat("R", 200)) != null);
         try t.expect(std.mem.indexOf(u8, built.payload, prev) != null);
     }
     // 档位 1：预算刚好装下“剥思考”版 → 剥思考
@@ -576,15 +577,15 @@ test "摘要输入：默认带思考；超预算按阶梯降级（剥思考 → 
         const w = windowFor(hard.len / 2 + 8);
         const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, w, .{});
         try t.expect(built.dropped_messages > 0);
-        try t.expect(std.mem.indexOf(u8, built.payload, "U" ** 40) == null);
-        try t.expect(std.mem.indexOf(u8, built.payload, "B" ** 40) != null);
+        try t.expect(std.mem.indexOf(u8, built.payload, utf8.repeat("U", 40)) == null);
+        try t.expect(std.mem.indexOf(u8, built.payload, utf8.repeat("B", 40)) != null);
         try t.expect(std.mem.indexOf(u8, built.payload, prev) != null);
     }
     // 档位 4：极端小窗口 → 保底（只剩最后一条），尽力而为返回
     {
         const built = try buildBudgetedCompactionPayload(a, msgs.items, range, prev, 8, .{});
         try t.expectEqual(@as(usize, 4), built.dropped_messages);
-        try t.expect(std.mem.indexOf(u8, built.payload, "B" ** 40) != null);
+        try t.expect(std.mem.indexOf(u8, built.payload, utf8.repeat("B", 40)) != null);
         try t.expect(std.mem.indexOf(u8, built.payload, prev) != null);
     }
 }
@@ -667,7 +668,40 @@ test "摘要垃圾扫描：行首标记 1 次即垃圾（行中/代码内不算�
 
 const testing = std.testing;
 
+/// 运行期构造大块测试数据（0.17 编译期大常量会拖死编译甚至 OOM，见 utf8.repeat 注释）
+fn fillBuf(a: std.mem.Allocator, pattern: []const u8, n: usize) ![]u8 {
+    const buf = try a.alloc(u8, pattern.len * n);
+    var i: usize = 0;
+    while (i < buf.len) : (i += pattern.len) @memcpy(buf[i..][0..pattern.len], pattern);
+    return buf;
+}
+
 test "token 估算与折叠模拟" {
+    const ba = testing.allocator;
+    const b_a30 = try fillBuf(ba, "a", 30_000);
+    defer ba.free(b_a30);
+    const b_b30 = try fillBuf(ba, "b", 30_000);
+    defer ba.free(b_b30);
+    const b_a100 = try fillBuf(ba, "a", 100_000);
+    defer ba.free(b_a100);
+    const b_b100 = try fillBuf(ba, "b", 100_000);
+    defer ba.free(b_b100);
+    const b_c100 = try fillBuf(ba, "c", 100_000);
+    defer ba.free(b_c100);
+    const b_d10 = try fillBuf(ba, "d", 10_000);
+    defer ba.free(b_d10);
+    const b_e10 = try fillBuf(ba, "e", 10_000);
+    defer ba.free(b_e10);
+    const b_old = try fillBuf(ba, "old", 100_000);
+    defer ba.free(b_old);
+    const b_x512 = try fillBuf(ba, "x", 512);
+    defer ba.free(b_x512);
+    const b_a10 = try fillBuf(ba, "a", 10_000);
+    defer ba.free(b_a10);
+    const b_b300 = try fillBuf(ba, "b", 300_000);
+    defer ba.free(b_b300);
+    const b_c300 = try fillBuf(ba, "c", 300_000);
+    defer ba.free(b_c300);
     try testing.expectEqual(@as(usize, 0), estimateTokens(0));
     try testing.expectEqual(@as(usize, 1), estimateTokens(4));
     try testing.expectEqual(@as(usize, 2), estimateTokens(5));
@@ -675,9 +709,9 @@ test "token 估算与折叠模拟" {
     // 两个 30KB 在最近回合 + 保护窗口内 → 不折叠
     var small = [_]ai.Message{
         .{ .role = "user", .content = "u1" },
-        .{ .role = "tool", .content = "a" ** 30_000, .db_id = 1 },
+        .{ .role = "tool", .content = b_a30, .db_id = 1 },
         .{ .role = "user", .content = "u2" },
-        .{ .role = "tool", .content = "b" ** 30_000, .db_id = 2 },
+        .{ .role = "tool", .content = b_b30, .db_id = 2 },
     };
     const sim_small = simulateFold(&small);
     try testing.expectEqual(@as(usize, 0), sim_small.foldable_count);
@@ -686,13 +720,13 @@ test "token 估算与折叠模拟" {
     // 3 条 100KB + 末尾两个空回合：最近 2 回合受位置保护，其余窗口保护最新 2 条，最旧 1 条可折
     var big = [_]ai.Message{
         .{ .role = "user", .content = "u1" },
-        .{ .role = "tool", .content = "a" ** 100_000, .db_id = 1 },
-        .{ .role = "tool", .content = "b" ** 100_000, .db_id = 2 },
-        .{ .role = "tool", .content = "c" ** 100_000, .db_id = 3 },
+        .{ .role = "tool", .content = b_a100, .db_id = 1 },
+        .{ .role = "tool", .content = b_b100, .db_id = 2 },
+        .{ .role = "tool", .content = b_c100, .db_id = 3 },
         .{ .role = "user", .content = "u2" },
-        .{ .role = "tool", .content = "d" ** 10_000, .db_id = 4 },
+        .{ .role = "tool", .content = b_d10, .db_id = 4 },
         .{ .role = "user", .content = "u3" },
-        .{ .role = "tool", .content = "e" ** 10_000, .db_id = 5 },
+        .{ .role = "tool", .content = b_e10, .db_id = 5 },
     };
     const sim_big = simulateFold(&big);
     try testing.expectEqual(@as(usize, 1), sim_big.foldable_count);
@@ -701,16 +735,16 @@ test "token 估算与折叠模拟" {
 
     // 已折叠（folded 标记）是扫描边界：更早的大输出不再计入（旧地址早已处理过）
     var stubs = [_]ai.Message{
-        .{ .role = "tool", .content = "old" ** 100_000, .db_id = 9 },
+        .{ .role = "tool", .content = b_old, .db_id = 9 },
         .{ .role = "tool", .content = "stub 文本", .db_id = 8, .folded = true },
         .{ .role = "user", .content = "u1" },
-        .{ .role = "tool", .content = "a" ** 100_000, .db_id = 1 },
-        .{ .role = "tool", .content = "b" ** 100_000, .db_id = 2 },
-        .{ .role = "tool", .content = "c" ** 100_000, .db_id = 3 },
+        .{ .role = "tool", .content = b_a100, .db_id = 1 },
+        .{ .role = "tool", .content = b_b100, .db_id = 2 },
+        .{ .role = "tool", .content = b_c100, .db_id = 3 },
         .{ .role = "user", .content = "u2" },
-        .{ .role = "tool", .content = "d" ** 10_000, .db_id = 4 },
+        .{ .role = "tool", .content = b_d10, .db_id = 4 },
         .{ .role = "user", .content = "u3" },
-        .{ .role = "tool", .content = "e" ** 10_000, .db_id = 5 },
+        .{ .role = "tool", .content = b_e10, .db_id = 5 },
     };
     const sim_stubs = simulateFold(&stubs);
     try testing.expectEqual(@as(usize, 1), sim_stubs.foldable_count);
@@ -719,13 +753,13 @@ test "token 估算与折叠模拟" {
     // 小输出（< 1KB）不折叠、也不占用保护窗口：最旧的 100KB 仍在窗口内 → 无可折叠
     var tiny = [_]ai.Message{
         .{ .role = "user", .content = "u1" },
-        .{ .role = "tool", .content = "x" ** 512, .db_id = 1 },
-        .{ .role = "tool", .content = "a" ** 100_000, .db_id = 2 },
-        .{ .role = "tool", .content = "b" ** 100_000, .db_id = 3 },
+        .{ .role = "tool", .content = b_x512, .db_id = 1 },
+        .{ .role = "tool", .content = b_a100, .db_id = 2 },
+        .{ .role = "tool", .content = b_b100, .db_id = 3 },
         .{ .role = "user", .content = "u2" },
-        .{ .role = "tool", .content = "c" ** 10_000, .db_id = 4 },
+        .{ .role = "tool", .content = utf8.repeat("c", 10_000), .db_id = 4 },
         .{ .role = "user", .content = "u3" },
-        .{ .role = "tool", .content = "d" ** 10_000, .db_id = 5 },
+        .{ .role = "tool", .content = b_d10, .db_id = 5 },
     };
     const sim_tiny = simulateFold(&tiny);
     try testing.expectEqual(@as(usize, 0), sim_tiny.foldable_count);
@@ -734,24 +768,24 @@ test "token 估算与折叠模拟" {
     // 未落库（db_id = 0）不折叠：重启后无法复现相同前缀
     var unsaved = [_]ai.Message{
         .{ .role = "user", .content = "u1" },
-        .{ .role = "tool", .content = "a" ** 100_000 },
-        .{ .role = "tool", .content = "b" ** 100_000, .db_id = 2 },
-        .{ .role = "tool", .content = "c" ** 100_000, .db_id = 3 },
+        .{ .role = "tool", .content = b_a100 },
+        .{ .role = "tool", .content = b_b100, .db_id = 2 },
+        .{ .role = "tool", .content = b_c100, .db_id = 3 },
         .{ .role = "user", .content = "u2" },
-        .{ .role = "tool", .content = "d" ** 10_000, .db_id = 4 },
+        .{ .role = "tool", .content = b_d10, .db_id = 4 },
         .{ .role = "user", .content = "u3" },
-        .{ .role = "tool", .content = "e" ** 10_000, .db_id = 5 },
+        .{ .role = "tool", .content = b_e10, .db_id = 5 },
     };
     try testing.expect(simulateFold(&unsaved).foldable_count == 0);
 
     // 最近两个回合内无论多大都不折（位置保护）
     var recent = [_]ai.Message{
         .{ .role = "user", .content = "u1" },
-        .{ .role = "tool", .content = "a" ** 10_000, .db_id = 1 },
+        .{ .role = "tool", .content = b_a10, .db_id = 1 },
         .{ .role = "user", .content = "u2" },
-        .{ .role = "tool", .content = "b" ** 300_000, .db_id = 2 },
+        .{ .role = "tool", .content = b_b300, .db_id = 2 },
         .{ .role = "user", .content = "u3" },
-        .{ .role = "tool", .content = "c" ** 300_000, .db_id = 3 },
+        .{ .role = "tool", .content = b_c300, .db_id = 3 },
     };
     const sim_recent = simulateFold(&recent);
     try testing.expectEqual(@as(usize, 0), sim_recent.foldable_count);
@@ -841,7 +875,7 @@ test "请求字节估算：思考按需计入（能力表 interleaved 口径）"
     const tail = [_]ai.Message{
         .{ .role = "system", .content = "sys" },
         .{ .role = "user", .content = "u0" },
-        .{ .role = "assistant", .content = "a1", .reasoning = "x" ** 60 },
+        .{ .role = "assistant", .content = "a1", .reasoning = utf8.repeat("x", 60) },
     };
     // 预算 10：不计 reasoning → 保留窗口吃掉全部（无需压缩）；
     // 计入后 a1 单条即超预算 → 有可压缩内容（保留区不再吞掉整段）

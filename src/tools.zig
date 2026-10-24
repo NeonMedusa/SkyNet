@@ -177,7 +177,7 @@ fn countLines(data: []const u8) usize {
 /// 给每行加绝对行号前缀（"N: 内容"，1 起）：便于模型引用位置与后续 edit 定位。
 /// line_start 为 data 第一行的绝对行号；行尾换行原样保留，不新增/删除行。
 fn numberLines(allocator: Allocator, data: []const u8, line_start: usize) error{OutOfMemory}![]u8 {
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
     var line_no = line_start;
@@ -395,7 +395,7 @@ fn toolRead(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8
 /// 把文本按"忽略行尾空白"归一化（借鉴 pi 的 normalizeForFuzzyMatch，仅用于诊断）。
 /// 返回归一化后的文本；调用者负责释放。失败时返回 null。
 fn normalizeForDiag(allocator: Allocator, text: []const u8) ?[]u8 {
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     var i: usize = 0;
     while (i < text.len) {
         const nl = std.mem.indexOfScalarPos(u8, text, i, '\n');
@@ -438,7 +438,7 @@ fn onlyWhitespaceDiff(a: []const u8, b: []const u8) bool {
 
 /// 把每个反斜杠连续段折叠成单个反斜杠（用于检测"转义层数"差异）
 fn collapseBackslashRuns(allocator: Allocator, line: []const u8) ?[]u8 {
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(allocator);
     var i: usize = 0;
     while (i < line.len) {
@@ -838,9 +838,9 @@ const LooseKind = enum { tail_ws, inner_ws, escape, indent };
 /// 返回 null = 分配失败。
 const NormMapped = struct { norm: []u8, map: []usize };
 fn normalizeWithMap(allocator: Allocator, text: []const u8, kind: LooseKind) ?NormMapped {
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(allocator);
-    var map = std.ArrayListUnmanaged(usize){ .items = &.{}, .capacity = 0 };
+    var map = std.ArrayListUnmanaged(usize).empty;
     defer map.deinit(allocator);
 
     var i: usize = 0;
@@ -1028,20 +1028,20 @@ fn toolEditMulti(
     defer diag_arena.deinit();
 
     const Applied = struct { start: usize, old_len: usize, new_text: []const u8, idx: usize };
-    var applied = std.ArrayListUnmanaged(Applied){ .items = &.{}, .capacity = 0 };
+    var applied = std.ArrayListUnmanaged(Applied).empty;
     defer applied.deinit(allocator);
 
     // CRLF 文件 + LF old_text 的适配（与旧单编辑路径行为一致）：
     // 若 data 含 CRLF 且某条 old_text 是 LF 形式，先转成 CRLF 再匹配
     const data_is_crlf = std.mem.indexOf(u8, data, "\r\n") != null;
-    var converted = std.ArrayListUnmanaged([]u8){ .items = &.{}, .capacity = 0 };
+    var converted = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (converted.items) |c| allocator.free(c);
         converted.deinit(allocator);
     }
 
     // 放宽级别使用记录（成功消息里给一行短标记；0 = 精确，不显示）
-    var loose_levels = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var loose_levels = std.ArrayListUnmanaged(u8).empty;
     defer loose_levels.deinit(allocator);
 
     for (edits, 0..) |item, i| {
@@ -1114,7 +1114,7 @@ fn toolEditMulti(
     }
 
     // 应用：按位置顺序拼接（已排序，直接一次遍历）
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(allocator);
     var cursor: usize = 0;
     for (applied.items) |a| {
@@ -1134,11 +1134,11 @@ fn toolEditMulti(
     const display = buildEditDiff(allocator, data, out.items) catch null;
     // 放宽标记：仅当有编辑走了非精确匹配时附一行短标记（正常路径零额外输出）。
     // 同一级别多次出现时合并为 "name×N"，避免重复占 token。
-    var loose_note = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var loose_note = std.ArrayListUnmanaged(u8).empty;
     defer loose_note.deinit(allocator);
     {
         // 统计各放宽级别出现次数（下标 = 级别；0 精确不记）
-        var counts = [_]usize{0} ** 5;
+        var counts: [5]usize = @splat(0);
         for (loose_levels.items) |lv| {
             if (lv > 0 and lv < counts.len) counts[lv] += 1;
         }
@@ -1169,7 +1169,7 @@ fn toolEditMulti(
 }
 
 fn crlf(allocator: Allocator, text: []const u8) error{OutOfMemory}![]u8 {
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     for (text) |c| {
         if (c == '\n') try out.append(allocator, '\r');
@@ -1217,9 +1217,9 @@ fn appendDiffElide(allocator: Allocator, out: *std.ArrayListUnmanaged(u8)) error
 
 /// 生成行号 diff 展示文本（上下文 3 行；`-` 删除 / `+` 新增）
 fn buildEditDiff(allocator: Allocator, old_text: []const u8, new_text: []const u8) error{OutOfMemory}![]u8 {
-    var old_lines = std.ArrayListUnmanaged([]const u8){ .items = &.{}, .capacity = 0 };
+    var old_lines = std.ArrayListUnmanaged([]const u8).empty;
     defer old_lines.deinit(allocator);
-    var new_lines = std.ArrayListUnmanaged([]const u8){ .items = &.{}, .capacity = 0 };
+    var new_lines = std.ArrayListUnmanaged([]const u8).empty;
     defer new_lines.deinit(allocator);
     try splitPlainLines(allocator, old_text, &old_lines);
     try splitPlainLines(allocator, new_text, &new_lines);
@@ -1234,7 +1234,7 @@ fn buildEditDiff(allocator: Allocator, old_text: []const u8, new_text: []const u
         std.mem.eql(u8, old_lines.items[old_lines.items.len - 1 - suffix], new_lines.items[new_lines.items.len - 1 - suffix])) : (suffix += 1)
     {}
 
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     var line_count: usize = 0;
     var truncated = false;
@@ -1497,7 +1497,7 @@ const pwsh_utf8_prefix = "try { [Console]::OutputEncoding=[System.Text.Encoding]
 
 /// 去除 ANSI 转义序列（CSI/OSC/双字符转义）：颜色码进入历史纯属浪费 token
 fn stripAnsiAlloc(allocator: Allocator, data: []const u8) error{OutOfMemory}![]u8 {
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     try out.ensureTotalCapacity(allocator, data.len);
 
@@ -1606,7 +1606,7 @@ fn toolBash(
     defer allocator.free(run_result.stdout);
     defer allocator.free(run_result.stderr);
 
-    var combined = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var combined = std.ArrayListUnmanaged(u8).empty;
     defer combined.deinit(allocator);
     try combined.appendSlice(allocator, run_result.stdout);
     if (run_result.stderr.len > 0) {
@@ -1617,7 +1617,7 @@ fn toolBash(
     }
 
     // 统一为 LF（PowerShell 输出 CRLF），并去掉裸 \r（进度条残留）
-    var normalized = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var normalized = std.ArrayListUnmanaged(u8).empty;
     defer normalized.deinit(allocator);
     {
         var idx: usize = 0;
@@ -1792,7 +1792,7 @@ fn walk(io: Io, allocator: Allocator, dir_abs: []const u8, rel_prefix: []const u
     defer dir.close(io);
 
     const Named = struct { name: []u8, kind: Io.File.Kind };
-    var entries = std.ArrayListUnmanaged(Named){ .items = &.{}, .capacity = 0 };
+    var entries = std.ArrayListUnmanaged(Named).empty;
     defer {
         for (entries.items) |e| allocator.free(e.name);
         entries.deinit(allocator);
@@ -1939,7 +1939,7 @@ const GrepArgs = struct {
 const LineRef = struct { start: usize, end: usize };
 
 fn splitLines(allocator: Allocator, data: []const u8) error{OutOfMemory}![]LineRef {
-    var list = std.ArrayListUnmanaged(LineRef){ .items = &.{}, .capacity = 0 };
+    var list = std.ArrayListUnmanaged(LineRef).empty;
     errdefer list.deinit(allocator);
     var i: usize = 0;
     // 仅按实际存在的行切分：以 '\n' 结尾的数据不会多出一个空的“幽灵行”，
@@ -2030,7 +2030,7 @@ const GrepCtx = struct {
 
         // 第一遍：收集匹配的行下标（受剩余配额约束）。多出一条即说明还有更多匹配。
         const budget = self.limit -| self.matches;
-        var match_lines = std.ArrayListUnmanaged(usize){ .items = &.{}, .capacity = 0 };
+        var match_lines = std.ArrayListUnmanaged(usize).empty;
         defer match_lines.deinit(self.allocator);
         for (lines, 0..) |line, li| {
             if (self.stop()) return;
@@ -2115,7 +2115,7 @@ fn toolGrep(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8
     }
     defer if (re) |*r| r.deinit();
 
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
 
     const single_file = !isDir(io, abs);
@@ -2219,7 +2219,7 @@ fn toolFind(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8
     }
 
     const limit: usize = if (args.limit > 0) @intCast(args.limit) else 1000;
-    var hits = std.ArrayListUnmanaged([]u8){ .items = &.{}, .capacity = 0 };
+    var hits = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (hits.items) |h| allocator.free(h);
         hits.deinit(allocator);
@@ -2236,7 +2236,7 @@ fn toolFind(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8
     const has_more = hits.items.len > limit;
     const shown = @min(hits.items.len, limit);
 
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     var written: usize = 0;
     var byte_capped = false;
@@ -2285,7 +2285,7 @@ fn lsRecurse(
     defer dir.close(io);
 
     const Named = struct { name: []u8, is_dir: bool };
-    var entries = std.ArrayListUnmanaged(Named){ .items = &.{}, .capacity = 0 };
+    var entries = std.ArrayListUnmanaged(Named).empty;
     defer {
         for (entries.items) |e| allocator.free(e.name);
         entries.deinit(allocator);
@@ -2345,7 +2345,7 @@ fn toolLs(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8) 
     // depth > 0：递归列出（相对路径，目录带 '/' 后缀）
     if (args.depth > 0) {
         const depth: u32 = @intCast(@min(args.depth, 32));
-        var paths = std.ArrayListUnmanaged([]u8){ .items = &.{}, .capacity = 0 };
+        var paths = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (paths.items) |p| allocator.free(p);
             paths.deinit(allocator);
@@ -2354,7 +2354,7 @@ fn toolLs(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8) 
         if (paths.items.len == 0) return ok(allocator, "(empty directory)", .{});
 
         const limit: usize = if (args.limit > 0) @intCast(args.limit) else 500;
-        var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+        var out = std.ArrayListUnmanaged(u8).empty;
         errdefer out.deinit(allocator);
         var shown: usize = 0;
         var byte_capped = false;
@@ -2382,7 +2382,7 @@ fn toolLs(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8) 
     defer dir.close(io);
 
     const Named = struct { name: []u8, is_dir: bool };
-    var entries = std.ArrayListUnmanaged(Named){ .items = &.{}, .capacity = 0 };
+    var entries = std.ArrayListUnmanaged(Named).empty;
     defer {
         for (entries.items) |e| allocator.free(e.name);
         entries.deinit(allocator);
@@ -2407,7 +2407,7 @@ fn toolLs(allocator: Allocator, io: Io, cwd: []const u8, args_json: []const u8) 
     }
 
     const limit: usize = if (args.limit > 0) @intCast(args.limit) else 500;
-    var out = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     var shown: usize = 0;
     var byte_capped = false;

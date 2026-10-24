@@ -115,7 +115,7 @@ fn pruneOldLogs(io: Io, allocator: Allocator, dir: []const u8, keep: usize) void
     var d = std.Io.Dir.openDirAbsolute(io, dir, .{ .iterate = true }) catch return;
     defer d.close(io);
 
-    var names = std.ArrayListUnmanaged([]u8){ .items = &.{}, .capacity = 0 };
+    var names = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (names.items) |n| allocator.free(n);
         names.deinit(allocator);
