@@ -13,6 +13,7 @@ const context_mod = @import("context.zig");
 const cli = @import("cli_args.zig");
 const Log = @import("log.zig");
 const paths = @import("paths.zig");
+const proxy = @import("proxy.zig");
 const display_mod = @import("display.zig");
 const model_table = @import("model_table.zig");
 
@@ -142,6 +143,11 @@ const SettingId = enum {
     compaction_retry,
     compaction_strip_thinking,
     fold_old_tool_outputs,
+    proxy_mode,
+    proxy_url,
+    proxy_ai,
+    proxy_web,
+    proxy_bash,
     restore_defaults,
 };
 
@@ -165,6 +171,12 @@ const settings_layout = [_]SettingsRow{
     .{ .id = .compaction_strip_thinking },
     .{ .group = "上下文" },
     .{ .id = .fold_old_tool_outputs },
+    .{ .group = "网络代理" },
+    .{ .id = .proxy_mode },
+    .{ .id = .proxy_url },
+    .{ .id = .proxy_ai },
+    .{ .id = .proxy_web },
+    .{ .id = .proxy_bash },
     .{ .group = "操作" },
     .{ .id = .restore_defaults },
 };
@@ -181,6 +193,11 @@ fn settingLabel(id: SettingId) []const u8 {
         .compaction_retry => "压缩失败重试",
         .compaction_strip_thinking => "压缩时剥离思考",
         .fold_old_tool_outputs => "旧工具输出折叠",
+        .proxy_mode => "代理来源",
+        .proxy_url => "代理地址",
+        .proxy_ai => "AI 请求经代理",
+        .proxy_web => "网页抓取经代理",
+        .proxy_bash => "终端命令经代理",
         .restore_defaults => "恢复默认设置",
     };
 }
@@ -221,11 +238,82 @@ fn settingValueText(state: *AppState, id: SettingId, buf: []u8) []const u8 {
         else
             "总是",
         .fold_old_tool_outputs => if (state.config.fold_old_tool_outputs) "开" else "关",
+        .proxy_mode => blk: {
+            if (state.config.proxy_mode.len == 0) break :blk "跟随环境变量";
+            if (std.mem.eql(u8, state.config.proxy_mode, "off")) break :blk "不使用";
+            if (std.mem.eql(u8, state.config.proxy_mode, "system")) {
+                if (state.proxy_system_display.len > 0)
+                    break :blk std.fmt.bufPrint(buf, "跟随系统（{s}）", .{state.proxy_system_display}) catch "跟随系统";
+                break :blk "跟随系统";
+            }
+            break :blk "自定义";
+        },
+        .proxy_url => if (state.config.proxy_url.len == 0) "（未设置）" else state.config.proxy_url,
+        .proxy_ai => if (state.config.proxy_for_ai) "开 ⚠" else "关",
+        .proxy_web => if (state.config.proxy_for_web) "开" else "关",
+        .proxy_bash => if (state.config.proxy_for_bash) "开" else "关",
         .restore_defaults => "Enter 确认",
     };
 }
 
 /// 设置页数字行（Enter 可键盘输入）
+/// 设置页可视窗口（滚动跟随）：选中行始终可见；为顶/底指示行预留空间。
+pub const SettingsWindow = struct {
+    start: usize,
+    count: usize,
+    more_above: bool,
+    more_below: bool,
+};
+
+pub fn settingsWindow(sel: usize, scroll_in: usize, avail_in: usize) SettingsWindow {
+    const n: usize = settings_layout.len;
+    const avail = @max(avail_in, 1);
+    var start: usize = @min(scroll_in, n -| 1);
+    var k: usize = 0;
+    while (k < 4) : (k += 1) {
+        var rows: usize = avail;
+        if (start > 0) rows -|= 1;
+        if (start + rows < n) rows -|= 1;
+        const count: usize = @max(rows, 1);
+        if (sel < start) {
+            start = sel;
+            continue;
+        }
+        if (sel >= start + count) {
+            start = sel + 1 - count;
+            continue;
+        }
+        break;
+    }
+    // 选中第一个可选项时把上方组标题一起露出来
+    //（否则最小滚动会把标题滚出视野，出现"第一项已选中却提示上面还有 1 项"）
+    const first_selectable = comptime blk: {
+        for (settings_layout, 0..) |r, i| {
+            if (r.id != null) break :blk i;
+        }
+        break :blk 0;
+    };
+    if (sel == first_selectable) start = 0;
+    var count: usize = avail;
+    if (start > 0) count -|= 1;
+    if (start + count < n) count -|= 1;
+    count = @max(count, 1);
+    return .{ .start = start, .count = count, .more_above = start > 0, .more_below = start + count < n };
+}
+
+fn isTextSetting(id: SettingId) bool {
+    return id == .proxy_url;
+}
+
+/// 设置页编辑允许字符（文本行 = URL 字符集；数字行 = 数字/./k/K/%）
+fn settingsCharAllowed(id: SettingId, c: u21) bool {
+    if (isTextSetting(id)) {
+        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or
+            c == ':' or c == '/' or c == '.' or c == '-' or c == '_' or c == '+' or c == '%' or c == '@' or c == '[';
+    }
+    return (c >= '0' and c <= '9') or c == '.' or c == 'k' or c == 'K' or c == '%';
+}
+
 fn isNumericSetting(id: SettingId) bool {
     return switch (id) {
         .max_output_tokens, .auto_compact_pct, .keep_recent_tokens => true,
@@ -540,6 +628,8 @@ const Message = struct {
     /// 定格后的思考耗时（毫秒；从数据库恢复时直接使用）
     reasoning_ms: i64 = 0,
     reasoning_expanded: bool = false,
+    /// 本轮思考是否已发生过"正文开始"的自动折叠（每消息一次；手动展开不受夺回）
+    thought_collapsed_once: bool = false,
     /// 来源数据库行 id（0 = 实时生成/内存消息）。窗口化按需重载的键。
     db_id: i64 = 0,
     /// 内容是否驻留内存（窗口化）：false 时 content/reasoning/md 已被卸载，
@@ -879,6 +969,10 @@ const StreamJob = struct {
     session_id: []const u8 = "",
     behavior: config_mod.Behavior = .{},
     environ_map: ?*const std.process.Environ.Map = null,
+    /// webfetch 专用环境（注入代理；null = 用 environ_map）
+    web_environ_map: ?*const std.process.Environ.Map = null,
+    /// AI 请求专用环境（注入代理；null = 用 environ_map）
+    ai_environ_map: ?*const std.process.Environ.Map = null,
     /// 数据库路径（工作线程实时落库/中途压缩时自建连接用；arena 所有，含终止符）
     db_path: [:0]const u8 = "",
     /// 会话的数字 id（worker 实时落库用；0 = 不落库，回退到 finalize 批量写）
@@ -968,6 +1062,15 @@ const AppState = struct {
     session_uuid_for: i64 = -1,
     /// 环境变量表（用于 HTTP_PROXY/HTTPS_PROXY）
     environ_map: ?*const std.process.Environ.Map = null,
+    /// 代理注入后的环境（null = 直连用 environ_map）
+    web_env: ?*std.process.Environ.Map = null,
+    ai_env: ?*std.process.Environ.Map = null,
+    bash_env: ?*std.process.Environ.Map = null,
+    /// 跟随系统时解析出的代理地址（设置页展示；空 = 未检测到）
+    proxy_system_display: []u8 = &.{},
+    /// 设置页滚动偏移（顶部行号）与最近一次绘制的可视行数（滚动跟随用）
+    settings_scroll: usize = 0,
+    settings_visible_rows: usize = 16,
 
     // 流式回复状态
     stream_status: std.atomic.Value(u8) = .init(@intFromEnum(StreamStatus.idle)),
@@ -1146,7 +1249,10 @@ const AppState = struct {
     /// 设置页数值行编辑（Enter 进入；数字/./k/% 输入，Enter 提交，Esc 取消）
     settings_edit: bool = false,
     settings_edit_len: usize = 0,
-    settings_edit_buf: [12]u8 = @splat(0),
+    settings_edit_buf: [96]u8 = @splat(0),
+    /// 编辑光标（0..settings_edit_len）与选区锚点（null = 无选区；选区 = min(anchor,cursor)..max）
+    settings_cursor: usize = 0,
+    settings_sel_anchor: ?usize = null,
 
     // 消息滚动状态
     /// 滚动锚点（锚点模型，取代旧的"距底部行数"）：视口首行所在的**全局**显示
@@ -1765,7 +1871,7 @@ const AppState = struct {
                 b.max_tokens = resolveMaxOutputTokens(&self.config, provider.preset, model);
                 break :blk b;
             },
-            .environ_map = self.environ_map,
+            .environ_map = self.aiEnviron(),
             .history = self.history.items,
             .counts_reasoning = countsReasoningFor(provider.preset, model),
             .keep_tokens = if (keep_tokens_override > 0) keep_tokens_override else self.keep_recent_tokens,
@@ -3287,6 +3393,7 @@ const AppState = struct {
     fn openSettings(self: *AppState, parent: ?Mode) void {
         self.settings_edit = false;
         self.settings_index = 0;
+        self.settings_scroll = 0;
         self.settingsMove(1); // 跳过组标题，定位到首个可选项
         self.menu_parent = parent;
         self.mode = .settings;
@@ -3305,25 +3412,57 @@ const AppState = struct {
             }
             if (settings_layout[i].id != null) {
                 self.settings_index = i;
+                self.settings_scroll = settingsWindow(i, self.settings_scroll, self.settings_visible_rows).start;
                 return;
             }
         }
     }
 
     fn handleSettingsKey(self: *AppState, key: tui.KeyEvent) void {
-        // 数值输入模式：只处理编辑键（Esc 取消；Enter 提交）
+        // 数值/文本输入模式：编辑键（Esc 取消；Enter 提交；Ctrl+A 全选）
         if (self.settings_edit) {
+            if (isCtrlA(key)) {
+                self.settings_sel_anchor = 0;
+                self.settings_cursor = self.settings_edit_len;
+                return;
+            }
             switch (key.code) {
-                .esc => self.settings_edit = false,
+                .esc => {
+                    self.settings_edit = false;
+                    self.settings_sel_anchor = null;
+                },
                 .enter => self.commitSettingsEdit(),
-                .backspace => if (self.settings_edit_len > 0) {
-                    self.settings_edit_len -= 1;
+                .backspace => {
+                    if (self.settingsSelRange()) |r| {
+                        self.settingsEditDeleteRange(r[0], r[1]);
+                    } else if (self.settings_cursor > 0) {
+                        self.settingsEditDeleteRange(self.settings_cursor - 1, self.settings_cursor);
+                    }
+                    self.settings_sel_anchor = null;
+                },
+                .delete => {
+                    if (self.settingsSelRange()) |r| {
+                        self.settingsEditDeleteRange(r[0], r[1]);
+                    } else if (self.settings_cursor < self.settings_edit_len) {
+                        self.settingsEditDeleteRange(self.settings_cursor, self.settings_cursor + 1);
+                    }
+                    self.settings_sel_anchor = null;
+                },
+                .left => self.settingsEditMove(-1),
+                .right => self.settingsEditMove(1),
+                .home => {
+                    self.settings_cursor = 0;
+                    self.settings_sel_anchor = null;
+                },
+                .end => {
+                    self.settings_cursor = self.settings_edit_len;
+                    self.settings_sel_anchor = null;
                 },
                 .char => |c| {
-                    const ok = (c >= '0' and c <= '9') or c == '.' or c == 'k' or c == 'K' or c == '%';
-                    if (ok and self.settings_edit_len < self.settings_edit_buf.len) {
-                        self.settings_edit_buf[self.settings_edit_len] = @intCast(c);
-                        self.settings_edit_len += 1;
+                    const id = if (settings_layout[self.settings_index].id) |x| x else .restore_defaults;
+                    if (settingsCharAllowed(id, c)) {
+                        const b = [_]u8{@intCast(c)};
+                        _ = self.settingsEditInsert(&b);
                     }
                 },
                 else => {},
@@ -3340,10 +3479,30 @@ const AppState = struct {
                         self.confirm_stage = 1;
                         self.confirm_yes = false;
                         self.mode = .settings_reset_confirm;
-                    } else if (isNumericSetting(id)) {
-                        // 数字行：Enter 进入键盘输入（←→ 仍走预设档位）
+                    } else if (isNumericSetting(id) or isTextSetting(id)) {
+                        // 数字/文本行：Enter 进入键盘输入（←→ 仍走预设档位）
                         self.settings_edit = true;
                         self.settings_edit_len = 0;
+                        self.settings_sel_anchor = null;
+                        // 文本行：预填当前值（光标在末尾），不提供全选——编辑基于现有内容
+                        if (isTextSetting(id)) {
+                            const cur = self.config.proxy_url;
+                            const n = @min(cur.len, self.settings_edit_buf.len);
+                            @memcpy(self.settings_edit_buf[0..n], cur[0..n]);
+                            self.settings_edit_len = n;
+                        } else if (isNumericSetting(id)) {
+                            // 数字行同样预填当前值（配合 Ctrl+A 可整体替换）
+                            const v: u64 = switch (id) {
+                                .max_output_tokens => self.config.max_output_tokens,
+                                .auto_compact_pct => self.config.auto_compact_pct,
+                                .keep_recent_tokens => self.config.keep_recent_tokens,
+                                else => 0,
+                            };
+                            const txt = std.fmt.bufPrint(&self.settings_edit_buf, "{d}", .{v}) catch "";
+                            self.settings_edit_len = txt.len;
+                        }
+                        self.settings_cursor = self.settings_edit_len;
+                        self.settings_sel_anchor = null;
                     } else {
                         self.cycleSetting(id);
                     }
@@ -3357,11 +3516,74 @@ const AppState = struct {
         }
     }
 
+    /// 设置页编辑态选区（null = 无）
+    fn settingsSelRange(self: *AppState) ?[2]usize {
+        const a = self.settings_sel_anchor orelse return null;
+        const c = self.settings_cursor;
+        if (a == c) return null;
+        return .{ @min(a, c), @max(a, c) };
+    }
+
+    fn settingsEditDeleteRange(self: *AppState, lo: usize, hi: usize) void {
+        const n = self.settings_edit_len;
+        if (lo >= hi or hi > n) return;
+        std.mem.copyForwards(u8, self.settings_edit_buf[lo .. n - (hi - lo)], self.settings_edit_buf[hi..n]);
+        self.settings_edit_len = n - (hi - lo);
+        self.settings_cursor = lo;
+    }
+
+    /// 在光标处插入（替换选区；96 字节上限截断，返回实际插入字节数）
+    fn settingsEditInsert(self: *AppState, text: []const u8) usize {
+        if (self.settingsSelRange()) |r| self.settingsEditDeleteRange(r[0], r[1]);
+        const room = self.settings_edit_buf.len - self.settings_edit_len;
+        const take = @min(room, text.len);
+        if (take > 0) {
+            const tail = self.settings_edit_buf[self.settings_cursor..self.settings_edit_len];
+            std.mem.copyBackwards(u8, self.settings_edit_buf[self.settings_cursor + take .. self.settings_edit_len + take], tail);
+            @memcpy(self.settings_edit_buf[self.settings_cursor .. self.settings_cursor + take], text[0..take]);
+            self.settings_edit_len += take;
+            self.settings_cursor += take;
+        }
+        self.settings_sel_anchor = null;
+        return take;
+    }
+
+    /// 光标左/右移（有选区先折叠到边缘）
+    fn settingsEditMove(self: *AppState, delta: i32) void {
+        if (self.settingsSelRange()) |r| {
+            self.settings_cursor = if (delta < 0) r[0] else r[1];
+            self.settings_sel_anchor = null;
+            return;
+        }
+        if (delta < 0) {
+            if (self.settings_cursor > 0) self.settings_cursor -= 1;
+        } else if (self.settings_cursor < self.settings_edit_len) {
+            self.settings_cursor += 1;
+        }
+    }
+
     /// 提交设置页数值输入（空/非法 → 取消不改；越界按各字段规则钳制）
     fn commitSettingsEdit(self: *AppState) void {
-        defer self.settings_edit = false;
+        defer {
+            self.settings_edit = false;
+            self.settings_sel_anchor = null;
+        }
         const id = settings_layout[self.settings_index].id orelse return;
         const raw = self.settings_edit_buf[0..self.settings_edit_len];
+        // 文本行（代理地址）：不进数值解析
+        if (id == .proxy_url) {
+            if (raw.len > 0) {
+                const normalized = proxy.normalizeCustom(self.allocator, raw) orelse {
+                    self.setToast("代理地址无效（示例：127.0.0.1:7890）");
+                    return;
+                };
+                self.allocator.free(normalized);
+            }
+            self.config.setProxyUrl(self.allocator, raw);
+            self.rebuildProxyEnv();
+            self.config.save(self.io, self.allocator);
+            return;
+        }
         const v = parseSettingNumber(raw) orelse return;
         switch (id) {
             .max_output_tokens => self.config.max_output_tokens = @intCast(@min(v, 4_000_000)),
@@ -3412,6 +3634,24 @@ const AppState = struct {
                 self.config.setCompactionStripThinking(a, nextInSteps([]const u8, &steps, self.config.compaction_strip_thinking));
             },
             .fold_old_tool_outputs => self.config.fold_old_tool_outputs = !self.config.fold_old_tool_outputs,
+            .proxy_mode => {
+                const steps = [_][]const u8{ "", "off", "system", "custom" };
+                self.config.setProxyMode(a, nextInSteps([]const u8, &steps, self.config.proxy_mode));
+                self.rebuildProxyEnv();
+            },
+            .proxy_url => {},
+            .proxy_ai => {
+                self.config.proxy_for_ai = !self.config.proxy_for_ai;
+                self.rebuildProxyEnv();
+            },
+            .proxy_web => {
+                self.config.proxy_for_web = !self.config.proxy_for_web;
+                self.rebuildProxyEnv();
+            },
+            .proxy_bash => {
+                self.config.proxy_for_bash = !self.config.proxy_for_bash;
+                self.rebuildProxyEnv();
+            },
             .restore_defaults => {},
         }
         self.config.save(self.io, self.allocator);
@@ -3440,7 +3680,7 @@ const AppState = struct {
                 b.max_tokens = resolveMaxOutputTokens(&self.config, provider.preset, model);
                 break :blk b;
             },
-            .environ_map = self.environ_map,
+            .environ_map = self.aiEnviron(),
             .counts_reasoning = countsReasoningFor(provider.preset, model),
             .keep_tokens = keep,
         };
@@ -4308,6 +4548,79 @@ const AppState = struct {
         self.mode = .session_select;
     }
 
+    // ── 代理环境映射（2026-10-24）──
+
+    fn webEnviron(self: *AppState) ?*const std.process.Environ.Map {
+        return if (self.web_env) |m| m else self.environ_map;
+    }
+
+    fn aiEnviron(self: *AppState) ?*const std.process.Environ.Map {
+        return if (self.ai_env) |m| m else self.environ_map;
+    }
+
+    fn bashEnviron(self: *AppState) ?*const std.process.Environ.Map {
+        return if (self.bash_env) |m| m else self.environ_map;
+    }
+
+    /// 按当前配置重建代理注入映射（设置变更/启动时调用）
+    fn rebuildProxyEnv(self: *AppState) void {
+        const a = self.allocator;
+        self.freeProxyEnv(&self.web_env);
+        self.freeProxyEnv(&self.ai_env);
+        self.freeProxyEnv(&self.bash_env);
+        const settings = self.config.proxySettings();
+        // 跟随系统时的展示文本（设置页）
+        if (self.proxy_system_display.len > 0) a.free(self.proxy_system_display);
+        self.proxy_system_display = &.{};
+        if (std.mem.eql(u8, settings.mode, "system")) {
+            if (proxy.resolveSystem(a, self.io)) |u| {
+                defer a.free(u);
+                self.proxy_system_display = std.fmt.allocPrint(a, "{s}", .{u}) catch &.{};
+            } else {
+                self.proxy_system_display = a.dupe(u8, "未检测到系统代理") catch &.{};
+            }
+        }
+        if (proxy.resolveFor(a, self.io, settings, .web, self.environ_map)) |url| {
+            defer a.free(url);
+            self.web_env = buildEnvWithProxy(a, self.environ_map, url) catch null;
+        }
+        if (proxy.resolveFor(a, self.io, settings, .ai, self.environ_map)) |url| {
+            defer a.free(url);
+            self.ai_env = buildEnvWithProxy(a, self.environ_map, url) catch null;
+        }
+        if (proxy.resolveFor(a, self.io, settings, .bash, self.environ_map)) |url| {
+            defer a.free(url);
+            self.bash_env = buildEnvWithProxy(a, self.environ_map, url) catch null;
+        }
+    }
+
+    fn freeProxyEnv(self: *AppState, slot: *?*std.process.Environ.Map) void {
+        if (slot.*) |m| {
+            m.deinit();
+            self.allocator.destroy(m);
+            slot.* = null;
+        }
+    }
+
+    fn buildEnvWithProxy(a: Allocator, base: ?*const std.process.Environ.Map, url: []const u8) !*std.process.Environ.Map {
+        const m = try a.create(std.process.Environ.Map);
+        errdefer a.destroy(m);
+        m.* = std.process.Environ.Map.init(a);
+        errdefer m.deinit();
+        if (base) |b| {
+            for (b.keys(), b.values()) |k, v| {
+                try m.put(k, v);
+            }
+        }
+        try m.put("HTTP_PROXY", url);
+        try m.put("HTTPS_PROXY", url);
+        try m.put("http_proxy", url);
+        try m.put("https_proxy", url);
+        try m.put("NO_PROXY", "localhost,127.0.0.1,::1");
+        try m.put("no_proxy", "localhost,127.0.0.1,::1");
+        return m;
+    }
+
     /// 每个 SkyNet 会话的稳定路由标识（网关的 x-opencode-session /
     /// OpenAI 的 prompt_cache_key 都用它做缓存亲和）。
     /// 由会话 id 确定性派生：跨重启、切换会话后回来都不变，保证服务端前缀缓存可复用。
@@ -4477,6 +4790,8 @@ const AppState = struct {
         job.compaction_retry = self.config.compaction_retry;
         job.compaction_strip_thinking = parseStripThinkingMode(self.config.compaction_strip_thinking);
         job.environ_map = self.environ_map;
+        job.web_environ_map = self.webEnviron();
+        job.ai_environ_map = self.aiEnviron();
         // worker 自建连接时用实际打开的库路径（测试/CLI 可能不是默认路径）
         const db_path: []const u8 = if (self.db) |*d| d.path else self.db_path;
         job.db_path = try arena.dupeSentinel(u8, db_path, 0);
@@ -4888,14 +5203,9 @@ const AppState = struct {
         }
         self.stream_mutex.unlock(self.io);
 
-        if (reasoning) |c| {
-            self.appendStreamReasoning(c);
-            self.allocator.free(c);
-        }
-        if (content) |c| {
-            self.appendStreamChunk(c);
-            self.allocator.free(c);
-        }
+        self.applyStreamFrame(reasoning, content);
+        if (reasoning) |c| self.allocator.free(c);
+        if (content) |c| self.allocator.free(c);
 
         // 2) 事件：回合结束 / 工具调用
         if (events.items.len > 0) {
@@ -5027,6 +5337,27 @@ const AppState = struct {
         }
     }
 
+    /// 应用一帧增量（可回放测试）：思考增量存在时**保持展开**；
+    /// 仅"纯正文帧"才折叠思考块。
+    /// 背景（2026-10-24 日志取证）：网关/代理会把多个 SSE chunk 缓冲后同帧到达，
+    /// 某些回合"首块思考"与"首块正文"毫秒级相同——旧实现先应用思考（展开）再应用
+    /// 正文（折叠），同帧内净效果 = 折叠且再也等不到 `first_reasoning`，思考全程不可见。
+    fn applyStreamFrame(self: *AppState, reasoning: ?[]const u8, content: ?[]const u8) void {
+        if (reasoning) |c| self.appendStreamReasoning(c);
+        if (content) |c| self.appendStreamChunk(c);
+        // 纯正文帧且尚未自动折叠过 → 折叠一次（"正文开始"信号）。
+        // 同帧混合（reasoning+content）不折叠：思考仍在流，以展开收尾。
+        if (content != null and reasoning == null) {
+            const idx = self.streaming_msg_idx orelse return;
+            if (idx >= self.messages.items.len) return;
+            const msg = &self.messages.items[idx];
+            if (msg.reasoning != null and !msg.thought_collapsed_once and msg.content.len > 0) {
+                msg.thought_collapsed_once = true;
+                setThoughtExpanded(self, idx, false, false);
+            }
+        }
+    }
+
     fn appendStreamChunk(self: *AppState, chunk: []const u8) void {
         const idx = self.ensureStreamingMessage() orelse return;
         const msg = &self.messages.items[idx];
@@ -5047,10 +5378,7 @@ const AppState = struct {
         if (msg.md) |old| md_mod.free(self.allocator, old);
         msg.md = md_mod.parse(self.allocator, joined, md_mod.default_styles) catch null;
 
-        // 思考结束（正文开始）：始终自动折叠（即使中途手动展开过）
-        if (first_content and msg.reasoning != null) {
-            setThoughtExpanded(self, idx, false, false);
-        }
+        // 思考块的折叠由 applyStreamFrame 按"纯正文帧"裁决（同帧混合时不折叠）
     }
 
     fn appendStreamReasoning(self: *AppState, chunk: []const u8) void {
@@ -5074,10 +5402,8 @@ const AppState = struct {
         if (old.len > 0) self.allocator.free(old);
         msg.reasoning = joined;
 
-        // 思考开始：展开，流式显示思考内容（思考结束后自动折叠）
-        if (first_reasoning) {
-            setThoughtExpanded(self, idx, true, false);
-        }
+        // 思考增量到达 = 仍在思考：保持展开（幂等；同帧含正文时也以展开收尾）
+        setThoughtExpanded(self, idx, true, false);
     }
 
     /// 收尾：join 线程、转录入历史、落库、清理共享状态（err 非空时显示错误）
@@ -5463,7 +5789,7 @@ const AppState = struct {
             .session_id = self.sessionUuid(),
             .behavior = config_mod.behavior(&p),
         });
-        client.environ_map = self.environ_map;
+        client.environ_map = self.aiEnviron();
         // 看门狗槽位：模型列表专用（菜单可在生成/压缩中打开，与流式请求可能并存；
         // 共用槽会互相覆盖句柄，故独立一套）
         client.watch_slot = .{
@@ -6030,6 +6356,12 @@ const AppState = struct {
         self.config.compaction_retry = d.compaction_retry;
         self.config.setCompactionStripThinking(a, d.compaction_strip_thinking);
         self.config.fold_old_tool_outputs = d.fold_old_tool_outputs;
+        self.config.setProxyMode(a, config_mod.Config.proxy_default_mode);
+        self.config.setProxyUrl(a, config_mod.Config.proxy_default_url);
+        self.config.proxy_for_ai = config_mod.Config.proxy_default_for_ai;
+        self.config.proxy_for_web = config_mod.Config.proxy_default_for_web;
+        self.config.proxy_for_bash = config_mod.Config.proxy_default_for_bash;
+        self.rebuildProxyEnv();
         // 本会话立即生效
         self.auto_compact_pct = self.config.auto_compact_pct;
         self.keep_recent_tokens = self.config.keep_recent_tokens;
@@ -7193,7 +7525,7 @@ fn compactJobHistory(job: *StreamJob, db: *db_mod.Db, force: bool, keep_override
         .session_id = &fresh_hex,
         .behavior = beh,
     });
-    client.environ_map = job.environ_map;
+    client.environ_map = job.ai_environ_map orelse job.environ_map;
     // 看门狗槽位：中途压缩在流 worker 内执行（主循环泵看门狗即可覆盖）
     client.watch_slot = .{
         .handle = &job.app.stream_watch_handle,
@@ -8533,6 +8865,7 @@ pub fn main(init: std.process.Init) !u8 {
         break :blk allocator.dupe(u8, z) catch &.{};
     };
     state.config.loadFile(io, allocator, tui_cfg_path_owned orelse "config.json", true);
+    state.rebuildProxyEnv();
     state.keep_recent_tokens = state.config.keep_recent_tokens; // 设置页：保留窗口默认值
     state.auto_compact_pct = state.config.auto_compact_pct; // 设置页：自动压缩阈值
     // 模糊宽度策略（①←≤…按 1 列还是 2 列）：必须在首次绘制前应用
@@ -8723,6 +9056,7 @@ pub fn main(init: std.process.Init) !u8 {
         // 坐标由各绘制函数写入 term_cursor_x/y（后绘制的叠加层覆盖主输入框的值）。
         const want_cursor = state.term_cursor_valid and switch (state.mode) {
             .normal, .provider_add, .session_rename, .cwd_edit => true,
+            .settings => state.settings_edit,
             else => false,
         };
         if (want_cursor != cursor_visible) {
@@ -8804,6 +9138,29 @@ fn handleTerminalEvent(state: *AppState, terminal: *Terminal, event: tui.Event) 
                     const inserted = insertPastedText(state.allocator, state.providerFormActiveInput(), text, form_sel_len);
                     if (inserted == 0 and text.len > 0) {
                         state.setToast("粘贴内容超过字段上限，已忽略");
+                    }
+                },
+                .settings => {
+                    if (state.settings_edit) {
+                        const id = if (settings_layout[state.settings_index].id) |x| x else .restore_defaults;
+                        var filtered: [96]u8 = undefined;
+                        var paste_text: []const u8 = text;
+                        if (!isTextSetting(id)) {
+                            // 数字行：粘贴按允许字符过滤（与键入同一白名单）
+                            var n: usize = 0;
+                            for (text) |ch| {
+                                if (settingsCharAllowed(id, ch)) {
+                                    if (n >= filtered.len) break;
+                                    filtered[n] = ch;
+                                    n += 1;
+                                }
+                            }
+                            paste_text = filtered[0..n];
+                        }
+                        const inserted = state.settingsEditInsert(paste_text);
+                        if (paste_text.len > 0 and inserted < paste_text.len) {
+                            state.setToast(if (inserted == 0) "粘贴内容超过字段上限（96 字节），已忽略" else "粘贴内容超过字段上限（96 字节），已截断");
+                        }
                     }
                 },
                 .session_rename, .cwd_edit => {
@@ -9693,7 +10050,7 @@ fn streamWorker(job: *StreamJob) void {
         .session_id = job.session_id,
         .behavior = job.behavior,
     });
-    client.environ_map = job.environ_map;
+    client.environ_map = job.ai_environ_map orelse job.environ_map;
     // 看门狗槽位：worker 暴露 socket 句柄/打点，主线程超时后唤醒阻塞读
     client.watch_slot = .{
         .handle = &app.stream_watch_handle,
@@ -9965,7 +10322,7 @@ fn streamWorker(job: *StreamJob) void {
                 // bash 超时/Ctrl+Q 的取消源（看门狗轮询）——仅对本次工具执行生效
                 tools_mod.bash_cancel_flag = &job.app.stream_cancel;
                 defer tools_mod.bash_cancel_flag = null;
-                break :blk2 tools_mod.executeWithEnv(arena, job.io, job.cwd, tc.name, tc.arguments, job.environ_map) catch |e| blk: {
+                break :blk2 tools_mod.executeWithEnv(arena, job.io, job.cwd, tc.name, tc.arguments, job.environ_map, job.web_environ_map) catch |e| blk: {
                     const msg = std.fmt.allocPrint(arena, "Tool execution failed: {s}", .{@errorName(e)}) catch "Tool execution failed";
                     break :blk tools_mod.Result{ .content = @constCast(msg), .is_error = true };
                 };
@@ -11624,8 +11981,19 @@ fn drawSettings(state: *AppState, area: Rect, buf: *Buffer) void {
     const inner = blk.inner(area);
     if (inner.height == 0 or inner.width == 0) return;
 
+    // 滚动窗口：可视内容高 = 面板内高 - 1（底部提示行）
+    state.settings_visible_rows = @max(inner.height -| 1, 1);
+    const win = settingsWindow(state.settings_index, state.settings_scroll, state.settings_visible_rows);
+    state.settings_scroll = win.start;
     var y = inner.y;
-    for (settings_layout, 0..) |row, i| {
+    if (win.more_above) {
+        var ab: [64]u8 = undefined;
+        const t = std.fmt.bufPrint(&ab, "▲ 上面还有 {d} 项", .{win.start}) catch "▲";
+        _ = drawTextAt(buf, inner.x + 1, y, t, .{ .fg = .dark_gray });
+        y += 1;
+    }
+    const end = @min(win.start + win.count, settings_layout.len);
+    for (settings_layout[win.start..end], win.start..) |row, i| {
         if (y >= inner.y + inner.height) break;
         if (row.id == null) {
             _ = drawTextAt(buf, inner.x + 1, y, row.group, .{ .fg = .dark_gray, .modifier = .{ .bold = true } });
@@ -11645,28 +12013,66 @@ fn drawSettings(state: *AppState, area: Rect, buf: *Buffer) void {
         }
         var x = inner.x;
         x = drawTextAt(buf, x, y, prefix, style);
+        const editing = state.settings_edit and is_selected;
+        // 编辑态（文本/数字行统一）：行不高亮（避免与字符选区冲突）；前缀青色作位置锚点，
+        // 值区只画选区白底；插入光标用**真实终端光标**（与"编辑提供商"表单一致，
+        // 终端原生闪烁，不冲突 IME）
+        if (editing) {
+            x = drawTextAt(buf, x, y, settingLabel(id), .{ .fg = .white });
+            const text = state.settings_edit_buf[0..state.settings_edit_len];
+            const sel = state.settingsSelRange();
+            const caret = state.settings_cursor;
+            var vw: u16 = @intCast(@min(tui.render.stringWidth(text), 0xFFFF));
+            if (caret >= state.settings_edit_len) vw += 1; // 末尾光标占一列
+            if (vw + 4 < inner.width) {
+                const vx: u16 = inner.x + inner.width - 2 - vw;
+                var cx = vx;
+                const sel_style: Style = .{ .fg = .black, .bg = .white };
+                var bi: usize = 0;
+                while (bi < text.len) {
+                    const n = std.unicode.utf8ByteSequenceLength(text[bi]) catch 1;
+                    const m = @min(n, text.len - bi);
+                    const in_sel = if (sel) |r| bi >= r[0] and bi < r[1] else false;
+                    const sty: Style = if (in_sel) sel_style else .{ .fg = .yellow };
+                    cx = drawTextAt(buf, cx, y, text[bi .. bi + m], sty);
+                    bi += m;
+                }
+                // 真实终端光标：落在光标字符处（末尾 = 文本之后一格）
+                const pre: []const u8 = text[0..caret];
+                const pre_w: u16 = @intCast(@min(tui.render.stringWidth(pre), 0xFFFF));
+                state.term_cursor_x = vx +| pre_w;
+                state.term_cursor_y = y;
+                state.term_cursor_valid = true;
+            }
+            y += 1;
+            continue;
+        }
         _ = drawTextAt(buf, x, y, settingLabel(id), style);
         var vb: [64]u8 = undefined;
-        const editing = state.settings_edit and is_selected;
-        const vt = if (editing)
-            std.fmt.bufPrint(&vb, "{s}_", .{state.settings_edit_buf[0..state.settings_edit_len]}) catch "_"
-        else
-            settingValueText(state, id, &vb);
+        const vt = settingValueText(state, id, &vb);
         // 右对齐按**显示宽度**（中文 1 字 3 字节但占 2 列；用字节长度会参差不齐）
         const vw: u16 = @intCast(@min(tui.render.stringWidth(vt), 0xFFFF));
-        const fits = if (editing) vw + 2 < inner.width else vw + 4 < inner.width;
+        const fits = vw + 4 < inner.width;
         if (vt.len > 0 and fits) {
             const vx: u16 = inner.x + inner.width - 2 - vw;
             _ = drawTextAt(buf, vx, y, vt, value_style);
         }
         y += 1;
     }
-    if (y < inner.y + inner.height) {
+    if (win.more_below and y < inner.y + inner.height) {
+        var bb: [64]u8 = undefined;
+        const t = std.fmt.bufPrint(&bb, "▼ 下面还有 {d} 项", .{settings_layout.len - end}) catch "▼";
+        _ = drawTextAt(buf, inner.x + 1, y, t, .{ .fg = .dark_gray });
+        y += 1;
+    }
+    // 提示行贴底（有空间时）
+    const hint_y = inner.y + inner.height - 1;
+    if (hint_y >= y) {
         const hint = if (state.settings_edit)
-            "输入数值：可带 k（20k、0.5k）或 %；Enter 确认 · Esc 取消 · Backspace 删除"
+            "Enter 提交 · Esc 取消 · Ctrl+A 全选 · Ctrl+V 粘贴 · ←→/Home/End 移动光标"
         else
-            "（←→/Enter 调整；数字行 Enter 可键盘输入、←→ 走预设档位）";
-        _ = drawTextAt(buf, inner.x + 1, y, hint, .{ .fg = .dark_gray });
+            "（←→/Enter 调整；文本行 Enter 编辑；↑↓ 滚动）";
+        _ = drawTextAt(buf, inner.x + 1, hint_y, hint, .{ .fg = .dark_gray });
     }
 }
 
@@ -12671,6 +13077,8 @@ test {
     _ = @import("regex.zig");
     _ = @import("textarea.zig");
     _ = @import("tools.zig");
+    _ = @import("html.zig");
+    _ = @import("web.zig");
     _ = @import("context.zig");
     _ = @import("cli_args.zig");
     _ = @import("log.zig");
@@ -15717,6 +16125,8 @@ test "设置页：打开/导航跳过组标题/循环与即时保存" {
     // 数值键盘输入：Enter 进入编辑，"75%" → 75；Esc 取消不改值
     state.handleSettingsKey(.{ .code = .enter });
     try std.testing.expect(state.settings_edit);
+    try std.testing.expectEqualStrings("70", state.settings_edit_buf[0..state.settings_edit_len]); // 预填
+    state.handleSettingsKey(.{ .code = .{ .char = 'a' }, .modifiers = .{ .ctrl = true } });
     for ("75%") |c| state.handleSettingsKey(.{ .code = .{ .char = c } });
     state.handleSettingsKey(.{ .code = .enter });
     try std.testing.expect(!state.settings_edit);
@@ -15729,25 +16139,30 @@ test "设置页：打开/导航跳过组标题/循环与即时保存" {
     // 保留窗口键盘输入："0.5k" → 500，且本会话立即生效
     state.settings_index = 6;
     state.handleSettingsKey(.{ .code = .enter });
+    state.handleSettingsKey(.{ .code = .{ .char = 'a' }, .modifiers = .{ .ctrl = true } });
     for ("0.5k") |c| state.handleSettingsKey(.{ .code = .{ .char = c } });
     state.handleSettingsKey(.{ .code = .enter });
     try std.testing.expectEqual(@as(usize, 500), state.config.keep_recent_tokens);
     try std.testing.expectEqual(@as(usize, 500), state.keep_recent_tokens);
 
     // 阈值钳制：输入 95% → 85（上限）；输入 1 → 50（下限）
+    // 数字行进入编辑时预填当前值 → 先 Ctrl+A 全选再用输入替换
     state.settings_index = 5;
     state.handleSettingsKey(.{ .code = .enter });
+    try std.testing.expectEqualStrings("75", state.settings_edit_buf[0..state.settings_edit_len]); // 上一段改成了 75
+    state.handleSettingsKey(.{ .code = .{ .char = 'a' }, .modifiers = .{ .ctrl = true } });
     for ("95%") |c| state.handleSettingsKey(.{ .code = .{ .char = c } });
     state.handleSettingsKey(.{ .code = .enter });
     try std.testing.expectEqual(@as(u64, 85), state.config.auto_compact_pct);
     state.handleSettingsKey(.{ .code = .enter });
+    state.handleSettingsKey(.{ .code = .{ .char = 'a' }, .modifiers = .{ .ctrl = true } });
     for ("1") |c| state.handleSettingsKey(.{ .code = .{ .char = c } });
     state.handleSettingsKey(.{ .code = .enter });
     try std.testing.expectEqual(@as(u64, 50), state.config.auto_compact_pct);
 
     // 恢复默认：两关确认 → 全部回默认
-    state.settings_index = 14;
-    try std.testing.expectEqual(SettingId.restore_defaults, settings_layout[14].id.?);
+    state.settings_index = 20;
+    try std.testing.expectEqual(SettingId.restore_defaults, settings_layout[20].id.?);
     state.handleSettingsKey(.{ .code = .enter });
     try std.testing.expectEqual(Mode.settings_reset_confirm, state.mode);
     try std.testing.expectEqual(@as(u8, 1), state.confirm_stage);
@@ -15762,11 +16177,17 @@ test "设置页：打开/导航跳过组标题/循环与即时保存" {
     try std.testing.expectEqual(@as(usize, 20_000), state.keep_recent_tokens);
     try std.testing.expect(!state.config.fold_old_tool_outputs);
     try std.testing.expect(state.config.auto_compact);
+    // 代理默认值（2026-10-24 定稿）：不使用 + 预填地址 + 网页/终端开、AI 关
+    try std.testing.expectEqualStrings("off", state.config.proxy_mode);
+    try std.testing.expectEqualStrings("127.0.0.1:7890", state.config.proxy_url);
+    try std.testing.expect(!state.config.proxy_for_ai);
+    try std.testing.expect(state.config.proxy_for_web);
+    try std.testing.expect(state.config.proxy_for_bash);
 
     // 导航 wrap 且跳过组标题
     state.settings_index = 1;
     state.settingsMove(-1);
-    try std.testing.expectEqual(@as(usize, 14), state.settings_index);
+    try std.testing.expectEqual(@as(usize, 20), state.settings_index);
     state.settingsMove(1);
     try std.testing.expectEqual(@as(usize, 1), state.settings_index);
 
@@ -15776,10 +16197,202 @@ test "设置页：打开/导航跳过组标题/循环与即时保存" {
     try std.testing.expectEqual(Mode.help_select, state.menu_parent.?);
     state.handleSettingsKey(.{ .code = .esc });
     try std.testing.expectEqual(Mode.help_select, state.mode);
-
     // 帮助菜单再 Esc → 回主界面
     state.handleHelpSelectKey(.{ .code = .esc });
     try std.testing.expectEqual(Mode.normal, state.mode);
+}
+
+test "流式显示：思考首块自动展开；正文到达自动折叠（回放）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    defer state.messages.deinit(std.testing.allocator);
+    state.message_wrap_width = 40;
+
+    try state.messages.append(std.testing.allocator, .{ .content = "", .style = .{ .fg = .white } });
+    state.streaming_msg_idx = 0;
+
+    state.applyStreamFrame("先想一下", null);
+    try std.testing.expect(state.messages.items[0].reasoning != null);
+    try std.testing.expect(state.messages.items[0].reasoning_expanded);
+    state.applyStreamFrame("，再想一下", null);
+    try std.testing.expect(state.messages.items[0].reasoning_expanded);
+
+    // 同帧混合：思考尾段与正文首段合并到达 → 不折叠（修复 2026-10-24 间歇性折叠）
+    state.applyStreamFrame("最后想想", "正文到了");
+    try std.testing.expect(state.messages.items[0].reasoning_expanded);
+
+    // 之后纯正文帧 → 折叠一次
+    state.applyStreamFrame(null, "更多正文");
+    try std.testing.expect(!state.messages.items[0].reasoning_expanded);
+    defer {
+        const m = state.messages.items[0];
+        if (m.content.len > 0) std.testing.allocator.free(m.content);
+        if (m.reasoning) |r| std.testing.allocator.free(r);
+        if (m.md) |md| md_mod.free(std.testing.allocator, md);
+    }
+}
+
+test "设置页绘制：编辑态文本行不崩溃（回归：cx 累加溢出）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    defer state.config.deinit(std.testing.allocator);
+    std.Io.Dir.cwd().deleteFile(io, "tmp/test_settings_config.json") catch {};
+    state.config.loadFile(io, std.testing.allocator, "tmp/test_settings_config.json", false);
+
+    var buf = try tui.render.Buffer.init(std.testing.allocator, 62, 30);
+    defer buf.deinit();
+    const area = Rect{ .x = 0, .y = 0, .width = 62, .height = 30 };
+
+    // 选中代理地址行并进入编辑态（预填 + 光标）→ 绘制（曾经在长文本/窄面板下 u16 溢出）
+    state.mode = .settings;
+    state.settings_index = 15;
+    state.settings_edit = true;
+    const url = "http://127.0.0.1:7890/very/long/path/segment";
+    const n = @min(url.len, state.settings_edit_buf.len);
+    @memcpy(state.settings_edit_buf[0..n], url[0..n]);
+    state.settings_edit_len = n;
+    state.settings_cursor = n;
+    state.settings_sel_anchor = 0; // 全选
+    drawSettings(&state, area, &buf);
+
+    // 窄面板（值区放不下）也不崩溃
+    var buf2 = try tui.render.Buffer.init(std.testing.allocator, 30, 24);
+    defer buf2.deinit();
+    const area2 = Rect{ .x = 0, .y = 0, .width = 30, .height = 24 };
+    drawSettings(&state, area2, &buf2);
+}
+
+test "设置页：滚动窗口（选中跟随 / 上下指示）" {
+    // 顶部：不滚动；底部有更多
+    const w0 = settingsWindow(1, 0, 10);
+    try std.testing.expectEqual(@as(usize, 0), w0.start);
+    try std.testing.expect(!w0.more_above);
+    try std.testing.expect(w0.more_below);
+    // 选中超出 → 最小滚动使选中可见
+    const w1 = settingsWindow(15, 0, 10);
+    try std.testing.expect(w1.more_above);
+    try std.testing.expect(w1.start + w1.count > 15);
+    // 末尾：无底部指示
+    const n = settings_layout.len;
+    const w2 = settingsWindow(n - 1, 0, 10);
+    try std.testing.expect(!w2.more_below);
+    try std.testing.expect(w2.start + w2.count >= n);
+    // 向上移动回顶部区域时滚动收缩
+    const w3 = settingsWindow(2, w2.start, 10);
+    try std.testing.expectEqual(@as(usize, 2), w3.start);
+    // 选中第一项时窗口归零（组标题一并露出，不再提示"上面还有 1 项"）
+    const w4 = settingsWindow(1, 5, 10);
+    try std.testing.expectEqual(@as(usize, 0), w4.start);
+    try std.testing.expect(!w4.more_above);
+}
+
+test "设置页：代理行（来源循环 / 地址编辑提交 / 三开关）" {
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(std.testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+
+    var state = AppState{};
+    state.io = io;
+    state.allocator = std.testing.allocator;
+    defer state.config.deinit(std.testing.allocator);
+    defer {
+        if (state.web_env) |m| {
+            m.deinit();
+            std.testing.allocator.destroy(m);
+        }
+        if (state.ai_env) |m| {
+            m.deinit();
+            std.testing.allocator.destroy(m);
+        }
+        if (state.bash_env) |m| {
+            m.deinit();
+            std.testing.allocator.destroy(m);
+        }
+        if (state.proxy_system_display.len > 0) std.testing.allocator.free(state.proxy_system_display);
+    }
+    std.Io.Dir.cwd().deleteFile(io, "tmp/test_settings_config.json") catch {};
+    state.config.loadFile(io, std.testing.allocator, "tmp/test_settings_config.json", false);
+
+    state.openSettings(null);
+
+    // 来源（缺失配置 → 默认 off）：off → system → custom → ""
+    state.settings_index = 14;
+    try std.testing.expectEqual(SettingId.proxy_mode, settings_layout[14].id.?);
+    try std.testing.expectEqualStrings("off", state.config.proxy_mode); // 默认值
+    state.handleSettingsKey(.{ .code = .enter }); // → system
+    try std.testing.expectEqualStrings("system", state.config.proxy_mode);
+    state.handleSettingsKey(.{ .code = .enter }); // → custom
+    try std.testing.expectEqualStrings("custom", state.config.proxy_mode);
+    state.handleSettingsKey(.{ .code = .enter }); // → ""（跟随环境变量）
+    try std.testing.expectEqualStrings("", state.config.proxy_mode);
+    state.handleSettingsKey(.{ .code = .enter }); // → 回到 off
+    try std.testing.expectEqualStrings("off", state.config.proxy_mode);
+
+    // 地址：Enter 编辑（预填当前值 = 默认地址）→ Ctrl+A → 输入 → Enter 提交
+    state.settings_index = 15;
+    try std.testing.expectEqual(SettingId.proxy_url, settings_layout[15].id.?);
+    state.handleSettingsKey(.{ .code = .enter });
+    try std.testing.expectEqualStrings("127.0.0.1:7890", state.settings_edit_buf[0..state.settings_edit_len]);
+    state.handleSettingsKey(.{ .code = .{ .char = 'a' }, .modifiers = .{ .ctrl = true } });
+    for ("127.0.0.1:7890") |c| state.handleSettingsKey(.{ .code = .{ .char = c } });
+    state.handleSettingsKey(.{ .code = .enter });
+    try std.testing.expectEqualStrings("127.0.0.1:7890", state.config.proxy_url);
+
+    // 再次 Enter 编辑：预填现有值（不清空、不默认全选，光标在末尾）
+    state.handleSettingsKey(.{ .code = .enter });
+    try std.testing.expectEqualStrings("127.0.0.1:7890", state.settings_edit_buf[0..state.settings_edit_len]);
+    state.handleSettingsKey(.{ .code = .esc });
+
+    // 编辑态：Ctrl+A 全选 → 粘贴替换 → Enter 提交
+    state.handleSettingsKey(.{ .code = .enter }); // 进入编辑
+    state.handleSettingsKey(.{ .code = .{ .char = 'a' }, .modifiers = .{ .ctrl = true } });
+    try std.testing.expectEqual(@as(?usize, 0), state.settings_sel_anchor);
+    try std.testing.expectEqual(@as(usize, state.settings_edit_len), state.settings_cursor);
+    try std.testing.expectEqual(@as(usize, 12), state.settingsEditInsert("9.9.9.9:1234")); // 全选替换后插入 12 字节
+    state.handleSettingsKey(.{ .code = .enter });
+    try std.testing.expectEqualStrings("9.9.9.9:1234", state.config.proxy_url);
+    // 光标移动 + Delete
+    state.handleSettingsKey(.{ .code = .enter }); // 再进入（预填 9.9.9.9:1234）
+    state.handleSettingsKey(.{ .code = .home });
+    state.handleSettingsKey(.{ .code = .delete });
+    state.handleSettingsKey(.{ .code = .enter });
+    try std.testing.expectEqualStrings(".9.9.9:1234", state.config.proxy_url);
+
+    // 三开关
+    state.settings_index = 16;
+    state.handleSettingsKey(.{ .code = .left }); // off → on
+    try std.testing.expect(state.config.proxy_for_ai);
+    state.handleSettingsKey(.{ .code = .left }); // → off
+    try std.testing.expect(!state.config.proxy_for_ai);
+    state.settings_index = 17;
+    try std.testing.expect(state.config.proxy_for_web); // 默认开
+    state.handleSettingsKey(.{ .code = .left }); // → 关
+    try std.testing.expect(!state.config.proxy_for_web);
+    state.handleSettingsKey(.{ .code = .left }); // → 开
+    try std.testing.expect(state.config.proxy_for_web);
+    state.settings_index = 18;
+    try std.testing.expect(state.config.proxy_for_bash); // 默认开
+    state.handleSettingsKey(.{ .code = .left }); // → 关
+    try std.testing.expect(!state.config.proxy_for_bash);
+
+    // 持久化落盘（tmp/）
+    const saved = std.Io.Dir.cwd().readFileAlloc(io, "tmp/test_settings_config.json", std.testing.allocator, .limited(1 << 20)) catch "";
+    defer if (saved.len > 0) std.testing.allocator.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"proxy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, ".9.9.9:1234") != null); // 编辑后的最终值已落盘
 }
 
 test "思考块 auto（硬编码）：思考时展开，正文开始时折叠" {
@@ -15807,14 +16420,18 @@ test "思考块 auto（硬编码）：思考时展开，正文开始时折叠" {
     toggleThought(&state, 0);
     try std.testing.expect(state.messages.items[0].reasoning_expanded);
 
-    // 正文开始：思考结束 → 折叠（即使中途手动展开过）
-    state.appendStreamChunk("正文来了");
+    // 同帧混合（思考+正文一起到，网关缓冲的典型形态）：保持展开
+    state.applyStreamFrame("最后一段思考", "首帧正文");
+    try std.testing.expect(state.messages.items[0].reasoning_expanded);
+
+    // 下一帧纯正文：思考结束 → 折叠（即使中途手动展开过）
+    state.applyStreamFrame(null, "正文来了");
     try std.testing.expect(!state.messages.items[0].reasoning_expanded);
 
     // 折叠发生在思考结束时，此后手动展开保持不被夺回
     toggleThought(&state, 0);
     try std.testing.expect(state.messages.items[0].reasoning_expanded);
-    state.appendStreamChunk("更多正文");
+    state.applyStreamFrame(null, "更多正文");
     try std.testing.expect(state.messages.items[0].reasoning_expanded);
 }
 

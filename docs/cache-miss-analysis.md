@@ -137,3 +137,45 @@
    工具密集会话若每回合都折叠，需评估“省 vs 赔”（选项：更大批/更低频/接近压缩阈值才折）。
 5. 诊断日志（`[cache] 请求指纹` / `响应 ... endpoint=` / `[fold] 首折 idx`）继续保留，
    后续如有新的 miss 模式可继续按判定表定因。
+
+## 2026-10-24 复查：折叠关闭后的 0% 闪变 + 会话亲和机制核对
+
+背景：fold_old_tool_outputs 已关闭，仍偶见 `缓存 0/226.6k 0%`。
+样本：当日 3 份运行日志（28 次请求，2 次应用重启）。
+
+### 数据（全部定因）
+
+- **前缀指纹零漂移**：28 次请求的 `h4k/h16k/h64k/h256k` 四个偏移哈希完全一致
+  （`bfcd39982ecb2c6a / 7ada6067ce177a5e / 2d96be07df0fcdec / 27b90c2198223e47`），
+  唯一 0% 事件的**前后两条请求指纹也完全相同** → 无上下文漂移（判定表"模式 A：网关侧"）。
+- 该 0% 事件：`in=226668 cached=0`（用户看到的 0/226.6k），下一发 10586ms 后 `cached=226432`（99%）恢复。
+- miss 率 ≈ 1/28 ≈ 3.5%，与历史（折叠开启时）2~3% 持平——**折叠不是 miss 的主因**，
+  关闭后频率不变，符合此前"模式 A 占绝对主导"的结论。
+- **跨重启复用已验证**：14:58 启动后的首个请求 `cached=131584/211736 = 62%`
+  （同一会话 UUID → 上次运行的前缀缓存直接复用），亲和键有效。
+
+### 新情况
+
+- **`endpoint=` 全空**：网关响应不再携带 `x-opencode-endpoint-id` 头
+  （我们的解析 `copyHeaderValue(... "x-opencode-endpoint-id")` 完好，非迁移回归）——
+  今后模式 A 的判定主要靠"指纹不变 + 下一发恢复"模式。
+
+### 会话亲和机制核对（与 pi / opencode 对照）
+
+我们的实现（已全部到位）：
+
+| 层 | 值 | 说明 |
+|---|---|---|
+| 路由标识 | `sessionUuid()` = SHA256("skynet:session:{id}") 的 UUID 格式 | 确定性派生，跨重启/切回不变 |
+| body | `prompt_cache_key` = 钳制 64 字符 | 与 opencode/pi 同为 64 上限；`prompt_cache_retention: 24h`（retention=.long 时） |
+| opencode 网关方言 | `x-opencode-session` + `x-opencode-client: skynet` | zen 端点自动启用 |
+| openai 方言 | `session_id` + `x-client-request-id` + `x-session-affinity` | pi 的同组头（pi 另发 `x-session-id`，仅在其 sendSessionAffinityHeaders 兼容位开启时；对网关无影响）|
+| openrouter / fireworks | `x-session-id` / `x-session-affinity` | |
+
+结论：**会话 id 机制无缺口**，与 pi（4 头 + 64 钳制 cache key）和 opencode（protocol 层
+`promptCacheKey` + 64 钳制）等价；今日样本中跨重启 62% 首请求即为此机制的实证。
+
+### 处置
+
+- 不改代码：剩余 0% = 网关节点抖动/淘汰，本地无消除手段；展示仍遵循"纯服务端真实值"。
+- 排查同类问题的快捷流程不变：`[cache] 请求指纹` 跨请求比对 + 下一发是否恢复。

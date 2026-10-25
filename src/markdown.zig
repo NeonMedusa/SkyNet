@@ -184,6 +184,20 @@ pub fn parse(allocator: Allocator, content: []const u8, styles: Styles) ![]Line 
         }
     }
 
+    // 开头空行同理裁掉（2026-10-24：流式过渡块常把 "\n"/"\n\n" 塞进正文开头，
+    // 与"思考块与正文之间空一行"的设计叠加 → 间距 3 行）。空行无分配，直接前移裁掉。
+    var lead: usize = 0;
+    while (lead < items.items.len) {
+        const first = items.items[lead];
+        if (first.kind == .normal and first.runs.len == 0 and first.table == null and first.owned_text == null) {
+            lead += 1;
+        } else break;
+    }
+    if (lead > 0) {
+        std.mem.copyForwards(Line, items.items[0 .. items.items.len - lead], items.items[lead..]);
+        items.items.len -= lead;
+    }
+
     return try items.toOwnedSlice(allocator);
 }
 
@@ -1249,4 +1263,20 @@ test "末尾空行裁剪：尾随换行不产生多余空行，中间空行保�
     const l5 = try parse(testing.allocator, c5, default_styles);
     defer free(testing.allocator, l5);
     try testing.expectEqual(@as(usize, 1), l5.len);
+}
+
+
+test "首尾空行裁剪：正文内部保留" {
+    const md = try parse(std.testing.allocator, "\n\n正文\n\n段落二\n\n", default_styles);
+    defer free(std.testing.allocator, md);
+    try std.testing.expectEqual(@as(usize, 3), md.len); // 正文 / 空行 / 段落二
+    try std.testing.expect(md[0].runs.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), md[1].runs.len);
+    try std.testing.expect(md[2].runs.len > 0);
+}
+
+test "首尾空行裁剪：全空内容 → 0 行" {
+    const md = try parse(std.testing.allocator, "\n\n\n", default_styles);
+    defer free(std.testing.allocator, md);
+    try std.testing.expectEqual(@as(usize, 0), md.len);
 }

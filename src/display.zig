@@ -111,6 +111,11 @@ pub fn formatToolCallLine(arena: Allocator, name: []const u8, args_json: []const
         if (path.len == 0) return "→ List .";
         return std.fmt.allocPrint(arena, "→ List {s}", .{path}) catch "→ List";
     }
+    if (std.mem.eql(u8, name, "webfetch")) {
+        const url = extractJsonString(arena, args_json, "url") orelse "";
+        if (url.len == 0) return "⇣ WebFetch";
+        return std.fmt.allocPrint(arena, "⇣ WebFetch {s}", .{url}) catch "⇣ WebFetch";
+    }
     if (std.mem.eql(u8, name, "write")) {
         const path = extractJsonString(arena, args_json, "path") orelse return "→ Write";
         const content = extractJsonString(arena, args_json, "content") orelse "";

@@ -1,4 +1,5 @@
 const std = @import("std");
+const proxy = @import("proxy.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -280,6 +281,16 @@ const ConfigJson = struct {
     compaction_retry: ?bool = null,
     compaction_strip_thinking: []const u8 = "",
     fold_old_tool_outputs: ?bool = null,
+    /// 代理（2026-10-24）：缺省 = 未配置（环境变量回退）
+    proxy: ?ProxyJson = null,
+};
+
+const ProxyJson = struct {
+    mode: []const u8 = "",
+    url: []const u8 = "",
+    for_ai: ?bool = null,
+    for_web: ?bool = null,
+    for_bash: ?bool = null,
 };
 
 const ThinkingByModelJson = struct {
@@ -358,6 +369,14 @@ const SaveModelOverride = struct {
     efforts: ?[]const []const u8 = null,
 };
 
+const SaveProxy = struct {
+    mode: []const u8 = "",
+    url: []const u8 = "",
+    for_ai: bool = false,
+    for_web: bool = false,
+    for_bash: bool = false,
+};
+
 const SaveConfig = struct {
     providers: []const SaveProvider,
     current: SaveCurrent,
@@ -376,6 +395,7 @@ const SaveConfig = struct {
     compaction_retry: bool = true,
     compaction_strip_thinking: ?[]const u8 = null,
     fold_old_tool_outputs: bool = false,
+    proxy: ?SaveProxy = null,
 };
 
 fn dupeOptional(allocator: Allocator, s: []const u8) ![]u8 {
@@ -463,6 +483,14 @@ pub const Config = struct {
     compaction_strip_thinking: []u8 = &.{},
     /// 旧工具输出折叠开关（默认关：折叠会改历史 → 前缀缓存命中频繁归零；2026-10-14 用户定）
     fold_old_tool_outputs: bool = false,
+    /// 代理来源（"" = 跟随环境变量 / off / system / custom；加载时应用默认值）
+    proxy_mode: []const u8 = "",
+    /// 自定义代理地址（mode=custom 时生效；可省略 http:// 前缀，自动补全）
+    proxy_url: []const u8 = "",
+    /// 三个消费方开关
+    proxy_for_ai: bool = false,
+    proxy_for_web: bool = false,
+    proxy_for_bash: bool = false,
     /// 用户宽度覆盖名单（原始字符串，启动时解析；格式见 README）
     width_overrides_wide: []u8 = &.{},
     width_overrides_narrow: []u8 = &.{},
@@ -572,6 +600,7 @@ pub const Config = struct {
         self.setSavePath(allocator, path);
         const dir = Io.Dir.cwd();
         const content = dir.readFileAlloc(io, path, allocator, .limited(1 << 20)) catch {
+            self.applyProxyDefaults(allocator);
             if (generate_if_missing) self.save(io, allocator);
             return;
         };
@@ -607,6 +636,16 @@ pub const Config = struct {
         if (v.compaction_retry) |b| self.compaction_retry = b;
         if (v.compaction_strip_thinking.len > 0) self.setCompactionStripThinking(allocator, v.compaction_strip_thinking);
         if (v.fold_old_tool_outputs) |b| self.fold_old_tool_outputs = b;
+
+        if (v.proxy) |pj| {
+            if (pj.mode.len > 0) self.setProxyMode(allocator, pj.mode);
+            if (pj.url.len > 0) self.setProxyUrl(allocator, pj.url);
+            if (pj.for_ai) |b| self.proxy_for_ai = b;
+            if (pj.for_web) |b| self.proxy_for_web = b;
+            if (pj.for_bash) |b| self.proxy_for_bash = b;
+        } else {
+            self.applyProxyDefaults(allocator);
+        }
 
         for (v.providers) |pj| {
             if (pj.endpoint.len == 0) continue;
@@ -717,6 +756,48 @@ pub const Config = struct {
         const copy = allocator.dupe(u8, value) catch return;
         allocator.free(self.interleaved_mode);
         self.interleaved_mode = copy;
+    }
+
+    // 代理默认值（2026-10-24 定稿）：不使用 + 预填地址 + 网页/终端开、AI 关。
+    // 注意：字段默认必须是空串（deinit/setter 会 free 旧值；非空字面量会被误 free）。
+    pub const proxy_default_mode = "off";
+    pub const proxy_default_url = "127.0.0.1:7890";
+    pub const proxy_default_for_ai = false;
+    pub const proxy_default_for_web = true;
+    pub const proxy_default_for_bash = true;
+
+    /// 应用代理默认值（加载时缺段 / 恢复默认时调用；setter 会 dupe，安全）
+    pub fn applyProxyDefaults(self: *Config, allocator: Allocator) void {
+        self.setProxyMode(allocator, proxy_default_mode);
+        self.setProxyUrl(allocator, proxy_default_url);
+        self.proxy_for_ai = proxy_default_for_ai;
+        self.proxy_for_web = proxy_default_for_web;
+        self.proxy_for_bash = proxy_default_for_bash;
+    }
+
+    /// 设置代理来源（""/off/system/custom）
+    pub fn setProxyMode(self: *Config, allocator: Allocator, value: []const u8) void {
+        const copy = allocator.dupe(u8, value) catch return;
+        allocator.free(self.proxy_mode);
+        self.proxy_mode = copy;
+    }
+
+    /// 设置自定义代理地址
+    pub fn setProxyUrl(self: *Config, allocator: Allocator, value: []const u8) void {
+        const copy = allocator.dupe(u8, value) catch return;
+        allocator.free(self.proxy_url);
+        self.proxy_url = copy;
+    }
+
+    /// 代理设置视图（供 proxy.resolveFor 使用）
+    pub fn proxySettings(self: *const Config) proxy.Settings {
+        return .{
+            .mode = self.proxy_mode,
+            .url = self.proxy_url,
+            .for_ai = self.proxy_for_ai,
+            .for_web = self.proxy_for_web,
+            .for_bash = self.proxy_for_bash,
+        };
     }
 
     /// 设置压缩时思考档（""/follow/off/low/medium/high/max；未知值按 follow 处理）
@@ -893,6 +974,17 @@ pub const Config = struct {
             .compaction_retry = self.compaction_retry,
             .compaction_strip_thinking = if (self.compaction_strip_thinking.len > 0) self.compaction_strip_thinking else null,
             .fold_old_tool_outputs = self.fold_old_tool_outputs,
+        .proxy = if (self.proxy_mode.len > 0 or self.proxy_url.len > 0 or
+            self.proxy_for_ai or self.proxy_for_web or self.proxy_for_bash)
+            SaveProxy{
+                .mode = self.proxy_mode,
+                .url = self.proxy_url,
+                .for_ai = self.proxy_for_ai,
+                .for_web = self.proxy_for_web,
+                .for_bash = self.proxy_for_bash,
+            }
+        else
+            null,
             .width_overrides = if (self.width_overrides_wide.len > 0 or self.width_overrides_narrow.len > 0)
                 .{
                     .wide = if (self.width_overrides_wide.len > 0) self.width_overrides_wide else null,
@@ -948,6 +1040,8 @@ pub const Config = struct {
         for (self.model_overrides.values()) |*v| v.deinit(allocator);
         self.model_overrides.deinit(allocator);
         self.model_overrides = .empty;
+        allocator.free(self.proxy_mode);
+        allocator.free(self.proxy_url);
     }
 };
 

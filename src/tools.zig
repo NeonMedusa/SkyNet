@@ -4,6 +4,8 @@ const Allocator = std.mem.Allocator;
 const Dir = Io.Dir;
 const regex = @import("regex.zig");
 const Log = @import("log.zig");
+const web = @import("web.zig");
+const html_mod = @import("html.zig");
 
 // ── 工具定义（供模型调用的 JSON Schema）──
 
@@ -68,6 +70,13 @@ pub const tool_defs = [_]ToolDef{
         .description = "Change the session working directory (the base for all relative paths in subsequent tool calls; persists across calls and restarts). The path is resolved relative to the current working directory and must exist. Note: each bash invocation runs in a fresh shell, so `cd` inside a shell command only affects that single call - use this tool to change the working directory persistently.",
         .parameters =
         \\{"type":"object","properties":{"path":{"type":"string","description":"Directory to switch to (relative to current working directory, or absolute)"}},"required":["path"]}
+        ,
+    },
+    .{
+        .name = "webfetch",
+        .description = "Fetch content from an http(s) URL and return it as compact markdown (default), plain text, or raw HTML. HTML pages are converted to markdown for reading (script/style/nav junk stripped). Read-only. Output is truncated to 2000 lines or 50KB (whichever is hit first). Timeout defaults to 30 seconds (max 120).",
+        .parameters =
+        \\{"type":"object","properties":{"url":{"type":"string","description":"The http(s) URL to fetch"},"format":{"type":"string","enum":["markdown","text","html"],"description":"Output format; default markdown"},"timeout":{"type":"integer","description":"Timeout in seconds (default 30, max 120)"}},"required":["url"]}
         ,
     },
 };
@@ -305,7 +314,7 @@ fn utf8BoundaryBack(data: []const u8, from: usize) usize {
 // ── 分发 ──
 
 pub fn execute(allocator: Allocator, io: Io, cwd: []const u8, name: []const u8, args_json: []const u8) error{OutOfMemory}!Result {
-    return executeWithEnv(allocator, io, cwd, name, args_json, null);
+    return executeWithEnv(allocator, io, cwd, name, args_json, null, null);
 }
 
 /// 带环境变量映射的版本（bash 截断时把全文写入系统临时目录需要 TEMP/TMPDIR）
@@ -316,6 +325,7 @@ pub fn executeWithEnv(
     name: []const u8,
     args_json: []const u8,
     environ_map: ?*const std.process.Environ.Map,
+    web_environ_map: ?*const std.process.Environ.Map,
 ) error{OutOfMemory}!Result {
     if (std.mem.eql(u8, name, "read")) return toolRead(allocator, io, cwd, args_json);
     if (std.mem.eql(u8, name, "write")) return toolWrite(allocator, io, cwd, args_json);
@@ -324,12 +334,70 @@ pub fn executeWithEnv(
     if (std.mem.eql(u8, name, "grep")) return toolGrep(allocator, io, cwd, args_json);
     if (std.mem.eql(u8, name, "find")) return toolFind(allocator, io, cwd, args_json);
     if (std.mem.eql(u8, name, "ls")) return toolLs(allocator, io, cwd, args_json);
+    if (std.mem.eql(u8, name, "webfetch")) return toolWebfetch(allocator, io, args_json, web_environ_map orelse environ_map);
     return fail(allocator, "Unknown tool: {s}", .{name});
 }
 
 fn parseArgs(comptime T: type, allocator: Allocator, args_json: []const u8) ?T {
     // 注意：allocator 必须是 arena；解析结果由 arena 统一释放
     return std.json.parseFromSliceLeaky(T, allocator, args_json, .{ .ignore_unknown_fields = true }) catch null;
+}
+
+// ── webfetch ──
+
+const WebfetchArgs = struct {
+    url: []const u8 = "",
+    format: []const u8 = "",
+    timeout: i64 = 0,
+};
+
+fn toolWebfetch(allocator: Allocator, io: Io, args_json: []const u8, environ_map: ?*const std.process.Environ.Map) error{OutOfMemory}!Result {
+    var args_arena = std.heap.ArenaAllocator.init(allocator);
+    defer args_arena.deinit();
+    const args = parseArgs(WebfetchArgs, args_arena.allocator(), args_json) orelse
+        return fail(allocator, "Invalid arguments JSON for webfetch", .{});
+    if (args.url.len == 0) return fail(allocator, "Missing required argument: url", .{});
+
+    var format: web.Format = .markdown;
+    if (args.format.len > 0) {
+        if (std.mem.eql(u8, args.format, "markdown")) {
+            format = .markdown;
+        } else if (std.mem.eql(u8, args.format, "text")) {
+            format = .text;
+        } else if (std.mem.eql(u8, args.format, "html")) {
+            format = .html;
+        } else {
+            return fail(allocator, "Invalid format: {s} (expected markdown|text|html)", .{args.format});
+        }
+    }
+    const timeout_s: u32 = if (args.timeout > 0) @intCast(@min(args.timeout, 120)) else 30;
+
+    var http_status: u16 = 0;
+    const fetched = web.fetch(allocator, io, args.url, format, timeout_s * 1000, &http_status, environ_map) catch |err| {
+        if (err == error.HttpStatus) {
+            return fail(allocator, "webfetch {s}: HTTP {d}", .{ args.url, http_status });
+        }
+        return fail(allocator, "webfetch {s}: {s}", .{ args.url, webErrorText(err) });
+    };
+    defer allocator.free(fetched.content_type);
+    defer allocator.free(fetched.body);
+
+    // 工具级截断：与 read/bash 一致（2000 行 / 50KB）
+    const capped = try capHead(allocator, fetched.body, cap_lines, cap_bytes, 1);
+    return .{ .content = try finishCapped(allocator, capped.text, capped.notice), .is_error = false };
+}
+
+fn webErrorText(err: anyerror) []const u8 {
+    return switch (err) {
+        error.InvalidUrl => "invalid URL",
+        error.UnsupportedScheme => "unsupported URL scheme (only http/https)",
+        error.TooLarge => "response too large (exceeds 5MB limit)",
+        error.UnsupportedContentType => "unsupported content type (only text-like content is supported)",
+        error.Timeout => "request timed out",
+        error.NetworkError => "network error",
+        error.OutOfMemory => "out of memory",
+        else => "fetch failed",
+    };
 }
 
 // ── read ──
@@ -3265,6 +3333,7 @@ test "tools: bash 截断时全文落临时文件（可用 read 续看，无需�
         "bash",
         "{\"command\":\"Write-Output ('x' * 100000)\"}",
         &env,
+        null,
     );
     defer testing.allocator.free(r.content);
     defer if (r.display) |d| testing.allocator.free(d);
@@ -3295,6 +3364,7 @@ test "tools: bash 截断时全文落临时文件（可用 read 续看，无需�
             "bash",
             "{\"command\":\"Write-Output ('y' * 100000)\"}",
             &empty_env,
+            null,
         );
         defer testing.allocator.free(r2.content);
         defer if (r2.display) |d| testing.allocator.free(d);

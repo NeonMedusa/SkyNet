@@ -552,3 +552,30 @@ Debug+smp 稳定 ~25MB、**ReleaseSafe 最省（~17MB，链接 libc → `c_alloc
 
 *维护提示：本文的路线图部分应随实现推进更新（完成的移入相应章节或删除）；踩坑经验
 请直接追加到 3.1，注明触发场景。*
+
+### 3.15 网页抓取（webfetch 工具）
+
+AI 可以抓取 http(s) 网页阅读内容（无需任何 API key）：
+
+- **输出**：默认把 HTML 转成紧凑 markdown（标题/链接/列表/代码块/表格），也可用
+  `format=text`（纯文本）或 `format=html`（原始 HTML）；无视口脚本/样式/留言板等噪音。
+- **限制**：响应体 ≤5MB；输出截断为 2000 行 / 50KB（与其它工具一致）；超时默认 30 秒、
+  上限 120 秒（`timeout` 参数，单位秒）。只读。
+- **兼容**：仅 http/https；自动跟随重定向（≤5 跳）；gzip/deflate/zstd 解压；伪造浏览器
+  UA 以通过常见反爬检查，遇 Cloudflare 挑战（`cf-mitigated`）自动换诚实 UA 重试一次；
+  非文本内容（图片/二进制）会拒绝并提示。
+- 排查：日志 `[api]`/工具结果即可见抓取状态；转换器单测在 `src/html.zig`。
+
+
+**代理设置（2026-10-24）**：设置页新增"网络代理"组（来源：跟随环境变量/不使用/跟随系统/自定义
++ AI/网页/终端三开关，默认全关）。`src/proxy.zig` 负责解析（自定义规范化、Windows 注册表
+`ProxyEnable/ProxyServer` 读取——std 0.17 无 registry 模块，用 `reg query` 子进程）；
+main 启动/设置变更时重建三份注入环境映射（base + 各自代理），AI 客户端与 webfetch 各取所用；
+bash 开关控制子进程环境注入；localhost 恒直连。背景：webfetch 实测发现 std 的 https CONNECT
+隧道与 Clash 类代理不兼容（curl 同代理可用），webfetch 已有 curl 回退兜底。
+
+**代理默认值（2026-10-24 改稿）**：来源默认 `off`（不使用）、地址预填 `127.0.0.1:7890`、
+网页抓取/终端命令默认开、AI 请求默认关。字段默认值必须保持空串（`Config.deinit`/setter 会
+`free` 旧值，非空字面量会被误 free——当天 22 个测试因此段错误）；默认值集中在
+`Config.applyProxyDefaults`，加载时缺 `proxy` 段与"恢复默认"两处应用。自定义/系统代理
+地址自动补 `http://` 前缀。
