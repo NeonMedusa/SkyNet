@@ -1,12 +1,17 @@
 //! webfetch 抓取层：http(s) GET + 重定向跟随 + 解压 + 大小/超时限制 + HTML→Markdown。
 //!
-//! 设计要点：
-//! - 仅允许 http/https；重定向最多 5 跳（std.http 内置）
-//! - 超时兜底：看门狗线程到点后 netShutdown(.both) 唤醒阻塞读（半开连接不会永久挂起）
+//! 设计要点（2026-10-26 传输层定稿）：
+//! - **优先系统 curl**（`--connect-timeout`/`--max-time` 覆盖连接阶段；std 的
+//!   client.request() 内部同步 connect，看门狗只能挂建连之后——DROP 端口实测 133s）；
+//!   仅在系统无 curl 时回退 std.http
+//! - loopback / *.localhost / IPv4 私有段永远直连（proxy.shouldBypassProxy，std 不支持 NO_PROXY）
+//! - 传输错误按 curl 退出码/ std 错误名分类（DnsFailed / ConnectionFailed / Timeout /
+//!   CertificateInvalid / ProxyTunnelFailed / TlsHandshakeFailed）
 //! - 响应体上限 5MB（解压后）；非文本 MIME 拒绝（图片除 SVG 外也拒绝）
-//! - Cloudflare 挑战（403 + cf-mitigated: challenge）→ 换诚实 UA 重试一次（对齐 opencode）
+//! - Cloudflare 挑战（403）→ 换诚实 UA 重试一次（对齐 opencode）
 //! - HTML 走 html.zig 转 markdown/text；其它文本类型原样返回
 const std = @import("std");
+const assert = std.debug.assert;
 const html = @import("html.zig");
 const Log = @import("log.zig");
 const proxy = @import("proxy.zig");
@@ -36,11 +41,68 @@ pub const Error = error{
     TooLarge,
     UnsupportedContentType,
     Timeout,
+    /// DNS 解析失败（域名不存在 / 污染 / 解析器不可用）
+    DnsFailed,
+    /// 连接失败（拒绝/主机不可达/网络不可达/被重置）
+    ConnectionFailed,
+    /// TLS 证书不受信（自签、过期、域名不匹配、可能被中间人劫持）
+    CertificateInvalid,
+    /// TLS 握手失败（包含证书链初始化失败等）
+    TlsHandshakeFailed,
+    /// 代理隧道建立失败（通常是代理侧 DNS/连接问题，并非目标站点证书问题）
+    ProxyTunnelFailed,
     NetworkError,
     OutOfMemory,
 };
 
+/// std 错误名 → 语义错误（无法归类的保留 NetworkError）
+fn classifyHttpError(e: anyerror) Error {
+    return switch (e) {
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.HostUnreachable,
+        error.NetworkUnreachable,
+        error.NetworkDown,
+        error.AddressUnavailable,
+        => error.ConnectionFailed,
+        error.Timeout => error.Timeout,
+        error.UnknownHostName, error.NameServerFailure, error.InvalidHostName => error.DnsFailed,
+        // std 的证书校验失败通常以 TlsAlert 上浮（alert 明细在 http.Client 内部不可达）；
+        // webfetch 只面向正常站点，握手被拒的压倒性原因是证书校验 → 归入 CertificateInvalid。
+        // TlsInitializationFailed = 本地根证书加载/初始化失败，单独归类。
+        error.TlsAlert, error.TlsCertificateNotVerified => error.CertificateInvalid,
+        error.TlsInitializationFailed => error.TlsHandshakeFailed,
+        else => error.NetworkError,
+    };
+}
+
+/// 带上下文的分类：std 把"远端证书不受信"也报成 TlsInitializationFailed（与本地
+/// 根证书为空同名）。用 bundle 证书数区分：非空 → 远端证书校验失败；空 → 本地 CA 问题。
+fn classifyHttpErrorCtx(e: anyerror, ca_count: usize) Error {
+    if (e == error.TlsInitializationFailed) {
+        return if (ca_count == 0) error.TlsHandshakeFailed else error.CertificateInvalid;
+    }
+    return classifyHttpError(e);
+}
+
+/// curl 退出码 → 语义错误（见 curl(1) EXIT CODES；未知码返回 null 交给调用方回退）
+/// use_proxy：经代理时 exit 35 多为隧道建立失败（代理侧 DNS/连接），不是目标证书问题
+fn curlExitError(code: u8, use_proxy: bool) ?Error {
+    return switch (code) {
+        5 => error.ConnectionFailed, // 代理域名解析失败
+        6 => error.DnsFailed,
+        7 => error.ConnectionFailed,
+        28 => error.Timeout,
+        35 => if (use_proxy) error.ProxyTunnelFailed else error.TlsHandshakeFailed,
+        52, 56 => error.NetworkError, // 空回复 / 接收失败
+        51, 58, 60, 77, 90, 91 => error.CertificateInvalid,
+        97 => error.ProxyTunnelFailed,
+        else => null,
+    };
+}
+
 /// 抓取并转换。timeout 毫秒，钳制到 [1s, 120s]。
+/// insecure=true 跳过 TLS 证书校验（仅用于用户的显式授权，调用方负责门控）。
 pub fn fetch(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -49,6 +111,7 @@ pub fn fetch(
     timeout_ms: u32,
     out_status: *u16,
     environ_map: ?*const std.process.Environ.Map,
+    insecure: bool,
 ) Error!Fetched {
     out_status.* = 0;
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
@@ -57,12 +120,22 @@ pub fn fetch(
 
     const timeout = @max(1000, @min(timeout_ms, max_timeout_ms));
 
-    // https + 配置了代理：std 0.17 的 CONNECT 隧道与本机 Clash 类代理不兼容
-    // （同代理 curl 可用，属 std 侧问题）→ 直接走系统 curl 抓取
-    if (std.mem.eql(u8, scheme, "https") and proxy.envProxy(environ_map) != null) {
-        if (try curlFetch(allocator, io, environ_map.?, url, format, timeout, out_status)) |res| return res;
+    // 目标主机是否应绕过代理（loopback / *.localhost / 私有网段）：
+    // std 客户端不支持 NO_PROXY，必须统一在这里判定，否则 use_proxy=true 时内网服务全部被塞进代理
+    const target_host = proxy.uriHost(uri);
+    const via_proxy = !proxy.shouldBypassProxy(target_host) and proxy.envProxy(environ_map) != null;
+
+    // 优先 curl：连接阶段有 --connect-timeout（std 的 client.request() 内部同步 connect，
+    // 看门狗只能挂在建连之后——DROP 端口会把 timeout 参数变成摆设，2026-10 实测 133s）。
+    // curl 不可用（未安装）时回退 std 路径。
+    if (environ_map != null) {
+        if (try curlFetch(allocator, io, environ_map.?, url, format, timeout, out_status, insecure, via_proxy, browser_ua)) |res| {
+            return res;
+        }
     }
 
+    // ── std 兜底路径（curl 缺失时）────────────────────────────────
+    // 注意：此路径的连接阶段不受 timeout 约束（std 限制），只有建连后的读写受看门狗保护
     var attempt: u8 = 0;
     while (attempt < 2) : (attempt += 1) {
         const ua = if (attempt == 0) browser_ua else honest_ua;
@@ -81,9 +154,25 @@ pub fn fetch(
 
 const internal = error{ HttpStatusRetry };
 
+/// curl 参数表（定长，零分配）
+const Argv = struct {
+    buf: [24][]const u8 = undefined,
+    len: usize = 0,
+
+    fn add(self: *Argv, v: []const u8) void {
+        assert(self.len < self.buf.len);
+        self.buf[self.len] = v;
+        self.len += 1;
+    }
+
+    fn slice(self: *const Argv) []const []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
 /// 用系统 curl 抓取（正文走 stdout；状态码/内容类型用 -w 指令码拼在尾部切分）。
-/// 仅用于 https+代理场景（std 0.17 的 CONNECT 隧道与 Clash 类代理不兼容，属 std 侧问题）。
-/// 失败返回 null 走本地路径。
+/// 用于 https+代理（std 0.17 的 CONNECT 隧道不兼容）与 insecure（std 无跳过校验开关）。
+/// 失败时按 curl 退出码返回语义化错误；无法归类/未安装 curl 返回 null 由调用方回退。
 fn curlFetch(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -92,57 +181,78 @@ fn curlFetch(
     format: Format,
     timeout_ms: u32,
     out_status: *u16,
+    insecure: bool,
+    use_proxy: bool,
+    ua: []const u8,
 ) Error!?Fetched {
-    const proxy_url = proxy.envProxy(environ_map) orelse return null;
-
     var timeout_buf: [16]u8 = undefined;
     const timeout_s = std.fmt.bufPrint(&timeout_buf, "{d}", .{@divTrunc(timeout_ms, 1000)}) catch "30";
-    const argv = [_][]const u8{
-        "curl",
-        "-sS",
-        "-L",
-        "--compressed",
-        "--max-time",
-        timeout_s,
-        "--proxy",
-        proxy_url,
-        "-A",
-        browser_ua,
-        "-H",
-        acceptHeader(format),
-        "-w",
-        "\n<<SKYNET-WF:%{http_code}|%{content_type}>>",
-        "--url",
-        url,
-    };
-    const run = spawnCollect(allocator, io, &argv, environ_map, max_body_bytes + 4096) orelse return null;
+    var conn_buf: [16]u8 = undefined;
+    const conn_timeout_s = std.fmt.bufPrint(&conn_buf, "{d}", .{@min(@divTrunc(timeout_ms, 1000), 10)}) catch "10";
+    var accept_buf: [160]u8 = undefined;
+    var argv = Argv{};
+    argv.add("curl");
+    argv.add("-sS");
+    argv.add("-L");
+    argv.add("--compressed");
+    argv.add("--max-time");
+    argv.add(timeout_s);
+    argv.add("--connect-timeout");
+    argv.add(conn_timeout_s);
+    if (use_proxy) {
+        if (proxy.envProxy(environ_map)) |p| {
+            argv.add("--proxy");
+            argv.add(p);
+        }
+    }
+    if (insecure) argv.add("-k");
+    argv.add("-A");
+    argv.add(ua);
+    // curl 的 -H 必须带 "Name: value"——裸值会被直接丢弃（2026-10 实测服务端只收到 */*）
+    argv.add("-H");
+    argv.add(headerLine(&accept_buf, "Accept", acceptHeader(format)));
+    argv.add("-H");
+    argv.add("Accept-Language: zh-CN,zh;q=0.9,en;q=0.8");
+    argv.add("-w");
+    argv.add("\n<<SKYNET-WF:%{http_code}|%{content_type}>>");
+    argv.add("--url");
+    argv.add(url);
+    const run = try spawnCollect(allocator, io, argv.slice(), environ_map, max_body_bytes + 4096) orelse return null;
     defer allocator.free(run.stdout);
     defer allocator.free(run.stderr);
+
+    // 传输层失败先看退出码（curl 失败时 -w 仍会打印 000，不能当成 HTTP 状态）
+    if (run.code != 0) {
+        Log.info(.api, "webfetch curl 失败(code={d}): {s}", .{ run.code, run.stderr[0..@min(run.stderr.len, 300)] });
+        return curlExitError(run.code, use_proxy) orelse error.NetworkError;
+    }
 
     // 从尾部切出状态码 + content-type
     const delim = "<<SKYNET-WF:";
     const pos = std.mem.lastIndexOf(u8, run.stdout, delim) orelse {
-        Log.info(.api, "webfetch curl 回退失败: {s}", .{run.stderr});
-        return null;
+        Log.info(.api, "webfetch curl 输出缺失 write-out: {s}", .{run.stderr[0..@min(run.stderr.len, 300)]});
+        return error.NetworkError;
     };
     const body_part = run.stdout[0..pos];
-    const meta_end = std.mem.indexOfScalarPos(u8, run.stdout, pos, '>') orelse return null;
+    const meta_end = std.mem.indexOfScalarPos(u8, run.stdout, pos, '>') orelse return error.NetworkError;
     const meta = run.stdout[pos + delim.len .. meta_end];
-    const bar = std.mem.findScalar(u8, meta, '|') orelse return null;
-    const code = std.fmt.parseInt(u16, meta[0..bar], 10) catch return null;
+    const bar = std.mem.findScalar(u8, meta, '|') orelse return error.NetworkError;
+    const code = std.fmt.parseInt(u16, meta[0..bar], 10) catch 0;
     out_status.* = code;
+    if (code == 0) return error.NetworkError; // 000 不是 HTTP 状态
     if (code < 200 or code >= 300) return error.HttpStatus;
 
     const ct = try allocator.dupe(u8, std.mem.trim(u8, meta[bar + 1 ..], " \t"));
     errdefer allocator.free(ct);
-    const mime = mimeOf(ct);
+    var mime_buf: [128]u8 = undefined;
+    const mime = mimeLower(&mime_buf, ct);
     if (isImage(mime) and !std.ascii.eqlIgnoreCase(mime, "image/svg+xml")) return error.UnsupportedContentType;
     if (!isTextual(mime)) return error.UnsupportedContentType;
 
     const raw = try allocator.dupe(u8, body_part);
     defer allocator.free(raw);
     const looks_html = std.mem.find(u8, mime, "html") != null or
-        (std.mem.trim(u8, mime, " \t").len == 0 and looksLikeHtml(raw));
+        (mime.len == 0 and looksLikeHtml(raw));
     const body: []u8 = if (looks_html and format != .html)
         html.convert(allocator, raw, if (format == .markdown) .markdown else .text) catch return error.OutOfMemory
     else
@@ -151,21 +261,7 @@ fn curlFetch(
 }
 
 /// 绝对路径读文件（0.17：fs.cwd 已移除，按父目录打开）
-fn readFileAbs(io: std.Io, allocator: std.mem.Allocator, abs: []const u8, limit: usize) ![]u8 {
-    const parent = std.fs.path.dirname(abs) orelse return error.FileNotFound;
-    var dir = try std.Io.Dir.openDirAbsolute(io, parent, .{});
-    defer dir.close(io);
-    return dir.readFileAlloc(io, std.fs.path.basename(abs), allocator, .limited(limit));
-}
-
-fn deleteFileAbs(io: std.Io, abs: []const u8) void {
-    const parent = std.fs.path.dirname(abs) orelse return;
-    var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return;
-    defer dir.close(io);
-    dir.deleteFile(io, std.fs.path.basename(abs)) catch {};
-}
-
-const RunOutput = struct { stdout: []u8, stderr: []u8 };
+const RunOutput = struct { code: u8, stdout: []u8, stderr: []u8 };
 
 /// spawn + 收集 stdout/stderr（MultiReader 模式；每路输出上限 64KB）
 fn spawnCollect(
@@ -174,7 +270,7 @@ fn spawnCollect(
     argv: []const []const u8,
     environ_map: *const std.process.Environ.Map,
     max_out: usize,
-) ?RunOutput {
+) error{TooLarge}!?RunOutput {
     var child = std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
@@ -188,19 +284,23 @@ fn spawnCollect(
     mr.init(allocator, io, mr_buf.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer mr.deinit();
     while (mr.fill(8192, .none)) |_| {
-        if (mr.reader(0).buffered().len > max_out) return null;
-        if (mr.reader(1).buffered().len > 64 * 1024) return null;
+        if (mr.reader(0).buffered().len > max_out) return error.TooLarge;
+        if (mr.reader(1).buffered().len > 64 * 1024) return error.TooLarge;
     } else |err| switch (err) {
         error.EndOfStream => {},
         else => return null,
     }
-    _ = child.wait(io) catch return null;
+    const term = child.wait(io) catch return null;
+    const code: u8 = switch (term) {
+        .exited => |c| c,
+        else => 255,
+    };
     const out = mr.toOwnedSlice(0) catch return null;
     const err = mr.toOwnedSlice(1) catch {
         allocator.free(out);
         return null;
     };
-    return .{ .stdout = out, .stderr = err };
+    return .{ .code = code, .stdout = out, .stderr = err };
 }
 
 fn attemptFetch(
@@ -218,20 +318,23 @@ fn attemptFetch(
     var client = std.http.Client{
         .allocator = allocator,
         .io = io,
-        .now = std.Io.Clock.real.now(io),  // 墙钟：TLS 证书有效期校验
+        .now = std.Io.Clock.real.now(io), // 墙钟：TLS 证书有效期校验
     };
     defer client.deinit();
+    // 显式赋 now 会跳过 std 的懒加载 rescan（bundle 为空 → Linux 下 HTTPS 一律
+    // TlsInitializationFailed，2026-10 WSL 实测）：显式重扫系统根证书。
+    // 失败保留空包（后续错误由连接阶段上交），仅记日志。
+    client.ca_bundle.rescan(allocator, io, client.now.?) catch |e| {
+        Log.warn(.api, "webfetch 根证书加载失败: {t}", .{e});
+    };
     // 代理：与 AI 客户端一致，读 HTTP_PROXY/HTTPS_PROXY/NO_PROXY（墙外站点必需；
     // 代理配置的分配域必须比客户端活得久）
     var proxy_arena = std.heap.ArenaAllocator.init(allocator);
     defer proxy_arena.deinit();
-    // localhost/127.0.0.1/::1 永远直连（保护本地服务，如 LM Studio）
-    const target_host: []const u8 = if (uri.host) |h| switch (h) {
-        .raw => |raw| raw,
-        .percent_encoded => |pe| pe,
-    } else "";
+    // loopback / *.localhost / 私有网段永远直连（保护本地服务与内网访问）
+    const attempt_host = proxy.uriHost(uri);
     if (environ_map) |env| {
-        if (!proxy.isLocalHost(target_host)) {
+        if (!proxy.shouldBypassProxy(attempt_host)) {
             client.initDefaultProxies(proxy_arena.allocator(), env) catch {};
         }
     }
@@ -248,7 +351,7 @@ fn attemptFetch(
             .user_agent = .{ .override = ua },
         },
         .extra_headers = &extra_headers,
-    }) catch return error.NetworkError;
+    }) catch |e| return classifyHttpErrorCtx(e, client.ca_bundle.map.count());
     defer request.deinit();
 
     // 看门狗：到点 shutdown 连接，唤醒阻塞读/等头
@@ -263,15 +366,15 @@ fn attemptFetch(
         thread.join();
     }
 
-    request.sendBodiless() catch {
+    request.sendBodiless() catch |e| {
         if (wd.timed_out.load(.acquire)) return error.Timeout;
-        return error.NetworkError;
+        return classifyHttpErrorCtx(e, client.ca_bundle.map.count());
     };
 
     var redirect_buf: [8192]u8 = undefined;
-    var response = request.receiveHead(&redirect_buf) catch {
+    var response = request.receiveHead(&redirect_buf) catch |e| {
         if (wd.timed_out.load(.acquire)) return error.Timeout;
-        return error.NetworkError;
+        return classifyHttpErrorCtx(e, client.ca_bundle.map.count());
     };
     // 重定向可能换连接：刷新句柄（std.http 在 receiveHead 内部跟随）
     wd.publishConnection(request.connection);
@@ -288,7 +391,8 @@ fn attemptFetch(
     // 读后复制拿到垃圾字节 → MIME 判定错乱 → HTML 未转换）
     const ct = try allocator.dupe(u8, headerValue(response.head.bytes, "content-type") orelse "");
     errdefer allocator.free(ct);
-    const mime = mimeOf(ct);
+    var mime_buf: [128]u8 = undefined;
+    const mime = mimeLower(&mime_buf, ct);
     if (isImage(mime) and !std.ascii.eqlIgnoreCase(mime, "image/svg+xml")) return error.UnsupportedContentType;
     if (!isTextual(mime)) return error.UnsupportedContentType;
 
@@ -298,7 +402,7 @@ fn attemptFetch(
     // HTML 判定：优先 content-type；缺失/空白时按内容嗅探
     // （不少 CDN/服务端不带该头——2026-10 course.ziglang.cc 实测踩到）
     const looks_html = std.mem.find(u8, mime, "html") != null or
-        (std.mem.trim(u8, mime, " \t").len == 0 and looksLikeHtml(raw));
+        (mime.len == 0 and looksLikeHtml(raw));
     const body: []u8 = if (looks_html and format != .html) blk: {
         const converted = html.convert(allocator, raw, if (format == .markdown) .markdown else .text) catch return error.OutOfMemory;
         break :blk converted;
@@ -389,6 +493,21 @@ fn acceptHeader(format: Format) []const u8 {
     };
 }
 
+/// `-H` 参数拼装：curl 要求 "Header: value" 形式（裸值会被 curl 丢弃）
+fn headerLine(buf: []u8, name: []const u8, value: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}: {s}", .{ name, value }) catch value;
+}
+
+/// Content-Type 规范化：去参数 + 转小写（写入调用方缓冲；超长时截断）。
+/// 下游全部按小写比较（"TEXT/HTML" 也要能命中 html 判定）。
+fn mimeLower(buf: []u8, ct: []const u8) []const u8 {
+    const semi = std.mem.findScalar(u8, ct, ';') orelse ct.len;
+    const m = std.mem.trim(u8, ct[0..semi], " \t");
+    const n = @min(m.len, buf.len);
+    for (m[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    return buf[0..n];
+}
+
 fn isCloudflareChallenge(head_bytes: []const u8) bool {
     const v = headerValue(head_bytes, "cf-mitigated") orelse return false;
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, v, " \t"), "challenge");
@@ -414,13 +533,6 @@ pub fn looksLikeHtml(raw: []const u8) bool {
     if (std.ascii.findIgnoreCase(head, "<!doctype html") != null) return true;
     if (std.ascii.findIgnoreCase(head, "<html") != null) return true;
     return false;
-}
-
-fn mimeOf(ct: []const u8) []const u8 {
-    const semi = std.mem.findScalar(u8, ct, ';') orelse ct.len;
-    const m = std.mem.trim(u8, ct[0..semi], " \t");
-    // 转小写（返回切片指向原字符串；调用方不重叠使用即可）
-    return m;
 }
 
 fn isImage(mime: []const u8) bool {
@@ -477,4 +589,35 @@ test "web：URL 校验" {
     const bad = std.Uri.parse("ftp://example.com/x") catch unreachable;
     try testing.expectEqualStrings("ftp", bad.scheme);
     try testing.expect(!std.mem.eql(u8, bad.scheme, "http"));
+}
+
+test "web：错误分类（std 错误名 + curl 退出码）" {
+    try testing.expectEqual(Error.ConnectionFailed, classifyHttpError(error.ConnectionRefused));
+    try testing.expectEqual(Error.ConnectionFailed, classifyHttpError(error.HostUnreachable));
+    try testing.expectEqual(Error.Timeout, classifyHttpError(error.Timeout));
+    try testing.expectEqual(Error.DnsFailed, classifyHttpError(error.UnknownHostName));
+    try testing.expectEqual(Error.DnsFailed, classifyHttpError(error.NameServerFailure));
+    try testing.expectEqual(Error.CertificateInvalid, classifyHttpError(error.TlsCertificateNotVerified));
+    try testing.expectEqual(Error.CertificateInvalid, classifyHttpError(error.TlsAlert));
+    try testing.expectEqual(Error.TlsHandshakeFailed, classifyHttpError(error.TlsInitializationFailed));
+    // 上下文判别：bundle 为空 = 本地 CA 问题；非空 = 远端证书不受信
+    try testing.expectEqual(Error.TlsHandshakeFailed, classifyHttpErrorCtx(error.TlsInitializationFailed, 0));
+    try testing.expectEqual(Error.CertificateInvalid, classifyHttpErrorCtx(error.TlsInitializationFailed, 121));
+    try testing.expectEqual(Error.NetworkError, classifyHttpError(error.BrokenPipe));
+
+    try testing.expectEqual(Error.DnsFailed, curlExitError(6, false).?);
+    try testing.expectEqual(Error.ConnectionFailed, curlExitError(7, false).?);
+    try testing.expectEqual(Error.Timeout, curlExitError(28, false).?);
+    try testing.expectEqual(Error.TlsHandshakeFailed, curlExitError(35, false).?);
+    try testing.expectEqual(Error.ProxyTunnelFailed, curlExitError(35, true).?);
+    try testing.expectEqual(Error.CertificateInvalid, curlExitError(60, false).?);
+    try testing.expect(curlExitError(22, false) == null); // HTTP 4xx 等不属于传输层
+}
+
+test "web：Content-Type 小写规范化（TEXT/HTML 也要命中 html 判定）" {
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("text/html", mimeLower(&buf, "TEXT/HTML; charset=utf-8"));
+    try testing.expectEqualStrings("application/json", mimeLower(&buf, " Application/JSON "));
+    try testing.expectEqualStrings("", mimeLower(&buf, ""));
+    try testing.expect(std.mem.find(u8, mimeLower(&buf, "TEXT/HTML"), "html") != null);
 }

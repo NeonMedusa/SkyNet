@@ -2,20 +2,22 @@
 
 # SkyNet
 
-用 Zig 0.16 写的 TUI AI 编码助手，仿照 pi 提供 7 个工具（read / write / edit / bash / grep / find / ls）：
+用 Zig 0.17 写的 TUI AI 编码助手，仿照 pi 提供 9 个工具（read / write / edit / bash / grep / find / ls / cd / webfetch）：
 流式对话、思考块、SQLite 持久化、工具输出折叠、上下文压缩（compaction）、prompt 缓存亲和；
 CLI 与 TUI 共用同一套 agent 逻辑。
 
 **原生程序，单个静态二进制，无需运行时**——ReleaseFast 构建约 **4 MB**，平均内存占用在 **30 MB** 以内，启动速度快到**几乎无感**。
 
-仅在 Windows 上做过日常验证；要支持Linux、MacOs理论上来说不难，但作者没有环境开发、测试，需要各位大佬们的援助。
+日常验证在 Windows 上进行；**Linux 已完成适配与实测**（Arch WSL2：TUI、全部工具、剪贴板、代理按次启用、证书处理均验证通过），原生 Linux 桌面理论上一致，macOS 未验证。欢迎 PR，尤其欢迎 AI 写的代码——这个项目本身就是 AI 写的，PR 我也会用 AI 来审。
 
-欢迎 PR，尤其欢迎 AI 写的代码——这个项目本身就是 AI 写的，PR 我也会用 AI 来审。
+代理采用显式启用模型：程序从不自行注入代理环境（程序自身环境里的代理变量也会被剔除，
+开关语义保证真实）；`webfetch` / `bash` 工具都有 `use_proxy` 参数，AI 遇到连接失败时
+按次请求代理（需在设置页填写地址并允许 AI 使用）；证书无效的站点由设置项「允许抓取证书无效站点」控制（默认拒绝）。
 
 ## 免责声明（请务必阅读）
 
 - **没有工具权限系统，也没有沙箱，AI 想去哪就去哪。** 它以你的用户身份、你账号的完整权限运行：
-  能读写任意绝对路径（不限于 cwd）、执行任意 shell 命令（默认 pwsh）、发起网络请求，
+  能读写任意绝对路径（不限于 cwd）、执行任意 shell 命令（Windows 默认 pwsh，Linux 为 sh）、发起网络请求，
   全程没有任何确认或拦截。"换个安全目录再跑"**不能**限制它——工作目录只是提示词层面的约定，
   不构成隔离。要真正限制，只能靠系统级手段（虚拟机、独立用户/容器、备份与权限控制），
   而不是指望本程序。**用它造成的一切后果由使用者自行承担。**
@@ -48,15 +50,19 @@ scoop install skynet
 
 ## 构建
 
-需要 Zig 0.16。仓库用 git submodule 引入 zigtui，克隆时请带 `--recurse-submodules`
+需要 Zig 0.17。仓库用 git submodule 引入 zigtui，克隆时请带 `--recurse-submodules`
 （已经克隆过的执行 `git submodule update --init`）：
 
 ```bash
 git clone --recursive https://github.com/NeonMedusa/SkyNet.git
-zig build                    # 调试构建 → zig-out/bin/SkyNet.exe
+zig build                    # 调试构建 → zig-out/bin/SkyNet(.exe)
 zig build test               # 全部单测（mock 集成测试在 mock 未启动时自动跳过）
-zig build -Doptimize=ReleaseSafe
+zig build check              # 单测 + exe 编译（覆盖 exe-only 的懒分析路径）
+zig build -Dcpu=baseline -Doptimize=ReleaseFast -Dstrip=true   # 发布构建（去调试信息，~4MB）
 ```
+
+WSL 下在 `/mnt/c/...` 构建时请加 `--cache-dir "$HOME/.cache/skynet-build"`：
+Windows 侧的 `.zig-cache` 目录属主不同，Linux 侧原子 rename 会报 AccessDenied。
 
 ## 运行
 
@@ -65,6 +71,9 @@ zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/SkyNet.exe ask -new -title "随便聊聊" "你好"    # 无界面发送一轮对话
 ./zig-out/bin/SkyNet.exe help                                # 全部子命令与参数
 ```
+
+Linux 下产物是 `zig-out/bin/SkyNet`（无 `.exe`），用法一致。注意 WSL/跨盘场景：
+数据目录必须放在 ext4 上（如 `/root/skynet`），`/mnt/c` 的 9p 文件系统不支持 SQLite WAL 的共享内存锁，数据库会打不开。
 
 数据目录（首次启动自动生成；`-db` / `-config` 可显式指定其他位置）：
 
@@ -106,7 +115,9 @@ Scoop 安装时 `data` 是指向 `scoop\persist\skynet\data` 的 junction——�
   失败时会提示"连接中断"，手动重发即可
 - 工具没有确认环节、没有目录白名单，无法阻止通过绝对路径访问任意位置（见免责声明）
 - **项目仍在实验阶段：数据库结构随时可能变动**——schema 版本不符时：有迁移路径的旧库会提示后自动迁移（先备份），过旧的库由 TUI 弹窗让你选择"重命名旧库并新建"或"退出"，库比程序新则提示升级；CLI 子命令不走弹窗（直接报错）
-- 仅在 Windows + PowerShell 7 上做过日常验证
+- 仅在 Windows + PowerShell 7 上做过日常验证；Linux（Arch WSL2）已验证 TUI、工具、剪贴板与代理，
+  原生 Linux 桌面与 macOS 未实测。Linux 剪贴板依赖：桌面环境用 `wl-copy`（wl-clipboard）/ `xclip` / `xsel`
+  任一；WSL 下自动走 `powershell.exe` 互操作，无需安装任何工具
 
 ## 第三方组件
 

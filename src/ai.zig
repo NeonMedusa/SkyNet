@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const Uri = std.Uri;
 const config_mod = @import("config.zig");
 const Log = @import("log.zig");
+const proxy = @import("proxy.zig");
 
 pub const Affinity = config_mod.Affinity;
 pub const CacheRetention = config_mod.CacheRetention;
@@ -445,7 +446,28 @@ pub const AIError = error{
     ServerTransient,
     /// 自动压缩连续两次被拒（模型摘要输出异常）→ 中断回合止损（2026-10-13）
     CompactionRejected,
+    /// https 端点 + 代理：std 0.17 的 CONNECT 隧道失败后会静默降级为明文直发，
+    /// 属于安全风险 → 明确拒绝（而不是让请求以明文离开本机）
+    HttpsProxyUnsupported,
 };
+
+/// env 是否配置了 https 代理（https_proxy/HTTPS_PROXY/all_proxy）
+fn httpsProxyConfigured(env: ?*const std.process.Environ.Map) bool {
+    const e = env orelse return false;
+    for ([_][]const u8{ "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY" }) |k| {
+        if (e.get(k)) |v| {
+            if (v.len > 0) return true;
+        }
+    }
+    return false;
+}
+
+/// https + 代理 → 拒绝（std 会明文降级）；loopback/私有网段豁免
+fn checkHttpsProxy(uri: std.Uri, env: ?*const std.process.Environ.Map) AIError!void {
+    if (!std.mem.eql(u8, uri.scheme, "https")) return;
+    if (proxy.shouldBypassProxy(proxy.uriHost(uri))) return;
+    if (httpsProxyConfigured(env)) return error.HttpsProxyUnsupported;
+}
 
 pub const ModelInfo = struct {
     id: []const u8 = "",
@@ -610,11 +632,16 @@ pub const AI = struct {
             .io = self.io,
         };
         if (self.environ_map) |env| {
-            // 代理配置的分配域必须比客户端活得久：单独 arena，随 deinitClient 释放
-            const pa = self.allocator.create(std.heap.ArenaAllocator) catch return &self.client.?;
-            pa.* = std.heap.ArenaAllocator.init(self.allocator);
-            self.proxy_arena = pa;
-            self.client.?.initDefaultProxies(pa.allocator(), env) catch {};
+            // loopback / *.localhost / 私有网段的端点永远直连（保护 LM Studio 等本地服务）
+            const ep_uri = std.Uri.parse(self.config.endpoint) catch null;
+            const bypass = if (ep_uri) |u| proxy.shouldBypassProxy(proxy.uriHost(u)) else false;
+            if (!bypass) {
+                // 代理配置的分配域必须比客户端活得久：单独 arena，随 deinitClient 释放
+                const pa = self.allocator.create(std.heap.ArenaAllocator) catch return &self.client.?;
+                pa.* = std.heap.ArenaAllocator.init(self.allocator);
+                self.proxy_arena = pa;
+                self.client.?.initDefaultProxies(pa.allocator(), env) catch {};
+            }
         }
         return &self.client.?;
     }
@@ -756,6 +783,7 @@ pub const AI = struct {
         defer if (full_url.ptr != base.ptr) self.allocator.free(full_url);
 
         const uri = Uri.parse(full_url) catch return error.InvalidUri;
+        try checkHttpsProxy(uri, self.environ_map);
 
         const auth_header: ?[]const u8 = if (self.config.api_key.len > 0)
             std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.config.api_key}) catch return error.OutOfMemory
@@ -818,6 +846,9 @@ pub const AI = struct {
         }
         if (status == .not_found or status == .bad_request or status == .forbidden) {
             self.captureErrorBody(&response);
+            if (self.error_body) |body| {
+                if (body.len > 0) Log.warn(.api, "服务端返回（前 300 字节）: {s}", .{body[0..@min(body.len, 300)]});
+            }
             return error.ServerError;
         }
         if (status.class() != .success) {
@@ -951,6 +982,7 @@ pub const AI = struct {
         defer self.allocator.free(full_url);
 
         const uri = Uri.parse(full_url) catch return error.InvalidUri;
+        try checkHttpsProxy(uri, self.environ_map);
 
         const auth_header: ?[]const u8 = if (self.config.api_key.len > 0)
             std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.config.api_key}) catch return error.OutOfMemory

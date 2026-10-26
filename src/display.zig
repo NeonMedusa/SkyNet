@@ -218,7 +218,7 @@ pub fn capBlockBody(allocator: Allocator, body: []const u8, max_lines: usize) er
     return out.toOwnedSlice(allocator);
 }
 
-/// 工具结果摘要（错误取首行，成功给大小）
+/// 工具结果摘要（错误取首行，超 80 字符截断并加省略号；成功给大小）
 pub fn toolResultSummary(arena: Allocator, content: []const u8, is_error: bool) error{OutOfMemory}![]const u8 {
     if (is_error) {
         const nl = std.mem.indexOfScalar(u8, content, '\n') orelse content.len;
@@ -232,8 +232,10 @@ pub fn toolResultSummary(arena: Allocator, content: []const u8, is_error: bool) 
             i += n;
             if (width > 80) break;
         }
+        const truncated = i < line.len;
         line = line[0..i];
-        return std.fmt.allocPrint(arena, "{s}", .{line});
+        // 截断必须显式标注：静默硬切会让用户误以为消息本身就不完整
+        return std.fmt.allocPrint(arena, "{s}{s}", .{ line, if (truncated) "…" else "" });
     }
     var size_buf: [32]u8 = undefined;
     return std.fmt.allocPrint(arena, "{s}", .{formatBytes(&size_buf, content.len)});
@@ -277,4 +279,28 @@ test "display: toolBlockKind 判定" {
     try testing.expectEqual(ToolBlockKind.shell, toolBlockKind("bash").?);
     try testing.expectEqual(ToolBlockKind.diff, toolBlockKind("edit").?);
     try testing.expect(toolBlockKind("read") == null);
+}
+
+test "display: 错误摘要超 80 字符截断并加省略号" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 短文本原样
+    try testing.expectEqualStrings("boom", try toolResultSummary(a, "boom", true));
+    // 多行只取首行
+    try testing.expectEqualStrings("line1", try toolResultSummary(a, "line1\nline2", true));
+    // 88 个汉字：截断到 81 字 + 省略号（不能静默硬切）
+    var long_buf: [88 * 3]u8 = undefined;
+    var k: usize = 0;
+    while (k < 88) : (k += 1) @memcpy(long_buf[k * 3 ..][0..3], "代");
+    const long = long_buf[0..];
+    const s = try toolResultSummary(a, long, true);
+    try testing.expect(std.mem.endsWith(u8, s, "…"));
+    try testing.expectEqual(@as(usize, 82 * 3), s.len); // 81 汉字 + 省略号
+    // 恰好不超限：不加省略号
+    var exact_buf: [80 * 3]u8 = undefined;
+    k = 0;
+    while (k < 80) : (k += 1) @memcpy(exact_buf[k * 3 ..][0..3], "短");
+    const exact = exact_buf[0..];
+    try testing.expect(!std.mem.endsWith(u8, try toolResultSummary(a, exact, true), "…"));
 }

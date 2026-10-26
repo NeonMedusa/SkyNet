@@ -567,15 +567,14 @@ AI 可以抓取 http(s) 网页阅读内容（无需任何 API key）：
 - 排查：日志 `[api]`/工具结果即可见抓取状态；转换器单测在 `src/html.zig`。
 
 
-**代理设置（2026-10-24）**：设置页新增"网络代理"组（来源：跟随环境变量/不使用/跟随系统/自定义
-+ AI/网页/终端三开关，默认全关）。`src/proxy.zig` 负责解析（自定义规范化、Windows 注册表
-`ProxyEnable/ProxyServer` 读取——std 0.17 无 registry 模块，用 `reg query` 子进程）；
-main 启动/设置变更时重建三份注入环境映射（base + 各自代理），AI 客户端与 webfetch 各取所用；
-bash 开关控制子进程环境注入；localhost 恒直连。背景：webfetch 实测发现 std 的 https CONNECT
-隧道与 Clash 类代理不兼容（curl 同代理可用），webfetch 已有 curl 回退兜底。
-
-**代理默认值（2026-10-24 改稿）**：来源默认 `off`（不使用）、地址预填 `127.0.0.1:7890`、
-网页抓取/终端命令默认开、AI 请求默认关。字段默认值必须保持空串（`Config.deinit`/setter 会
-`free` 旧值，非空字面量会被误 free——当天 22 个测试因此段错误）；默认值集中在
-`Config.applyProxyDefaults`，加载时缺 `proxy` 段与"恢复默认"两处应用。自定义/系统代理
-地址自动补 `http://` 前缀。
+**代理设置（2026-10-26 简化定稿）**：设置页"网络代理"组只有四项——代理地址 + 三个开关
+（AI 请求经代理 / 允许 AI 使用代理 / 允许抓取证书无效站点）。地址空 = 跟随
+`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 环境变量；`src/proxy.zig` 的 `resolveAny` 负责解析
+（地址优先、自动补 `http://`），localhost 恒直连。已移除早期设计的「代理来源」循环
+（跟随环境变量/不使用/跟随系统/自定义）与 Windows 注册表读取——系统代理开关属于第二个
+隐式状态，心智负担大且跨平台不可移植。main 在启动/设置变更时重建注入环境：
+`tool_env`（基础环境，剔除一切代理变量，保证开关语义真实）、`tool_proxy_env`
+（use_proxy=true 时）与 `ai_env`（for_ai 时）；webfetch 的所有抓取优先走系统 curl
+（连接阶段超时 + CONNECT 代理都只有它可靠），std.http 仅作无 curl 时的兜底；
+AI 请求仍是 std.http——https+代理直接拒绝（避免 std 的明文降级）。默认值集中在 `Config.applyProxyDefaults`，
+字段默认值必须保持空串（`Config.deinit`/setter 会 `free` 旧值，非空字面量会被误 free）。

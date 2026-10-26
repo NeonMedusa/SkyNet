@@ -39,9 +39,9 @@ pub const tool_defs = [_]ToolDef{
     },
     .{
         .name = "bash",
-        .description = "Execute a shell command in the session working directory and return its output. Each invocation runs in a fresh shell: `cd` inside a command only affects that single call (use the cd tool for persistent changes). On Windows this runs PowerShell (pwsh); on other platforms it runs sh. Output is truncated to the last 2000 lines or 50KB. Commands time out after 5 minutes by default; pass timeout_ms (milliseconds) to raise the limit for long-running commands.",
+        .description = "Execute a shell command in the session working directory and return its output. Each invocation runs in a fresh shell: `cd` inside a command only affects that single call (use the cd tool for persistent changes). On Windows this runs PowerShell (pwsh); on other platforms it runs sh. Output is truncated to the last 2000 lines or 50KB. Commands time out after 5 minutes by default; pass timeout_ms (milliseconds) to raise the limit for long-running commands. Network-restricted environments: if a command fails to reach the network (DNS poisoning / connection timeout), retry with use_proxy=true, which injects the proxy configured in Settings for this call only.",
         .parameters =
-        \\{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout_ms":{"type":"integer","description":"Optional timeout in milliseconds (default 300000 = 5 minutes; raise it for long-running commands, no upper limit)"}},"required":["command"]}
+        \\{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout_ms":{"type":"integer","description":"Optional timeout in milliseconds (default 300000 = 5 minutes; raise it for long-running commands, no upper limit)"},"use_proxy":{"type":"boolean","description":"Inject the user-configured proxy into the command environment for this call only (default false)"}},"required":["command"]}
         ,
     },
     .{
@@ -74,9 +74,9 @@ pub const tool_defs = [_]ToolDef{
     },
     .{
         .name = "webfetch",
-        .description = "Fetch content from an http(s) URL and return it as compact markdown (default), plain text, or raw HTML. HTML pages are converted to markdown for reading (script/style/nav junk stripped). Read-only. Output is truncated to 2000 lines or 50KB (whichever is hit first). Timeout defaults to 30 seconds (max 120).",
+        .description = "Fetch content from an http(s) URL and return it as compact markdown (default), plain text, or raw HTML. HTML pages are converted to markdown for reading (script/style/nav junk stripped). Read-only. Output is truncated to 2000 lines or 50KB (whichever is hit first). Timeout defaults to 30 seconds (max 120). Network-restricted environments: if a fetch fails (DNS poisoning / connection timeout), retry with use_proxy=true to go through the proxy configured in Settings.",
         .parameters =
-        \\{"type":"object","properties":{"url":{"type":"string","description":"The http(s) URL to fetch"},"format":{"type":"string","enum":["markdown","text","html"],"description":"Output format; default markdown"},"timeout":{"type":"integer","description":"Timeout in seconds (default 30, max 120)"}},"required":["url"]}
+        \\{"type":"object","properties":{"url":{"type":"string","description":"The http(s) URL to fetch"},"format":{"type":"string","enum":["markdown","text","html"],"description":"Output format; default markdown"},"timeout":{"type":"integer","description":"Timeout in seconds (default 30, max 120)"},"use_proxy":{"type":"boolean","description":"Fetch through the user-configured proxy (default false)"}},"required":["url"]}
         ,
     },
 };
@@ -314,7 +314,34 @@ fn utf8BoundaryBack(data: []const u8, from: usize) usize {
 // ── 分发 ──
 
 pub fn execute(allocator: Allocator, io: Io, cwd: []const u8, name: []const u8, args_json: []const u8) error{OutOfMemory}!Result {
-    return executeWithEnv(allocator, io, cwd, name, args_json, null, null);
+    return executeWithEnv(allocator, io, cwd, name, args_json, .{});
+}
+
+/// 工具的网络环境（use_proxy 按次选择；insecure 只看用户设置）
+pub const NetEnv = struct {
+    /// 程序自身环境（use_proxy=false；本程序不注入任何代理变量）
+    plain: ?*const std.process.Environ.Map = null,
+    /// 注入代理后的环境（use_proxy=true；null = 未配置代理）
+    with_proxy: ?*const std.process.Environ.Map = null,
+    /// 用户是否允许 AI 在工具中使用代理（设置页主开关）
+    allow_tools: bool = false,
+    /// 用户是否允许抓取证书无效的站点（webfetch 遇到证书失败时自动 curl -k 重试）
+    allow_insecure: bool = false,
+};
+
+const EnvSel = union(enum) {
+    env: ?*const std.process.Environ.Map,
+    fail: Result,
+};
+
+/// 按 use_proxy 选择本次调用的环境；不允许/未配置时给出具体指向的错误
+fn selectToolEnv(allocator: Allocator, proxy_env: NetEnv, use_proxy: bool) error{OutOfMemory}!EnvSel {
+    if (!use_proxy) return .{ .env = proxy_env.plain };
+    if (!proxy_env.allow_tools)
+        return .{ .fail = try fail(allocator, "代理不可用：用户明确未允许 AI 使用代理（设置项：网络代理 → 允许 AI 使用代理）。这是用户侧的决定，不要尝试修改配置文件或自行开启。可向用户说明情况，并请其开启后重试。", .{}) };
+    const env = proxy_env.with_proxy orelse
+        return .{ .fail = try fail(allocator, "代理不可用：用户尚未配置代理（设置项：网络代理 → 代理来源/地址为空，且环境变量未设置）。不要自行猜测地址或修改配置。可告知用户，并请其配置代理地址后重试。", .{}) };
+    return .{ .env = env };
 }
 
 /// 带环境变量映射的版本（bash 截断时把全文写入系统临时目录需要 TEMP/TMPDIR）
@@ -324,17 +351,16 @@ pub fn executeWithEnv(
     cwd: []const u8,
     name: []const u8,
     args_json: []const u8,
-    environ_map: ?*const std.process.Environ.Map,
-    web_environ_map: ?*const std.process.Environ.Map,
+    proxy_env: NetEnv,
 ) error{OutOfMemory}!Result {
     if (std.mem.eql(u8, name, "read")) return toolRead(allocator, io, cwd, args_json);
     if (std.mem.eql(u8, name, "write")) return toolWrite(allocator, io, cwd, args_json);
     if (std.mem.eql(u8, name, "edit")) return toolEdit(allocator, io, cwd, args_json);
-    if (std.mem.eql(u8, name, "bash")) return toolBash(allocator, io, cwd, args_json, environ_map);
+    if (std.mem.eql(u8, name, "bash")) return toolBash(allocator, io, cwd, args_json, proxy_env);
     if (std.mem.eql(u8, name, "grep")) return toolGrep(allocator, io, cwd, args_json);
     if (std.mem.eql(u8, name, "find")) return toolFind(allocator, io, cwd, args_json);
     if (std.mem.eql(u8, name, "ls")) return toolLs(allocator, io, cwd, args_json);
-    if (std.mem.eql(u8, name, "webfetch")) return toolWebfetch(allocator, io, args_json, web_environ_map orelse environ_map);
+    if (std.mem.eql(u8, name, "webfetch")) return toolWebfetch(allocator, io, args_json, proxy_env);
     return fail(allocator, "Unknown tool: {s}", .{name});
 }
 
@@ -349,9 +375,10 @@ const WebfetchArgs = struct {
     url: []const u8 = "",
     format: []const u8 = "",
     timeout: i64 = 0,
+    use_proxy: bool = false,
 };
 
-fn toolWebfetch(allocator: Allocator, io: Io, args_json: []const u8, environ_map: ?*const std.process.Environ.Map) error{OutOfMemory}!Result {
+fn toolWebfetch(allocator: Allocator, io: Io, args_json: []const u8, proxy_env: NetEnv) error{OutOfMemory}!Result {
     var args_arena = std.heap.ArenaAllocator.init(allocator);
     defer args_arena.deinit();
     const args = parseArgs(WebfetchArgs, args_arena.allocator(), args_json) orelse
@@ -371,20 +398,46 @@ fn toolWebfetch(allocator: Allocator, io: Io, args_json: []const u8, environ_map
         }
     }
     const timeout_s: u32 = if (args.timeout > 0) @intCast(@min(args.timeout, 120)) else 30;
+    const environ_map: ?*const std.process.Environ.Map = switch (try selectToolEnv(allocator, proxy_env, args.use_proxy)) {
+        .env => |e| e,
+        .fail => |r| return r,
+    };
 
+    // 跳证书校验的唯一决定点 = 设置项「允许抓取证书无效站点」：
+    // 先正常校验（正常站点不受影响）；只在 CertificateInvalid 且已授权时用 curl -k 自动重试一次。
+    var used_insecure = false;
     var http_status: u16 = 0;
-    const fetched = web.fetch(allocator, io, args.url, format, timeout_s * 1000, &http_status, environ_map) catch |err| {
-        if (err == error.HttpStatus) {
-            return fail(allocator, "webfetch {s}: HTTP {d}", .{ args.url, http_status });
+    const fetched = web.fetch(allocator, io, args.url, format, timeout_s * 1000, &http_status, environ_map, false) catch |err| blk: {
+        if (err == error.CertificateInvalid) {
+            if (proxy_env.allow_insecure) {
+                used_insecure = true;
+                break :blk web.fetch(allocator, io, args.url, format, timeout_s * 1000, &http_status, environ_map, true) catch |err2|
+                    return webfetchFail(allocator, args.url, http_status, err2);
+            }
+            return fail(allocator, "webfetch {s}: TLS 证书不受信（{s}），可能被抓包/劫持。如确需继续：请用户在设置页开启「允许抓取证书无效站点」后重试；在此之前不要重试同一地址。", .{ args.url, @errorName(err) });
         }
-        return fail(allocator, "webfetch {s}: {s}", .{ args.url, webErrorText(err) });
+        return webfetchFail(allocator, args.url, http_status, err);
     };
     defer allocator.free(fetched.content_type);
     defer allocator.free(fetched.body);
 
+    // 跳过校验的抓取：正文前强制追加警告（与内容一起进模型上下文与用户视野）
+    const warned: ?[]u8 = if (used_insecure)
+        try std.fmt.allocPrint(allocator, "⚠ 注意：本次抓取跳过了 TLS 证书校验（用户已在设置中授权），内容未经认证，可能被中间人篡改；勿据此执行命令或安装依赖。\n\n{s}", .{fetched.body})
+    else
+        null;
+    defer if (warned) |b| allocator.free(b);
+    const result_body: []const u8 = warned orelse fetched.body;
+
     // 工具级截断：与 read/bash 一致（2000 行 / 50KB）
-    const capped = try capHead(allocator, fetched.body, cap_lines, cap_bytes, 1);
+    const capped = try capHead(allocator, result_body, cap_lines, cap_bytes, 1);
     return .{ .content = try finishCapped(allocator, capped.text, capped.notice), .is_error = false };
+}
+
+/// webfetch 失败的统一文案（HTTP 状态 / 语义错误 + 错误名）
+fn webfetchFail(allocator: Allocator, url: []const u8, http_status: u16, err: anyerror) error{OutOfMemory}!Result {
+    if (err == error.HttpStatus) return fail(allocator, "webfetch {s}: HTTP {d}", .{ url, http_status });
+    return fail(allocator, "webfetch {s}: {s} ({s})", .{ url, webErrorText(err), @errorName(err) });
 }
 
 fn webErrorText(err: anyerror) []const u8 {
@@ -394,6 +447,11 @@ fn webErrorText(err: anyerror) []const u8 {
         error.TooLarge => "response too large (exceeds 5MB limit)",
         error.UnsupportedContentType => "unsupported content type (only text-like content is supported)",
         error.Timeout => "request timed out",
+        error.DnsFailed => "DNS resolution failed",
+        error.ConnectionFailed => "connection failed (refused or unreachable)",
+        error.CertificateInvalid => "TLS certificate not trusted",
+        error.TlsHandshakeFailed => "TLS handshake failed",
+        error.ProxyTunnelFailed => "proxy tunnel failed (proxy-side DNS/connect problem, not the target's certificate)",
         error.NetworkError => "network error",
         error.OutOfMemory => "out of memory",
         else => "fetch failed",
@@ -1391,6 +1449,7 @@ fn buildEditDiff(allocator: Allocator, old_text: []const u8, new_text: []const u
 const BashArgs = struct {
     command: []const u8 = "",
     timeout_ms: i64 = 0,
+    use_proxy: bool = false,
 };
 
 /// bash 默认超时（毫秒）：模型不传 timeout_ms（或传 ≤0）时兜底 5 分钟——
@@ -1470,7 +1529,12 @@ pub fn killProcessTree(
         // ② 无条件直杀（保底：哪怕 taskkill 不可用也必杀）
         _ = TerminateProcess(proc, 1);
     } else {
-        std.posix.kill(@intCast(handle_or_pid), std.posix.SIG.KILL) catch {};
+        const pid: std.posix.pid_t = @intCast(handle_or_pid);
+        // 子进程以自身为组长启动（spawn .pgid=0）→ 杀整个进程组：
+        // 普通孙子进程一并杀掉；主动 setsid 逃逸的守护进程除外（孤儿，交给用户/系统清理）
+        std.posix.kill(-pid, std.posix.SIG.KILL) catch {
+            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+        };
     }
 }
 
@@ -1498,22 +1562,30 @@ fn bashWatchdog(
     }
 }
 
-/// 等价 std.process.run（spawn → 多路读 → wait → defer kill），但把子进程标识发布到
-/// 槽位（超时/Ctrl+Q 时由看门狗调 killProcessTree 杀树）。主体逐行对齐本机 std 的
-/// run（Zig 0.16.0）；阻塞读不传 io deadline（后者对管道读不生效，见上方注释）。
+/// 等价 std.process.run（spawn → 多路读 → wait → defer kill），但：
+/// - 子进程以自身为组长启动（`.pgid = 0`）→ killProcessTree 能杀整个进程组（普通孙子进程不逃逸）
+/// - 管道读用 100ms 轮询（不用无限阻塞）：看门狗（超时/Ctrl+Q）置位后最多 100ms 内返回，
+///   即使有后台孤儿进程仍握着管道写端（2026-10 WSL 实测：`nohup svc &` 曾把工具永久挂住）
 fn runBashTracked(
     gpa: Allocator,
     io: Io,
     argv: []const []const u8,
     cwd: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+    wd_state: *const std.atomic.Value(u8),
 ) !std.process.RunResult {
-    var child = try std.process.spawn(io, .{
+    var spawn_opts: std.process.SpawnOptions = .{
         .argv = argv,
         .cwd = .{ .path = cwd },
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
-    });
+        .environ_map = environ_map,
+    };
+    // posix：自建进程组（组长 pid == child pid），杀树用 kill(-pid)；
+    // Windows 的 pgid 字段是进程句柄类型，不适用（杀树走 taskkill /T）
+    if (@import("builtin").os.tag != .windows) spawn_opts.pgid = 0;
+    var child = try std.process.spawn(io, spawn_opts);
     defer child.kill(io);
     bash_child_mutex.lockUncancelable(io);
     bash_child_slot.store(blk: {
@@ -1538,16 +1610,29 @@ fn runBashTracked(
     const stdout_reader = multi_reader.reader(0);
     const stderr_reader = multi_reader.reader(1);
 
-    while (multi_reader.fill(8192, .none)) |_| {
+    // 100ms 轮询读：看门狗（超时/Ctrl+Q）触发后最多 100ms 内脱身，
+    // 即使有后台孤儿进程仍握着管道写端（EOF 永不到达）也不会永久挂住
+    const poll_timeout: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(100), .clock = .awake } };
+    fill: while (true) {
+        multi_reader.fill(8192, poll_timeout) catch |err| switch (err) {
+            error.EndOfStream => break :fill,
+            error.Timeout => {
+                if (wd_state.load(.acquire) != 0) break :fill; // 看门狗已触发：不再等 EOF
+                if (stdout_reader.buffered().len > 4 * 1024 * 1024) return error.StreamTooLong;
+                if (stderr_reader.buffered().len > 4 * 1024 * 1024) return error.StreamTooLong;
+                continue :fill;
+            },
+            else => |e| return e,
+        };
         if (stdout_reader.buffered().len > 4 * 1024 * 1024) return error.StreamTooLong;
         if (stderr_reader.buffered().len > 4 * 1024 * 1024) return error.StreamTooLong;
-    } else |err| switch (err) {
-        error.EndOfStream => {},
-        else => |e| return e,
     }
+    if (wd_state.load(.acquire) == 0) try multi_reader.checkAnyError();
 
-    try multi_reader.checkAnyError();
-
+    // 看门狗触发：再补一刀杀组（可能杀在 spawn 竞争前），然后必然能回收直接子进程
+    if (wd_state.load(.acquire) != 0) {
+        killProcessTree(gpa, io, bash_child_slot.load(.acquire), environ_map);
+    }
     const term = try child.wait(io);
 
     const stdout_slice = try multi_reader.toOwnedSlice(0);
@@ -1619,13 +1704,17 @@ fn toolBash(
     io: Io,
     cwd: []const u8,
     args_json: []const u8,
-    environ_map: ?*const std.process.Environ.Map,
+    proxy_env: NetEnv,
 ) error{OutOfMemory}!Result {
     var args_arena = std.heap.ArenaAllocator.init(allocator);
     defer args_arena.deinit();
     const args = parseArgs(BashArgs, args_arena.allocator(), args_json) orelse
         return fail(allocator, "Invalid arguments JSON for bash", .{});
     if (args.command.len == 0) return fail(allocator, "Missing required parameter: command", .{});
+    const environ_map: ?*const std.process.Environ.Map = switch (try selectToolEnv(allocator, proxy_env, args.use_proxy)) {
+        .env => |e| e,
+        .fail => |r| return r,
+    };
 
     const is_windows = @import("builtin").os.tag == .windows;
     const full_command: []const u8 = if (is_windows)
@@ -1655,7 +1744,7 @@ fn toolBash(
         environ_map,
     }) catch null;
 
-    const run_result = runBashTracked(allocator, io, argv, cwd) catch |err| {
+    const run_result = runBashTracked(allocator, io, argv, cwd, environ_map, &wd_state) catch |err| {
         wd_done.store(true, .release);
         if (wd) |t| t.join();
         switch (wd_state.load(.acquire)) {
@@ -1788,7 +1877,7 @@ fn persistBashFullOutput(
     const perms: std.Io.File.Permissions = if (@import("builtin").os.tag == .windows)
         .default_file
     else
-        @enumFromInt(0o600);
+        @fromBackingInt(@intCast(0o600));
     const f = d.createFile(io, std.fs.path.basename(path), .{ .truncate = true, .permissions = perms }) catch {
         allocator.free(path);
         return null;
@@ -3332,8 +3421,7 @@ test "tools: bash 截断时全文落临时文件（可用 read 续看，无需�
         cwd,
         "bash",
         "{\"command\":\"Write-Output ('x' * 100000)\"}",
-        &env,
-        null,
+        .{ .plain = &env },
     );
     defer testing.allocator.free(r.content);
     defer if (r.display) |d| testing.allocator.free(d);
@@ -3363,8 +3451,7 @@ test "tools: bash 截断时全文落临时文件（可用 read 续看，无需�
             cwd,
             "bash",
             "{\"command\":\"Write-Output ('y' * 100000)\"}",
-            &empty_env,
-            null,
+            .{ .plain = &empty_env },
         );
         defer testing.allocator.free(r2.content);
         defer if (r2.display) |d| testing.allocator.free(d);
@@ -3757,4 +3844,57 @@ test "tools: grep 因字节上限截断时提示不再误报为匹配数上限" 
     defer if (r.display) |d| testing.allocator.free(d);
     try testing.expect(std.mem.indexOf(u8, r.content, "truncated at 50.0KB") != null);
     try testing.expect(std.mem.indexOf(u8, r.content, "matches limit reached") == null);
+}
+
+test "tools: 所有工具 schema 均为合法 JSON（编译期查不出的字符串错误）" {
+    for (tool_defs) |def| {
+        var parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, def.parameters, .{}) catch |e| {
+            std.debug.print("工具 {s} 的 schema JSON 非法: {t}\n", .{ def.name, e });
+            return e;
+        };
+        defer parsed.deinit();
+    }
+}
+
+test "tools(linux): 后台子进程握着管道时，超时/取消也能按时返回（2026-10 挂死回归）" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(testing.allocator, .{});
+    const io = threaded.io();
+    defer threaded.deinit();
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+
+    // ① 超时路径：sleep 5 继承 stdout 管道且不重定向，EOF 要等 5 秒——超时 300ms 必须立即截断
+    {
+        const t0 = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        const r = try execute(testing.allocator, io, cwd, "bash", "{\"command\":\"sleep 5 & echo started\",\"timeout_ms\":300}");
+        const dt = std.Io.Timestamp.now(io, .awake).toMilliseconds() - t0;
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(dt < 3000);
+        try testing.expect(std.mem.indexOf(u8, r.content, "timed out") != null);
+    }
+
+    // ② 取消路径：同样的管道占用，Ctrl+Q 置位后也必须秒级返回
+    {
+        var cancel = std.atomic.Value(bool).init(false);
+        bash_cancel_flag = &cancel;
+        defer bash_cancel_flag = null;
+        const Canceller = struct {
+            fn run(io2: Io, flag: *std.atomic.Value(bool)) void {
+                Io.sleep(io2, Io.Duration.fromMilliseconds(300), .awake) catch {};
+                flag.store(true, .release);
+            }
+        };
+        const th = try std.Thread.spawn(.{}, Canceller.run, .{ io, &cancel });
+        const t0 = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        const r = try execute(testing.allocator, io, cwd, "bash", "{\"command\":\"sleep 5 & echo x\",\"timeout_ms\":600000}");
+        const dt = std.Io.Timestamp.now(io, .awake).toMilliseconds() - t0;
+        th.join();
+        defer testing.allocator.free(r.content);
+        defer if (r.display) |d| testing.allocator.free(d);
+        try testing.expect(dt < 3000);
+        try testing.expect(std.mem.indexOf(u8, r.content, "cancelled by the user") != null);
+    }
 }

@@ -143,11 +143,10 @@ const SettingId = enum {
     compaction_retry,
     compaction_strip_thinking,
     fold_old_tool_outputs,
-    proxy_mode,
     proxy_url,
     proxy_ai,
-    proxy_web,
-    proxy_bash,
+    proxy_allow_tools,
+    proxy_allow_insecure,
     restore_defaults,
 };
 
@@ -172,11 +171,10 @@ const settings_layout = [_]SettingsRow{
     .{ .group = "上下文" },
     .{ .id = .fold_old_tool_outputs },
     .{ .group = "网络代理" },
-    .{ .id = .proxy_mode },
     .{ .id = .proxy_url },
     .{ .id = .proxy_ai },
-    .{ .id = .proxy_web },
-    .{ .id = .proxy_bash },
+    .{ .id = .proxy_allow_tools },
+    .{ .id = .proxy_allow_insecure },
     .{ .group = "操作" },
     .{ .id = .restore_defaults },
 };
@@ -193,11 +191,10 @@ fn settingLabel(id: SettingId) []const u8 {
         .compaction_retry => "压缩失败重试",
         .compaction_strip_thinking => "压缩时剥离思考",
         .fold_old_tool_outputs => "旧工具输出折叠",
-        .proxy_mode => "代理来源",
         .proxy_url => "代理地址",
         .proxy_ai => "AI 请求经代理",
-        .proxy_web => "网页抓取经代理",
-        .proxy_bash => "终端命令经代理",
+        .proxy_allow_tools => "允许 AI 使用代理",
+        .proxy_allow_insecure => "允许抓取证书无效站点",
         .restore_defaults => "恢复默认设置",
     };
 }
@@ -238,20 +235,10 @@ fn settingValueText(state: *AppState, id: SettingId, buf: []u8) []const u8 {
         else
             "总是",
         .fold_old_tool_outputs => if (state.config.fold_old_tool_outputs) "开" else "关",
-        .proxy_mode => blk: {
-            if (state.config.proxy_mode.len == 0) break :blk "跟随环境变量";
-            if (std.mem.eql(u8, state.config.proxy_mode, "off")) break :blk "不使用";
-            if (std.mem.eql(u8, state.config.proxy_mode, "system")) {
-                if (state.proxy_system_display.len > 0)
-                    break :blk std.fmt.bufPrint(buf, "跟随系统（{s}）", .{state.proxy_system_display}) catch "跟随系统";
-                break :blk "跟随系统";
-            }
-            break :blk "自定义";
-        },
         .proxy_url => if (state.config.proxy_url.len == 0) "（未设置）" else state.config.proxy_url,
         .proxy_ai => if (state.config.proxy_for_ai) "开 ⚠" else "关",
-        .proxy_web => if (state.config.proxy_for_web) "开" else "关",
-        .proxy_bash => if (state.config.proxy_for_bash) "开" else "关",
+        .proxy_allow_tools => if (state.config.proxy_allow_tools) "开" else "关",
+        .proxy_allow_insecure => if (state.config.allow_insecure_cert) "开 ⚠" else "关",
         .restore_defaults => "Enter 确认",
     };
 }
@@ -969,8 +956,12 @@ const StreamJob = struct {
     session_id: []const u8 = "",
     behavior: config_mod.Behavior = .{},
     environ_map: ?*const std.process.Environ.Map = null,
-    /// webfetch 专用环境（注入代理；null = 用 environ_map）
-    web_environ_map: ?*const std.process.Environ.Map = null,
+    /// 工具代理环境（use_proxy=true 且允许/已配置；否则 null；use_proxy=false 用 environ_map）
+    tool_proxy_env: ?*const std.process.Environ.Map = null,
+    /// 用户是否允许 AI 在工具中使用代理
+    tool_allow_proxy: bool = false,
+    /// 用户是否允许抓取证书无效的站点（webfetch 遇证书失败自动 -k 重试）
+    tool_allow_insecure: bool = false,
     /// AI 请求专用环境（注入代理；null = 用 environ_map）
     ai_environ_map: ?*const std.process.Environ.Map = null,
     /// 数据库路径（工作线程实时落库/中途压缩时自建连接用；arena 所有，含终止符）
@@ -1034,7 +1025,7 @@ const StreamJob = struct {
 };
 
 /// 剪贴板写入函数签名（生产环境用 clipboard.setText；测试可注入 fake）
-const ClipboardWriter = *const fn (std.mem.Allocator, []const u8) bool;
+const ClipboardWriter = *const fn (Io, std.mem.Allocator, []const u8) bool;
 
 const AppState = struct {
     running: bool = true,
@@ -1062,12 +1053,13 @@ const AppState = struct {
     session_uuid_for: i64 = -1,
     /// 环境变量表（用于 HTTP_PROXY/HTTPS_PROXY）
     environ_map: ?*const std.process.Environ.Map = null,
-    /// 代理注入后的环境（null = 直连用 environ_map）
-    web_env: ?*std.process.Environ.Map = null,
+    /// AI 请求专用环境（null = 直连用 environ_map）
     ai_env: ?*std.process.Environ.Map = null,
-    bash_env: ?*std.process.Environ.Map = null,
-    /// 跟随系统时解析出的代理地址（设置页展示；空 = 未检测到）
-    proxy_system_display: []u8 = &.{},
+    /// 工具 use_proxy=true 时的环境（null = 未配置代理或用户未允许）
+    tool_proxy_env: ?*std.process.Environ.Map = null,
+    /// 工具/AI 的基础环境：程序自身环境**剔除所有代理变量**
+    /// （确保 use_proxy=false / for_ai=false 真实直连，不受 shell 里 HTTP_PROXY 干扰）
+    tool_env: ?*std.process.Environ.Map = null,
     /// 设置页滚动偏移（顶部行号）与最近一次绘制的可视行数（滚动跟随用）
     settings_scroll: usize = 0,
     settings_visible_rows: usize = 16,
@@ -2323,7 +2315,7 @@ const AppState = struct {
                 self.clearSelection();
                 return;
             }
-            if (clipboard.setText(self.allocator, sel)) {
+            if (clipboard.setText(self.io, self.allocator, sel)) {
                 var note_buf: [64]u8 = undefined;
                 const note = std.fmt.bufPrint(&note_buf, "已复制 {d} 字符", .{sel.len}) catch "已复制";
                 self.setToast(note);
@@ -2371,7 +2363,7 @@ const AppState = struct {
         }
         defer if (clean) |c| self.allocator.free(c);
 
-        if (clipboard.setText(self.allocator, copy_text)) {
+        if (clipboard.setText(self.io, self.allocator, copy_text)) {
             var note_buf: [64]u8 = undefined;
             const note = std.fmt.bufPrint(&note_buf, "已复制 {d} 字符", .{copy_text.len}) catch "已复制";
             self.setToast(note);
@@ -2392,7 +2384,7 @@ const AppState = struct {
         const r = self.inputSelectionRange() orelse return false;
         const text = self.input.value();
         const sel = text[r[0]..r[1]];
-        if (!write(self.allocator, sel)) {
+        if (!write(self.io, self.allocator, sel)) {
             self.setToast("剪切到剪贴板失败");
             return false;
         }
@@ -3634,24 +3626,16 @@ const AppState = struct {
                 self.config.setCompactionStripThinking(a, nextInSteps([]const u8, &steps, self.config.compaction_strip_thinking));
             },
             .fold_old_tool_outputs => self.config.fold_old_tool_outputs = !self.config.fold_old_tool_outputs,
-            .proxy_mode => {
-                const steps = [_][]const u8{ "", "off", "system", "custom" };
-                self.config.setProxyMode(a, nextInSteps([]const u8, &steps, self.config.proxy_mode));
-                self.rebuildProxyEnv();
-            },
             .proxy_url => {},
             .proxy_ai => {
                 self.config.proxy_for_ai = !self.config.proxy_for_ai;
                 self.rebuildProxyEnv();
             },
-            .proxy_web => {
-                self.config.proxy_for_web = !self.config.proxy_for_web;
+            .proxy_allow_tools => {
+                self.config.proxy_allow_tools = !self.config.proxy_allow_tools;
                 self.rebuildProxyEnv();
             },
-            .proxy_bash => {
-                self.config.proxy_for_bash = !self.config.proxy_for_bash;
-                self.rebuildProxyEnv();
-            },
+            .proxy_allow_insecure => self.config.allow_insecure_cert = !self.config.allow_insecure_cert,
             .restore_defaults => {},
         }
         self.config.save(self.io, self.allocator);
@@ -4346,7 +4330,7 @@ const AppState = struct {
     fn copyDialogSelection(self: *AppState) void {
         const r = self.dialogSelectionRange() orelse return;
         const sel = self.dialog_input.value()[r[0]..r[1]];
-        if (clipboard.setText(self.allocator, sel)) {
+        if (clipboard.setText(self.io, self.allocator, sel)) {
             var note_buf: [64]u8 = undefined;
             const note = std.fmt.bufPrint(&note_buf, "已复制 {d} 字符", .{sel.len}) catch "已复制";
             self.setToast(note);
@@ -4360,7 +4344,7 @@ const AppState = struct {
     fn cutDialogSelection(self: *AppState) void {
         const r = self.dialogSelectionRange() orelse return;
         const sel = self.dialog_input.value()[r[0]..r[1]];
-        if (!clipboard.setText(self.allocator, sel)) {
+        if (!clipboard.setText(self.io, self.allocator, sel)) {
             self.setToast("剪切到剪贴板失败");
             return;
         }
@@ -4548,50 +4532,45 @@ const AppState = struct {
         self.mode = .session_select;
     }
 
-    // ── 代理环境映射（2026-10-24）──
-
-    fn webEnviron(self: *AppState) ?*const std.process.Environ.Map {
-        return if (self.web_env) |m| m else self.environ_map;
-    }
+    // ── 代理环境映射 ──
 
     fn aiEnviron(self: *AppState) ?*const std.process.Environ.Map {
-        return if (self.ai_env) |m| m else self.environ_map;
+        // 兜底必须是剔除代理变量的基础环境：否则 shell 里的 HTTP_PROXY 会绕过 for_ai 开关
+        return if (self.ai_env) |m| m else self.toolBaseEnviron();
     }
 
-    fn bashEnviron(self: *AppState) ?*const std.process.Environ.Map {
-        return if (self.bash_env) |m| m else self.environ_map;
+    /// 工具 use_proxy=true 时的环境（null = 未配置代理或用户未允许）
+    fn toolProxyEnviron(self: *AppState) ?*const std.process.Environ.Map {
+        return if (self.tool_proxy_env) |m| m else null;
     }
 
-    /// 按当前配置重建代理注入映射（设置变更/启动时调用）
+    /// 工具/AI 的基础环境（已剔除代理变量；构建失败则退化为原环境）
+    fn toolBaseEnviron(self: *AppState) ?*const std.process.Environ.Map {
+        return if (self.tool_env) |m| m else self.environ_map;
+    }
+
+    /// 按当前配置重建代理注入映射（设置变更/启动/CLI 入口时调用）
     fn rebuildProxyEnv(self: *AppState) void {
         const a = self.allocator;
-        self.freeProxyEnv(&self.web_env);
         self.freeProxyEnv(&self.ai_env);
-        self.freeProxyEnv(&self.bash_env);
+        self.freeProxyEnv(&self.tool_proxy_env);
         const settings = self.config.proxySettings();
-        // 跟随系统时的展示文本（设置页）
-        if (self.proxy_system_display.len > 0) a.free(self.proxy_system_display);
-        self.proxy_system_display = &.{};
-        if (std.mem.eql(u8, settings.mode, "system")) {
-            if (proxy.resolveSystem(a, self.io)) |u| {
-                defer a.free(u);
-                self.proxy_system_display = std.fmt.allocPrint(a, "{s}", .{u}) catch &.{};
-            } else {
-                self.proxy_system_display = a.dupe(u8, "未检测到系统代理") catch &.{};
-            }
-        }
-        if (proxy.resolveFor(a, self.io, settings, .web, self.environ_map)) |url| {
-            defer a.free(url);
-            self.web_env = buildEnvWithProxy(a, self.environ_map, url) catch null;
-        }
-        if (proxy.resolveFor(a, self.io, settings, .ai, self.environ_map)) |url| {
-            defer a.free(url);
-            self.ai_env = buildEnvWithProxy(a, self.environ_map, url) catch null;
-        }
-        if (proxy.resolveFor(a, self.io, settings, .bash, self.environ_map)) |url| {
-            defer a.free(url);
-            self.bash_env = buildEnvWithProxy(a, self.environ_map, url) catch null;
-        }
+        // 工具/AI 的基础环境：剔除代理变量，保证开关语义真实（与是否配置代理无关）
+        if (self.tool_env == null) self.tool_env = buildEnvWithoutProxy(a, self.environ_map) catch null;
+        const url = proxy.resolveAny(a, settings, self.environ_map) orelse return;
+        defer a.free(url);
+        const base = self.toolBaseEnviron();
+        // 工具：用户允许才建注入环境（AI 用 use_proxy 参数按次选择）
+        if (settings.allow_tools) self.tool_proxy_env = buildEnvWithProxy(a, base, url) catch null;
+        // AI 自身请求：只看「AI 请求经代理」开关
+        if (settings.for_ai) self.ai_env = buildEnvWithProxy(a, base, url) catch null;
+    }
+
+    /// 测试收尾：释放全部代理相关环境（生产路径不调用，进程退出即回收）
+    fn freeAllProxyEnvs(self: *AppState) void {
+        self.freeProxyEnv(&self.ai_env);
+        self.freeProxyEnv(&self.tool_proxy_env);
+        self.freeProxyEnv(&self.tool_env);
     }
 
     fn freeProxyEnv(self: *AppState, slot: *?*std.process.Environ.Map) void {
@@ -4601,6 +4580,27 @@ const AppState = struct {
             slot.* = null;
         }
     }
+
+    /// 基础环境剔除代理变量（HTTP(S)_PROXY / ALL_PROXY / NO_PROXY，大小写）
+    fn buildEnvWithoutProxy(a: Allocator, base: ?*const std.process.Environ.Map) !*std.process.Environ.Map {
+        const m = try a.create(std.process.Environ.Map);
+        errdefer a.destroy(m);
+        m.* = std.process.Environ.Map.init(a);
+        errdefer m.deinit();
+        const skip = [_][]const u8{ "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy" };
+        if (base) |b| {
+            outer: for (b.keys(), b.values()) |k, v| {
+                for (skip) |s| {
+                    if (std.mem.eql(u8, k, s)) continue :outer;
+                }
+                try m.put(k, v);
+            }
+        }
+        return m;
+    }
+
+    /// 注入到子进程的 NO_PROXY：回环 + *.localhost + IPv4 私有/保留段（与 proxy.shouldBypassProxy 一致）
+    const injected_no_proxy = "localhost,*.localhost,127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,::1";
 
     fn buildEnvWithProxy(a: Allocator, base: ?*const std.process.Environ.Map, url: []const u8) !*std.process.Environ.Map {
         const m = try a.create(std.process.Environ.Map);
@@ -4616,8 +4616,8 @@ const AppState = struct {
         try m.put("HTTPS_PROXY", url);
         try m.put("http_proxy", url);
         try m.put("https_proxy", url);
-        try m.put("NO_PROXY", "localhost,127.0.0.1,::1");
-        try m.put("no_proxy", "localhost,127.0.0.1,::1");
+        try m.put("NO_PROXY", injected_no_proxy);
+        try m.put("no_proxy", injected_no_proxy);
         return m;
     }
 
@@ -4789,8 +4789,10 @@ const AppState = struct {
         job.summary_garbage_check = self.config.summary_garbage_check;
         job.compaction_retry = self.config.compaction_retry;
         job.compaction_strip_thinking = parseStripThinkingMode(self.config.compaction_strip_thinking);
-        job.environ_map = self.environ_map;
-        job.web_environ_map = self.webEnviron();
+        job.environ_map = self.toolBaseEnviron();
+        job.tool_proxy_env = self.toolProxyEnviron();
+        job.tool_allow_proxy = self.config.proxy_allow_tools;
+        job.tool_allow_insecure = self.config.allow_insecure_cert;
         job.ai_environ_map = self.aiEnviron();
         // worker 自建连接时用实际打开的库路径（测试/CLI 可能不是默认路径）
         const db_path: []const u8 = if (self.db) |*d| d.path else self.db_path;
@@ -5652,6 +5654,8 @@ const AppState = struct {
             var err_buf: [256]u8 = undefined;
             const err_msg: []const u8 = if (e == error.StreamTruncated)
                 "连接中断：响应流未正常结束，本次回复可能不完整（可重发消息重试）"
+            else if (e == error.HttpsProxyUnsupported)
+                "AI 请求失败：https 端点不能经代理（std 0.17 的 CONNECT 隧道会静默降级为明文，已拒绝）。请关闭设置页「AI 请求经代理」，或改用 http 端点"
             else if (error_detail.len > 0 and isContextOverflowText(error_detail))
                 "AI 请求失败（上下文超限）：自动压缩恢复未成功（可 /compact 或换更大窗口模型）"
             else
@@ -5904,7 +5908,7 @@ const AppState = struct {
         const input = self.providerFormActiveInput();
         const r = input.selectionRange() orelse return;
         const sel = input.value()[r[0]..r[1]];
-        if (clipboard.setText(self.allocator, sel)) {
+        if (clipboard.setText(self.io, self.allocator, sel)) {
             var note_buf: [64]u8 = undefined;
             const note = std.fmt.bufPrint(&note_buf, "已复制 {d} 字符", .{sel.len}) catch "已复制";
             self.setToast(note);
@@ -5919,7 +5923,7 @@ const AppState = struct {
         const input = self.providerFormActiveInput();
         const r = input.selectionRange() orelse return;
         const sel = input.value()[r[0]..r[1]];
-        if (!clipboard.setText(self.allocator, sel)) {
+        if (!clipboard.setText(self.io, self.allocator, sel)) {
             self.setToast("剪切到剪贴板失败");
             return;
         }
@@ -6356,11 +6360,10 @@ const AppState = struct {
         self.config.compaction_retry = d.compaction_retry;
         self.config.setCompactionStripThinking(a, d.compaction_strip_thinking);
         self.config.fold_old_tool_outputs = d.fold_old_tool_outputs;
-        self.config.setProxyMode(a, config_mod.Config.proxy_default_mode);
         self.config.setProxyUrl(a, config_mod.Config.proxy_default_url);
         self.config.proxy_for_ai = config_mod.Config.proxy_default_for_ai;
-        self.config.proxy_for_web = config_mod.Config.proxy_default_for_web;
-        self.config.proxy_for_bash = config_mod.Config.proxy_default_for_bash;
+        self.config.proxy_allow_tools = config_mod.Config.proxy_default_allow_tools;
+        self.config.allow_insecure_cert = d.allow_insecure_cert;
         self.rebuildProxyEnv();
         // 本会话立即生效
         self.auto_compact_pct = self.config.auto_compact_pct;
@@ -8068,6 +8071,7 @@ fn cmdCompact(init: std.process.Init, opt: CliOptions) u8 {
     };
     defer allocator.free(cfg_path);
     state.config.loadFile(io, allocator, cfg_path, opt.config_path.len == 0);
+    state.rebuildProxyEnv(); // CLI 入口同步代理环境注入（此前仅 TUI 调了，bash 子进程拿不到代理变量）
     state.keep_recent_tokens = state.config.keep_recent_tokens; // 设置页：保留窗口默认值
     state.auto_compact_pct = state.config.auto_compact_pct; // 设置页：自动压缩阈值
     const db_path = cliResolveDefaultPath(allocator, io, opt.db_path, "skynet.db") orelse {
@@ -8187,6 +8191,7 @@ fn cmdAsk(init: std.process.Init, opt: CliOptions) u8 {
     };
     defer allocator.free(cfg_path);
     state.config.loadFile(io, allocator, cfg_path, opt.config_path.len == 0);
+    state.rebuildProxyEnv(); // CLI 入口同步代理环境注入（此前仅 TUI 调了，bash 子进程拿不到代理变量）
     state.keep_recent_tokens = state.config.keep_recent_tokens; // 设置页：保留窗口默认值
     state.auto_compact_pct = state.config.auto_compact_pct; // 设置页：自动压缩阈值
     const db_path = cliResolveDefaultPath(allocator, io, opt.db_path, "skynet.db") orelse {
@@ -9894,26 +9899,31 @@ fn applyPendingWorkDir(job: *StreamJob) void {
 /// 同时推 work_dir_changed（空文本）让主线程清内存，避免下回合重复检测/重复通知。
 fn healWorkerWorkDir(job: *StreamJob) void {
     if (job.cwd.len == 0) return;
-    var d = std.Io.Dir.openDirAbsolute(job.io, job.cwd, .{}) catch {
-        // 失效：回退启动目录（本回合内工具继续可用）
-        if (job.default_cwd.len > 0) {
-            job.cwd = job.arena.allocator().dupe(u8, job.default_cwd) catch return;
-        }
-        var buf: [512]u8 = undefined;
-        const notice = std.fmt.bufPrint(&buf, "[工作目录已失效，跟随启动目录: {s}]", .{job.default_cwd}) catch "[工作目录已失效]";
-        // 通知入队：由轮次边界/轮尾统一处理（历史+落库+上屏，与 AI 所见顺序一致）
-        queueNoticeFromWorker(job.app, notice);
-        // 主线程内存同步：清 work_dir（否则帮助栏显示旧路径、下回合重复检测）
-        pushStreamEvent(job.app, .work_dir_changed, "", "", "", "", false);
-        // 落库清空（主线程也会在下回合 heal；这里尽力而为）
-        var worker_db: ?db_mod.Db = null;
-        defer if (worker_db) |*w| w.deinit();
-        if (ensureWorkerDb(job, &worker_db)) |wdb| {
-            wdb.setSessionWorkDir(job.session_id_num, "") catch {};
-        }
-        return;
-    };
-    d.close(job.io);
+    if (dirExists(job.io, job.cwd)) return;
+    // 失效：回退启动目录（本回合内工具继续可用）
+    if (job.default_cwd.len > 0) {
+        job.cwd = job.arena.allocator().dupe(u8, job.default_cwd) catch return;
+    }
+    var buf: [512]u8 = undefined;
+    const notice = std.fmt.bufPrint(&buf, "[工作目录已失效，跟随启动目录: {s}]", .{job.default_cwd}) catch "[工作目录已失效]";
+    // 通知入队：由轮次边界/轮尾统一处理（历史+落库+上屏，与 AI 所见顺序一致）
+    queueNoticeFromWorker(job.app, notice);
+    // 主线程内存同步：清 work_dir（否则帮助栏显示旧路径、下回合重复检测）
+    pushStreamEvent(job.app, .work_dir_changed, "", "", "", "", false);
+    // 落库清空（主线程也会在下回合 heal；这里尽力而为）
+    var worker_db: ?db_mod.Db = null;
+    defer if (worker_db) |*w| w.deinit();
+    if (ensureWorkerDb(job, &worker_db)) |wdb| {
+        wdb.setSessionWorkDir(job.session_id_num, "") catch {};
+    }
+}
+
+/// 目录存在性：openDirAbsolute 对相对路径是 assert（而非错误），非绝对路径直接视为不存在。
+fn dirExists(io: Io, path: []const u8) bool {
+    if (!std.fs.path.isAbsolute(path)) return false;
+    var d = std.Io.Dir.openDirAbsolute(io, path, .{}) catch return false;
+    d.close(io);
+    return true;
 }
 
 /// worker 侧入队系统通知（不触发生成；由轮次边界或轮尾 flush 消费）。
@@ -10322,7 +10332,12 @@ fn streamWorker(job: *StreamJob) void {
                 // bash 超时/Ctrl+Q 的取消源（看门狗轮询）——仅对本次工具执行生效
                 tools_mod.bash_cancel_flag = &job.app.stream_cancel;
                 defer tools_mod.bash_cancel_flag = null;
-                break :blk2 tools_mod.executeWithEnv(arena, job.io, job.cwd, tc.name, tc.arguments, job.environ_map, job.web_environ_map) catch |e| blk: {
+                break :blk2 tools_mod.executeWithEnv(arena, job.io, job.cwd, tc.name, tc.arguments, .{
+                .plain = job.environ_map,
+                .with_proxy = job.tool_proxy_env,
+                .allow_tools = job.tool_allow_proxy,
+                .allow_insecure = job.tool_allow_insecure,
+            }) catch |e| blk: {
                     const msg = std.fmt.allocPrint(arena, "Tool execution failed: {s}", .{@errorName(e)}) catch "Tool execution failed";
                     break :blk tools_mod.Result{ .content = @constCast(msg), .is_error = true };
                 };
@@ -12958,11 +12973,11 @@ fn drawInputStatus(state: *AppState, area: Rect, buf: *Buffer) void {
             const hit_text = std.fmt.bufPrint(&hb, "{d}%", .{hit}) catch "";
             if (hit_text.len > 0) {
                 const hit_color: tui.style.Color = if (hit >= 80) .green else if (hit >= 50) .yellow else .red;
-                _ = drawStatusSegment(buf, x, end_x, area.y, hit_text, .{ .fg = hit_color });
+                x = drawStatusSegment(buf, x, end_x, area.y, hit_text, .{ .fg = hit_color });
             }
         } else {
             // 无数据（新会话/未发过消息）：命中率 0%（数据仅来自服务端真实回传）
-            _ = drawStatusSegment(buf, x, end_x, area.y, " · 缓存 0% ", .{ .fg = .dark_gray });
+            x = drawStatusSegment(buf, x, end_x, area.y, " · 缓存 0% ", .{ .fg = .dark_gray });
         }
     } else if (provider_name.len > 0) {
         var sb: [192]u8 = undefined;
@@ -14729,7 +14744,7 @@ test "Ctrl+X 剪切输入框选区：先复制后删除，失败保留原文" {
         var text: [64]u8 = undefined;
         var len: usize = 0;
         var fail: bool = false;
-        fn write(_: std.mem.Allocator, s: []const u8) bool {
+        fn write(_: Io, _: std.mem.Allocator, s: []const u8) bool {
             if (fail) return false;
             len = @min(s.len, text.len);
             @memcpy(text[0..len], s[0..len]);
@@ -16094,6 +16109,9 @@ test "设置页：打开/导航跳过组标题/循环与即时保存" {
     state.io = io;
     state.allocator = std.testing.allocator;
     defer state.config.deinit(std.testing.allocator);
+    defer {
+        state.freeAllProxyEnvs();
+    }
 
     // 隔离持久化：把“即时保存”重定向到 tmp/，避免写到仓库根目录的 config.json（测试污染）
     // 先删除上次运行留下的文件，保证测试可重复
@@ -16161,8 +16179,8 @@ test "设置页：打开/导航跳过组标题/循环与即时保存" {
     try std.testing.expectEqual(@as(u64, 50), state.config.auto_compact_pct);
 
     // 恢复默认：两关确认 → 全部回默认
-    state.settings_index = 20;
-    try std.testing.expectEqual(SettingId.restore_defaults, settings_layout[20].id.?);
+    state.settings_index = 19;
+    try std.testing.expectEqual(SettingId.restore_defaults, settings_layout[19].id.?);
     state.handleSettingsKey(.{ .code = .enter });
     try std.testing.expectEqual(Mode.settings_reset_confirm, state.mode);
     try std.testing.expectEqual(@as(u8, 1), state.confirm_stage);
@@ -16177,17 +16195,16 @@ test "设置页：打开/导航跳过组标题/循环与即时保存" {
     try std.testing.expectEqual(@as(usize, 20_000), state.keep_recent_tokens);
     try std.testing.expect(!state.config.fold_old_tool_outputs);
     try std.testing.expect(state.config.auto_compact);
-    // 代理默认值（2026-10-24 定稿）：不使用 + 预填地址 + 网页/终端开、AI 关
-    try std.testing.expectEqualStrings("off", state.config.proxy_mode);
+    // 代理默认值：预填地址 + AI 关 + 允许工具使用
     try std.testing.expectEqualStrings("127.0.0.1:7890", state.config.proxy_url);
     try std.testing.expect(!state.config.proxy_for_ai);
-    try std.testing.expect(state.config.proxy_for_web);
-    try std.testing.expect(state.config.proxy_for_bash);
+    try std.testing.expect(!state.config.proxy_allow_tools);
+    try std.testing.expect(!state.config.allow_insecure_cert);
 
     // 导航 wrap 且跳过组标题
     state.settings_index = 1;
     state.settingsMove(-1);
-    try std.testing.expectEqual(@as(usize, 20), state.settings_index);
+    try std.testing.expectEqual(@as(usize, 19), state.settings_index);
     state.settingsMove(1);
     try std.testing.expectEqual(@as(usize, 1), state.settings_index);
 
@@ -16298,7 +16315,7 @@ test "设置页：滚动窗口（选中跟随 / 上下指示）" {
     try std.testing.expect(!w4.more_above);
 }
 
-test "设置页：代理行（来源循环 / 地址编辑提交 / 三开关）" {
+test "设置页：代理行（来源循环 / 地址编辑提交 / 两开关）" {
     var threaded: std.Io.Threaded = undefined;
     threaded = .init(std.testing.allocator, .{});
     const io = threaded.io();
@@ -16309,41 +16326,27 @@ test "设置页：代理行（来源循环 / 地址编辑提交 / 三开关）" 
     state.allocator = std.testing.allocator;
     defer state.config.deinit(std.testing.allocator);
     defer {
-        if (state.web_env) |m| {
-            m.deinit();
-            std.testing.allocator.destroy(m);
-        }
         if (state.ai_env) |m| {
             m.deinit();
             std.testing.allocator.destroy(m);
         }
-        if (state.bash_env) |m| {
+        if (state.tool_proxy_env) |m| {
             m.deinit();
             std.testing.allocator.destroy(m);
         }
-        if (state.proxy_system_display.len > 0) std.testing.allocator.free(state.proxy_system_display);
+        if (state.tool_env) |m| {
+            m.deinit();
+            std.testing.allocator.destroy(m);
+        }
     }
     std.Io.Dir.cwd().deleteFile(io, "tmp/test_settings_config.json") catch {};
     state.config.loadFile(io, std.testing.allocator, "tmp/test_settings_config.json", false);
 
     state.openSettings(null);
 
-    // 来源（缺失配置 → 默认 off）：off → system → custom → ""
-    state.settings_index = 14;
-    try std.testing.expectEqual(SettingId.proxy_mode, settings_layout[14].id.?);
-    try std.testing.expectEqualStrings("off", state.config.proxy_mode); // 默认值
-    state.handleSettingsKey(.{ .code = .enter }); // → system
-    try std.testing.expectEqualStrings("system", state.config.proxy_mode);
-    state.handleSettingsKey(.{ .code = .enter }); // → custom
-    try std.testing.expectEqualStrings("custom", state.config.proxy_mode);
-    state.handleSettingsKey(.{ .code = .enter }); // → ""（跟随环境变量）
-    try std.testing.expectEqualStrings("", state.config.proxy_mode);
-    state.handleSettingsKey(.{ .code = .enter }); // → 回到 off
-    try std.testing.expectEqualStrings("off", state.config.proxy_mode);
-
     // 地址：Enter 编辑（预填当前值 = 默认地址）→ Ctrl+A → 输入 → Enter 提交
-    state.settings_index = 15;
-    try std.testing.expectEqual(SettingId.proxy_url, settings_layout[15].id.?);
+    state.settings_index = 14;
+    try std.testing.expectEqual(SettingId.proxy_url, settings_layout[14].id.?);
     state.handleSettingsKey(.{ .code = .enter });
     try std.testing.expectEqualStrings("127.0.0.1:7890", state.settings_edit_buf[0..state.settings_edit_len]);
     state.handleSettingsKey(.{ .code = .{ .char = 'a' }, .modifiers = .{ .ctrl = true } });
@@ -16371,22 +16374,22 @@ test "设置页：代理行（来源循环 / 地址编辑提交 / 三开关）" 
     state.handleSettingsKey(.{ .code = .enter });
     try std.testing.expectEqualStrings(".9.9.9:1234", state.config.proxy_url);
 
-    // 三开关
-    state.settings_index = 16;
+    // 三个开关：AI 请求经代理 / 允许 AI 使用代理 / 允许抓取证书无效站点
+    state.settings_index = 15;
     state.handleSettingsKey(.{ .code = .left }); // off → on
     try std.testing.expect(state.config.proxy_for_ai);
     state.handleSettingsKey(.{ .code = .left }); // → off
     try std.testing.expect(!state.config.proxy_for_ai);
-    state.settings_index = 17;
-    try std.testing.expect(state.config.proxy_for_web); // 默认开
-    state.handleSettingsKey(.{ .code = .left }); // → 关
-    try std.testing.expect(!state.config.proxy_for_web);
+    state.settings_index = 16;
+    try std.testing.expect(!state.config.proxy_allow_tools); // 默认关
     state.handleSettingsKey(.{ .code = .left }); // → 开
-    try std.testing.expect(state.config.proxy_for_web);
-    state.settings_index = 18;
-    try std.testing.expect(state.config.proxy_for_bash); // 默认开
+    try std.testing.expect(state.config.proxy_allow_tools);
     state.handleSettingsKey(.{ .code = .left }); // → 关
-    try std.testing.expect(!state.config.proxy_for_bash);
+    try std.testing.expect(!state.config.proxy_allow_tools);
+    state.settings_index = 17;
+    try std.testing.expect(!state.config.allow_insecure_cert); // 默认关
+    state.handleSettingsKey(.{ .code = .left }); // → 开
+    try std.testing.expect(state.config.allow_insecure_cert);
 
     // 持久化落盘（tmp/）
     const saved = std.Io.Dir.cwd().readFileAlloc(io, "tmp/test_settings_config.json", std.testing.allocator, .limited(1 << 20)) catch "";
@@ -18095,6 +18098,62 @@ test "状态栏：缓存命中率百分比与着色" {
     try std.testing.expect(buf5.get(@intCast(hit5_x), 0).?.fg.eql(tui.style.Color.red));
 }
 
+test "代理注入：地址解析与两个开关的门控" {
+    var state = AppState{};
+    state.allocator = std.testing.allocator;
+    state.io = std.testing.io;
+    defer state.config.deinit(std.testing.allocator);
+    defer {
+        state.freeAllProxyEnvs();
+    }
+    // 模拟 shell 里有代理变量：基础环境必须剔除，开关语义才真实
+    var shell_env = std.process.Environ.Map.init(std.testing.allocator);
+    defer shell_env.deinit();
+    try shell_env.put("HTTP_PROXY", "http://evil:1");
+    try shell_env.put("NO_PROXY", "localhost");
+    try shell_env.put("PATH", "/usr/bin");
+    state.environ_map = &shell_env;
+    state.config.setProxyUrl(std.testing.allocator, "127.0.0.1:7890");
+
+    // 默认：两个开关都关 → 都不建注入环境
+    state.rebuildProxyEnv();
+    try std.testing.expect(state.tool_proxy_env == null);
+    try std.testing.expect(state.ai_env == null);
+
+    // 打开 allow_tools：只建工具环境
+    state.config.proxy_allow_tools = true;
+    state.rebuildProxyEnv();
+    try std.testing.expect(state.tool_proxy_env != null);
+    try std.testing.expectEqualStrings("http://127.0.0.1:7890", state.tool_proxy_env.?.get("HTTPS_PROXY").?);
+    try std.testing.expect(state.ai_env == null);
+    // 基础环境：代理变量被剔除，其余保留
+    try std.testing.expect(state.tool_env != null);
+    try std.testing.expect(state.tool_env.?.get("HTTP_PROXY") == null);
+    try std.testing.expect(state.tool_env.?.get("PATH") != null);
+
+    // 不允许工具 + AI 开：只建 AI 环境
+    state.config.proxy_allow_tools = false;
+    state.config.proxy_for_ai = true;
+    state.rebuildProxyEnv();
+    try std.testing.expect(state.tool_proxy_env == null);
+    try std.testing.expect(state.ai_env != null);
+
+    // 地址清空（环境变量回退到 shell 里的代理）：两个开关仍各自门控
+    state.config.setProxyUrl(std.testing.allocator, "");
+    state.rebuildProxyEnv();
+    try std.testing.expect(state.tool_proxy_env == null);
+    try std.testing.expect(state.ai_env != null);
+    try std.testing.expectEqualStrings("http://evil:1", state.ai_env.?.get("HTTPS_PROXY").?);
+
+    // 地址为空 + 无环境变量：直连（不建任何注入环境）
+    var empty_env = std.process.Environ.Map.init(std.testing.allocator);
+    defer empty_env.deinit();
+    state.environ_map = &empty_env;
+    state.rebuildProxyEnv();
+    try std.testing.expect(state.tool_proxy_env == null);
+    try std.testing.expect(state.ai_env == null);
+}
+
 test "进行中指示：spinner 帧按时间推导" {
     // 同周期内恒帧、跨周期换帧、整周期回绕
     try std.testing.expectEqualStrings("⠋", spinnerFrame(0));
@@ -19752,7 +19811,10 @@ test "worker 目录失效：通知入队 + 事件清内存 + DB 清空（下个�
         break :blk try alloc.dupe(u8, z);
     };
     // 会话先切到目标目录（落库），模拟"用户切完后删除目录"
-    try state.db.?.setSessionWorkDir(sid, "C:\\no_such_heal_dir");
+    // 平台无关的“绝对且不存在”路径（Linux 下 C:\\... 是相对路径，会触发 openDirAbsolute 断言）
+    const ghost_dir = try std.fmt.allocPrint(alloc, "{s}{c}no_such_heal_dir", .{ state.default_cwd, std.fs.path.sep });
+    defer alloc.free(ghost_dir);
+    try state.db.?.setSessionWorkDir(sid, ghost_dir);
 
     // 构造 job：cwd 指向已不存在的目录
     var job = StreamJob{
@@ -19768,7 +19830,7 @@ test "worker 目录失效：通知入队 + 事件清内存 + DB 清空（下个�
     };
     defer job.arena.deinit();
     const ja = job.arena.allocator();
-    job.cwd = try ja.dupe(u8, "C:\\no_such_heal_dir");
+    job.cwd = try ja.dupe(u8, ghost_dir);
     job.default_cwd = try ja.dupe(u8, state.default_cwd);
     job.db_path = try ja.dupeSentinel(u8, db_path, 0);
     job.session_id_num = sid;

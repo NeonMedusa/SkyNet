@@ -2,6 +2,8 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // 发布构建去掉调试信息：`zig build -Doptimize=ReleaseFast -Dstrip=true`（体积约 4MB）
+    const strip = b.option(bool, "strip", "Strip debug info (for release distribution)");
 
     const exe = b.addExecutable(.{
         .name = "SkyNet",
@@ -9,6 +11,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
         }),
     });
 

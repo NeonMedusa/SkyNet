@@ -42,7 +42,7 @@
 | `log.zig` | ~0.3k | 日志（分文件、分级、保留清理） | `info`、`Log.info` |
 | `cli_args.zig` | ~0.2k | CLI 参数解析与标准输出辅助 | `parseCliArgs` |
 | `db_query.zig` | ~0.2k | drizzle 风格的查询构造辅助 | `queryAll1` |
-| `utf8.zig` / `clipboard.zig` | 小 | UTF-8 工具、Windows 剪贴板 | `nextLen`、`setText` |
+| `utf8.zig` / `clipboard.zig` | 小 | UTF-8 工具、系统剪贴板（Windows Win32 / Linux wl-copy→xclip→xsel→WSL powershell） | `nextLen`、`setText` |
 
 ## 2. main.zig 分区地图（144 个顶层函数）
 
