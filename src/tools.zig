@@ -74,7 +74,7 @@ pub const tool_defs = [_]ToolDef{
     },
     .{
         .name = "webfetch",
-        .description = "Fetch content from an http(s) URL and return it as compact markdown (default), plain text, or raw HTML. HTML pages are converted to markdown for reading (script/style/nav junk stripped). Read-only. Output is truncated to 2000 lines or 50KB (whichever is hit first). Timeout defaults to 30 seconds (max 120). Network-restricted environments: if a fetch fails (DNS poisoning / connection timeout), retry with use_proxy=true to go through the proxy configured in Settings.",
+        .description = "Fetch content from an http(s) URL and return it as compact markdown (default), plain text, or raw HTML. HTML pages are converted to markdown for reading (script/style/nav junk stripped). Read-only. Output is truncated to 2000 lines or 50KB (whichever is hit first). Timeout defaults to 30 seconds (max 120). Responses larger than 32KB are saved to a temporary file and only a short receipt (path, size, heading outline) is returned. Network-restricted environments: if a fetch fails (DNS poisoning / connection timeout), retry with use_proxy=true to go through the proxy configured in Settings.",
         .parameters =
         \\{"type":"object","properties":{"url":{"type":"string","description":"The http(s) URL to fetch"},"format":{"type":"string","enum":["markdown","text","html"],"description":"Output format; default markdown"},"timeout":{"type":"integer","description":"Timeout in seconds (default 30, max 120)"},"use_proxy":{"type":"boolean","description":"Fetch through the user-configured proxy (default false)"}},"required":["url"]}
         ,
@@ -327,6 +327,8 @@ pub const NetEnv = struct {
     allow_tools: bool = false,
     /// 用户是否允许抓取证书无效的站点（webfetch 遇到证书失败时自动 curl -k 重试）
     allow_insecure: bool = false,
+    /// SkyNet 管理的临时目录（<data>/tmp，绝对路径；null = 回退系统 TEMP/TMPDIR）
+    tmp_dir: ?[]const u8 = null,
 };
 
 const EnvSel = union(enum) {
@@ -421,7 +423,22 @@ fn toolWebfetch(allocator: Allocator, io: Io, args_json: []const u8, proxy_env: 
     defer allocator.free(fetched.content_type);
     defer allocator.free(fetched.body);
 
-    // 跳过校验的抓取：正文前强制追加警告（与内容一起进模型上下文与用户视野）
+    // 大页面：落盘到 <data>/tmp + 回执（路径/大小/大纲），AI 按需 read/grep；
+    // 落盘失败（目录不可写等）则回退内联，行为与旧版一致。
+    if (fetched.body.len > webfetch_inline_max_bytes) {
+        const fmt_tag: []const u8 = switch (format) {
+            .markdown => "md",
+            .text => "txt",
+            .html => "html",
+        };
+        if (try saveWebfetchToTemp(allocator, io, proxy_env.tmp_dir, environ_map, args.url, fmt_tag, fetched.body)) |saved| {
+            defer allocator.free(saved.path);
+            defer allocator.free(saved.content);
+            return .{ .content = try webfetchSavedStub(allocator, args.url, saved.path, saved.content, format, used_insecure), .is_error = false };
+        }
+    }
+
+    // 内联路径：跳过校验的抓取在正文前强制追加警告（与内容一起进模型上下文与用户视野）
     const warned: ?[]u8 = if (used_insecure)
         try std.fmt.allocPrint(allocator, "⚠ 注意：本次抓取跳过了 TLS 证书校验（用户已在设置中授权），内容未经认证，可能被中间人篡改；勿据此执行命令或安装依赖。\n\n{s}", .{fetched.body})
     else
@@ -432,6 +449,149 @@ fn toolWebfetch(allocator: Allocator, io: Io, args_json: []const u8, proxy_env: 
     // 工具级截断：与 read/bash 一致（2000 行 / 50KB）
     const capped = try capHead(allocator, result_body, cap_lines, cap_bytes, 1);
     return .{ .content = try finishCapped(allocator, capped.text, capped.notice), .is_error = false };
+}
+
+/// Allocating 写失败只可能是 OOM：映射回本模块统一的错误集
+fn awAll(w: *std.Io.Writer, bytes: []const u8) error{OutOfMemory}!void {
+    w.writeAll(bytes) catch return error.OutOfMemory;
+}
+fn awPrint(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
+    w.print(fmt, args) catch return error.OutOfMemory;
+}
+
+// ── webfetch 大页面落盘 ──
+
+/// 内联上限：超过则落盘到 <data>/tmp，回执只给路径/大纲（页面越大越省 token）
+const webfetch_inline_max_bytes: usize = 32 * 1024;
+/// 大纲上限（条数 / 字节）；超出部分只统计条数
+const webfetch_outline_max_entries: usize = 40;
+const webfetch_outline_max_bytes: usize = 2 * 1024;
+
+const Outline = struct { text: []u8, count: usize, more: usize, title: ?[]u8 };
+
+/// 从 markdown 提取 h1-h3 大纲（带保存文件行号；跳过 ``` / ~~~ 围栏内的行）。
+/// text 为渲染好的多行文本（每行 "  L<行号>  <标题>"，超限带 more 统计）。
+fn extractOutline(allocator: Allocator, body: []const u8) error{OutOfMemory}!Outline {
+    var text = std.ArrayListUnmanaged(u8).empty;
+    errdefer text.deinit(allocator);
+    var count: usize = 0;
+    var shown: usize = 0;
+    var more: usize = 0;
+    var title: ?[]u8 = null;
+    var fence = false;
+    var line_no: usize = 1;
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| : (line_no += 1) {
+        const t = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, t, "```") or std.mem.startsWith(u8, t, "~~~")) {
+            fence = !fence;
+            continue;
+        }
+        if (fence) continue;
+        var level: usize = 0;
+        while (level < t.len and t[level] == '#') level += 1;
+        if (level == 0 or level > 3) continue;
+        if (level >= t.len or t[level] != ' ') continue;
+        count += 1;
+        const heading = std.mem.trimEnd(u8, t, " \t\r");
+        if (title == null and level == 1) {
+            title = allocator.dupe(u8, std.mem.trimStart(u8, heading[level..], " \t")) catch null;
+        }
+        if (shown >= webfetch_outline_max_entries or text.items.len >= webfetch_outline_max_bytes) {
+            more += 1;
+            continue;
+        }
+        var hb: [160]u8 = undefined;
+        const clipped = heading[0..@min(heading.len, 100)];
+        const seg = std.fmt.bufPrint(&hb, "  L{d}  {s}\n", .{ line_no, clipped }) catch continue;
+        try text.appendSlice(allocator, seg);
+        shown += 1;
+    }
+    if (more > 0) {
+        var mb: [48]u8 = undefined;
+        try text.appendSlice(allocator, std.fmt.bufPrint(&mb, "  … (+{d} more headings)\n", .{more}) catch "");
+    }
+    return .{ .text = try text.toOwnedSlice(allocator), .count = count, .more = more, .title = title };
+}
+
+const SavedWebPage = struct { path: []u8, content: []u8 };
+
+/// 把大页面写入 <temp>/skynet-web-<hash8>.<ext>（同一 URL+格式覆盖同一文件，幂等）。
+/// 文件内容 = 出处注释行 + 正文；content 与落盘内容一致（回执的大纲/行号必须基于它，
+/// 否则会少算出处注释的 2 行偏移——2026-10 E2E 实测踩到）。
+/// 失败返回 null（调用方回退内联）。
+fn saveWebfetchToTemp(
+    allocator: Allocator,
+    io: Io,
+    tmp_dir: ?[]const u8,
+    environ_map: ?*const std.process.Environ.Map,
+    url: []const u8,
+    fmt_tag: []const u8,
+    body: []const u8,
+) error{OutOfMemory}!?SavedWebPage {
+    var hash: [32]u8 = undefined;
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(url);
+    h.update("\x00");
+    h.update(fmt_tag);
+    h.final(&hash);
+    const hex = std.fmt.bytesToHex(hash[0..4], .lower);
+
+    var name_buf: [48]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "skynet-web-{s}.{s}", .{ hex[0..], fmt_tag }) catch return null;
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try awPrint(&aw.writer, "<!-- source: {s} -->\n\n", .{url});
+    try awAll(&aw.writer, body);
+    const content = try aw.toOwnedSlice();
+    errdefer allocator.free(content);
+    const path = (try writeToolTempFile(allocator, io, tmp_dir, environ_map, name, content)) orelse {
+        allocator.free(content);
+        return null;
+    };
+    return .{ .path = path, .content = content };
+}
+
+/// 落盘回执：⚠ 警告（insecure 时）+ 路径/大小/行数/标题 + 大纲 + 恒定 hint。
+/// content 必须是落盘原文（大纲行号要与 read(offset) 对齐）。
+fn webfetchSavedStub(
+    allocator: Allocator,
+    url: []const u8,
+    path: []const u8,
+    content: []const u8,
+    format: web.Format,
+    insecure: bool,
+) error{OutOfMemory}![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    if (insecure) {
+        try awAll(w, "⚠ 注意：本次抓取跳过了 TLS 证书校验（用户已在设置中授权），内容未经认证，可能被中间人篡改；勿据此执行命令或安装依赖。\n\n");
+    }
+    const lines: usize = if (content.len == 0) 0 else std.mem.count(u8, content, "\n") + 1;
+    try awPrint(w, "webfetch {s} → saved: {s}\n{d}.{d}KB · {d} lines", .{
+        url, path, content.len / 1024, (content.len % 1024) * 10 / 1024, lines,
+    });
+    const outline = try extractOutline(allocator, content);
+    defer {
+        allocator.free(outline.text);
+        if (outline.title) |t| allocator.free(t);
+    }
+    if (outline.title) |t| {
+        if (t.len > 0) try awPrint(w, " · title: \"{s}\"", .{t});
+    }
+    try awAll(w, "\n");
+    if (format == .html) {
+        try awAll(w, "no outline (raw HTML requested)\n");
+    } else if (outline.count == 0) {
+        try awAll(w, "no outline (no h1-h3 headings; likely raw code / plain text)\n");
+    } else {
+        try awPrint(w, "outline (from h1-h3, {d} headings):\n", .{outline.count});
+        try awAll(w, outline.text);
+    }
+    try awAll(w, "hint: use read(offset/limit) or grep to consume this file.");
+    return aw.toOwnedSlice();
 }
 
 /// webfetch 失败的统一文案（HTTP 状态 / 语义错误 + 错误名）
@@ -451,7 +611,8 @@ fn webErrorText(err: anyerror) []const u8 {
         error.ConnectionFailed => "connection failed (refused or unreachable)",
         error.CertificateInvalid => "TLS certificate not trusted",
         error.TlsHandshakeFailed => "TLS handshake failed",
-        error.ProxyTunnelFailed => "proxy tunnel failed (proxy-side DNS/connect problem, not the target's certificate)",
+        error.ProxyTunnelFailed => "proxy tunnel failed (proxy-side DNS/connect problem, not the target's certificate); retry with use_proxy=false to fetch directly",
+        error.ProxyConnectionFailed => "proxy connection failed (proxy port refused/unreachable, is the proxy running?); retry with use_proxy=false to fetch directly",
         error.NetworkError => "network error",
         error.OutOfMemory => "out of memory",
         else => "fetch failed",
@@ -1798,7 +1959,7 @@ fn toolBash(
     // 截断时把全文写入系统临时文件，并在提示里给出路径：
     // 模型需要被截掉的部分时可以直接 read，而不是重跑命令（pi / opencode 同款兜底）
     if (cap.notice.len > 0) {
-        if (try persistBashFullOutput(allocator, io, environ_map, stripped)) |path| {
+        if (try persistBashFullOutput(allocator, io, proxy_env.tmp_dir, environ_map, stripped)) |path| {
             defer allocator.free(path);
             const amended = try std.fmt.allocPrint(
                 allocator,
@@ -1840,27 +2001,27 @@ fn toolBash(
 /// 仅由 agent worker 线程访问（工具执行单线程）；若未来多线程并行调工具需改为原子。
 var bash_temp_seq: u32 = 0;
 
-/// bash 临时文件所在目录（TEMP/TMPDIR/TMP；缺失返回 null）
+/// 系统临时目录（未配置 <data>/tmp 时的回退）
 fn bashTempDir(environ_map: ?*const std.process.Environ.Map) ?[]const u8 {
     const map = environ_map orelse return null;
     const dir = map.get("TEMP") orelse map.get("TMPDIR") orelse map.get("TMP") orelse return null;
     return if (dir.len > 0) dir else null;
 }
 
-/// 把被截断的 bash 全文写入系统临时目录（TEMP/TMPDIR/TMP）。
-/// 返回分配的路径；环境变量缺失或写入失败时返回 null（调用方保留原提示）。
-fn persistBashFullOutput(
+/// 把工具全文写入临时目录（优先 SkyNet 管理的 <data>/tmp，其次系统 TEMP/TMPDIR）。
+/// name 为完整文件名（skynet-bash-<ms>-<seq>.txt / skynet-web-<hash>.md）。
+/// 返回分配的绝对路径；任何失败返回 null（调用方保留原有行为）。
+fn writeToolTempFile(
     allocator: Allocator,
     io: Io,
+    tmp_dir: ?[]const u8,
     environ_map: ?*const std.process.Environ.Map,
+    name: []const u8,
     data: []const u8,
 ) error{OutOfMemory}!?[]u8 {
-    const dir = bashTempDir(environ_map) orelse return null;
+    const dir = tmp_dir orelse bashTempDir(environ_map) orelse return null;
+    if (tmp_dir != null) makeDirs(io, dir); // 托管目录按需创建（首次使用 / 被用户删除后）
 
-    var name_buf: [80]u8 = undefined;
-    const now_ms = Io.Timestamp.now(io, .awake).toMilliseconds();
-    bash_temp_seq +%= 1;
-    const name = std.fmt.bufPrint(&name_buf, "skynet-bash-{d}-{d}.txt", .{ now_ms, bash_temp_seq }) catch return null;
     const path = try std.fs.path.join(allocator, &.{ dir, name });
     errdefer allocator.free(path);
 
@@ -1890,17 +2051,35 @@ fn persistBashFullOutput(
     return path;
 }
 
-/// 删除过期的 bash 截断临时文件（文件名内嵌写入时间戳，无需 stat）。
+/// 把被截断的 bash 全文写入临时目录（<data>/tmp 或系统 TEMP）。
+fn persistBashFullOutput(
+    allocator: Allocator,
+    io: Io,
+    tmp_dir: ?[]const u8,
+    environ_map: ?*const std.process.Environ.Map,
+    data: []const u8,
+) error{OutOfMemory}!?[]u8 {
+    if (tmp_dir == null and bashTempDir(environ_map) == null) return null;
+    var name_buf: [80]u8 = undefined;
+    const now_ms = Io.Timestamp.now(io, .awake).toMilliseconds();
+    bash_temp_seq +%= 1;
+    const name = std.fmt.bufPrint(&name_buf, "skynet-bash-{d}-{d}.txt", .{ now_ms, bash_temp_seq }) catch return null;
+    return writeToolTempFile(allocator, io, tmp_dir, environ_map, name, data);
+}
+
+
+/// 删除过期的工具临时文件（skynet-* 前缀：bash 全文 + webfetch 落盘页，按 mtime 判定）。
 /// 保留 max_age_ms 内的文件——会话历史里的 stub 仍可能引用它们；
 /// 更早的按"临时"语义回收（用户重读旧会话时该路径可能已失效，属预期）。
 /// 返回删除数量。由 TUI 启动时调用；失败静默（清理是尽力而为）。
-pub fn cleanupStaleBashTempFiles(
+pub fn cleanupStaleTempFiles(
     io: Io,
+    dir_abs: ?[]const u8,
     environ_map: ?*const std.process.Environ.Map,
     now_ms: i64,
     max_age_ms: i64,
 ) usize {
-    const dir = bashTempDir(environ_map) orelse return 0;
+    const dir = dir_abs orelse bashTempDir(environ_map) orelse return 0;
     var d = Dir.openDirAbsolute(io, dir, .{ .iterate = true }) catch return 0;
     defer d.close(io);
 
@@ -1908,17 +2087,16 @@ pub fn cleanupStaleBashTempFiles(
     var it = d.iterate();
     while (it.next(io) catch return removed) |entry| {
         if (entry.kind != .file and entry.kind != .sym_link) continue;
-        const name = entry.name;
-        if (!std.mem.startsWith(u8, name, "skynet-bash-") or !std.mem.endsWith(u8, name, ".txt")) continue;
-        const rest = name["skynet-bash-".len .. name.len - ".txt".len];
-        const dash = std.mem.indexOfScalar(u8, rest, '-') orelse continue;
-        const created = std.fmt.parseInt(i64, rest[0..dash], 10) catch continue;
-        if (now_ms - created <= max_age_ms) continue;
-        d.deleteFile(io, name) catch continue;
+        if (!std.mem.startsWith(u8, entry.name, "skynet-")) continue;
+        const st = d.statFile(io, entry.name, .{}) catch continue;
+        const mtime_ms: i64 = @intCast(@divTrunc(st.mtime.nanoseconds, 1_000_000)); // ns -> ms
+        if (now_ms - mtime_ms <= max_age_ms) continue;
+        d.deleteFile(io, entry.name) catch continue;
         removed += 1;
     }
     return removed;
 }
+
 
 // ── 目录遍历与通配符 ──
 
@@ -3474,55 +3652,55 @@ test "tools: 过期 bash 临时文件启动清理" {
     defer removeTree(io, testing.allocator, tmp_dir);
     makeDirs(io, tmp_dir);
 
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    try env.put("TEMP", tmp_dir);
-
-    const now_ms: i64 = 1_000_000_000_000;
+    const now_real = std.Io.Timestamp.now(io, .real);
+    const now_ms: i64 = @intCast(@divTrunc(now_real.nanoseconds, 1_000_000));
     const age: i64 = 7 * 24 * 60 * 60 * 1000; // 7 天
-    const old_ts = now_ms - age - 1000; // 过期
-    const new_ts = now_ms - 60_000; // 未过期
+    const old_ns = (now_ms - age - 1_000) * 1_000_000;
 
-    var buf_old: [64]u8 = undefined;
-    const name_old = try std.fmt.bufPrint(&buf_old, "skynet-bash-{d}-1.txt", .{old_ts});
-    var buf_new: [64]u8 = undefined;
-    const name_new = try std.fmt.bufPrint(&buf_new, "skynet-bash-{d}-2.txt", .{new_ts});
-    const kept_names = [_][]const u8{
-        name_new,
-        "skynet-bash-abc-3.txt", // 时间戳不可解析 → 留
-        "other-999999000000-4.txt", // 前缀不符 → 留
-        "skynet-bash-999999000000-5.log", // 扩展名不符 → 留
-    };
+    // 按 mtime 判定（文件名不再参与）：旧的一律删，新的留，非 skynet- 前缀留
+    const old_files = [_][]const u8{ "skynet-bash-1-1.txt", "skynet-web-abc12345.md" };
+    const fresh_files = [_][]const u8{ "skynet-bash-2-2.txt", "skynet-web-def67890.md" };
+    const keep_name = "other-1.txt";
     {
         var d = try Dir.openDirAbsolute(io, tmp_dir, .{});
         defer d.close(io);
-        var f = try d.createFile(io, name_old, .{});
-        f.close(io);
-        for (kept_names) |n| {
-            var k = try d.createFile(io, n, .{});
-            k.close(io);
+        for (old_files) |n| {
+            var f = try d.createFile(io, n, .{});
+            try f.setTimestamps(io, .{
+                .access_timestamp = .{ .new = std.Io.Timestamp{ .nanoseconds = old_ns } },
+                .modify_timestamp = .{ .new = std.Io.Timestamp{ .nanoseconds = old_ns } },
+            });
+            f.close(io);
         }
+        for (fresh_files) |n| {
+            var f = try d.createFile(io, n, .{});
+            f.close(io);
+        }
+        var f = try d.createFile(io, keep_name, .{});
+        try f.setTimestamps(io, .{
+            .access_timestamp = .{ .new = std.Io.Timestamp{ .nanoseconds = old_ns } },
+            .modify_timestamp = .{ .new = std.Io.Timestamp{ .nanoseconds = old_ns } },
+        });
+        f.close(io);
     }
 
-    const removed = cleanupStaleBashTempFiles(io, &env, now_ms, age);
-    try testing.expectEqual(@as(usize, 1), removed);
+    const removed = cleanupStaleTempFiles(io, tmp_dir, null, now_ms, age);
+    try testing.expectEqual(old_files.len, removed);
 
     var d = try Dir.openDirAbsolute(io, tmp_dir, .{ .iterate = true });
     defer d.close(io);
-    var old_gone = true;
     var kept_count: usize = 0;
     var it = d.iterate();
     while (it.next(io) catch null) |entry| {
-        if (std.mem.eql(u8, entry.name, name_old)) old_gone = false;
+        for (old_files) |n| try testing.expect(!std.mem.eql(u8, entry.name, n));
         kept_count += 1;
     }
-    try testing.expect(old_gone);
-    try testing.expectEqual(kept_names.len, kept_count);
+    try testing.expectEqual(fresh_files.len + 1, kept_count);
 
-    // 无 TEMP/TMPDIR → 不做任何事
+    // 无目录且无 TEMP/TMPDIR → 不做任何事
     var empty_env = std.process.Environ.Map.init(testing.allocator);
     defer empty_env.deinit();
-    try testing.expectEqual(@as(usize, 0), cleanupStaleBashTempFiles(io, &empty_env, now_ms, 0));
+    try testing.expectEqual(@as(usize, 0), cleanupStaleTempFiles(io, null, &empty_env, now_ms, 0));
 }
 
 test "tools: grep 重叠上下文不重复输出，且不以换行结尾时不多出幽灵行" {
@@ -3897,4 +4075,65 @@ test "tools(linux): 后台子进程握着管道时，超时/取消也能按时�
         try testing.expect(dt < 3000);
         try testing.expect(std.mem.indexOf(u8, r.content, "cancelled by the user") != null);
     }
+}
+
+test "tools: 大纲提取（h1-h3、跳过代码围栏、行号、截断计数）" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const body =
+        "# Foo API\n" ++
+        "intro\n" ++
+        "## Auth\n" ++
+        "```\n" ++
+        "# not a heading (inside fence)\n" ++
+        "```\n" ++
+        "### GET /users\n" ++
+        "#### deep (ignored)\n" ++
+        "#NotHeading\n" ++
+        "## Tail\n";
+    const o = try extractOutline(a, body);
+    try testing.expectEqual(@as(usize, 4), o.count); // Foo API / Auth / GET /users / Tail
+    try testing.expectEqual(@as(usize, 0), o.more);
+    try testing.expectEqualStrings("Foo API", o.title.?);
+    try testing.expect(std.mem.find(u8, o.text, "L1  # Foo API") != null);
+    try testing.expect(std.mem.find(u8, o.text, "L3  ## Auth") != null);
+    try testing.expect(std.mem.find(u8, o.text, "L7  ### GET /users") != null);
+    try testing.expect(std.mem.find(u8, o.text, "not a heading") == null);
+    try testing.expect(std.mem.find(u8, o.text, "deep") == null); // h4 忽略
+
+    // 纯代码：无大纲
+    const code = "int main() {\n  return 0;\n}\n";
+    const o2 = try extractOutline(a, code);
+    try testing.expectEqual(@as(usize, 0), o2.count);
+    try testing.expect(o2.title == null);
+
+    // 超限：条数与字节截断，more 计数
+    var big: std.Io.Writer.Allocating = .init(a);
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        try big.writer.print("## Section {d}\n", .{i});
+    }
+    const o3 = try extractOutline(a, big.written());
+    try testing.expectEqual(@as(usize, 60), o3.count);
+    try testing.expectEqual(@as(usize, 60 - webfetch_outline_max_entries), o3.more);
+    try testing.expect(std.mem.find(u8, o3.text, "more headings") != null);
+}
+
+test "tools: 落盘回执的行号与文件内容对齐（出处注释偏移）" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const url = "https://example.com/x";
+    // 模拟 saveWebfetchToTemp 组装的文件内容：注释 1 行 + 空行 + 正文
+    const body = "intro\n## Section\n";
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try aw.writer.print("<!-- source: {s} -->\n\n", .{url});
+    try aw.writer.writeAll(body);
+    const content = aw.written();
+    const stub = try webfetchSavedStub(a, url, "/tmp/x.md", content, .markdown, false);
+    // 文件里 "## Section" 位于第 4 行（1 注释 + 1 空行 + intro + 标题）
+    try testing.expect(std.mem.find(u8, stub, "L4  ## Section") != null);
+    try testing.expect(std.mem.find(u8, stub, "hint: use read(offset/limit) or grep") != null);
 }

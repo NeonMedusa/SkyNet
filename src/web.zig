@@ -51,6 +51,8 @@ pub const Error = error{
     TlsHandshakeFailed,
     /// 代理隧道建立失败（通常是代理侧 DNS/连接问题，并非目标站点证书问题）
     ProxyTunnelFailed,
+    /// 经代理时连接失败（代理端口拒绝/不可达——通常是代理未启动，可改直连重试）
+    ProxyConnectionFailed,
     NetworkError,
     OutOfMemory,
 };
@@ -89,9 +91,9 @@ fn classifyHttpErrorCtx(e: anyerror, ca_count: usize) Error {
 /// use_proxy：经代理时 exit 35 多为隧道建立失败（代理侧 DNS/连接），不是目标证书问题
 fn curlExitError(code: u8, use_proxy: bool) ?Error {
     return switch (code) {
-        5 => error.ConnectionFailed, // 代理域名解析失败
+        5 => if (use_proxy) error.ProxyConnectionFailed else error.ConnectionFailed, // 代理域名解析失败
         6 => error.DnsFailed,
-        7 => error.ConnectionFailed,
+        7 => if (use_proxy) error.ProxyConnectionFailed else error.ConnectionFailed,
         28 => error.Timeout,
         35 => if (use_proxy) error.ProxyTunnelFailed else error.TlsHandshakeFailed,
         52, 56 => error.NetworkError, // 空回复 / 接收失败
@@ -607,6 +609,8 @@ test "web：错误分类（std 错误名 + curl 退出码）" {
 
     try testing.expectEqual(Error.DnsFailed, curlExitError(6, false).?);
     try testing.expectEqual(Error.ConnectionFailed, curlExitError(7, false).?);
+    try testing.expectEqual(Error.ProxyConnectionFailed, curlExitError(7, true).?);
+    try testing.expectEqual(Error.ProxyConnectionFailed, curlExitError(5, true).?);
     try testing.expectEqual(Error.Timeout, curlExitError(28, false).?);
     try testing.expectEqual(Error.TlsHandshakeFailed, curlExitError(35, false).?);
     try testing.expectEqual(Error.ProxyTunnelFailed, curlExitError(35, true).?);

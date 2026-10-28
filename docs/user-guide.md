@@ -420,6 +420,14 @@ AI 可以抓取 http(s) 网页阅读内容（无需任何 API key）：
 - **输出**：默认把 HTML 转成紧凑 markdown（标题/链接/列表/代码块/表格），也可用
   `format=text`（纯文本）或 `format=html`（原始 HTML）；无视口脚本/样式/留言板等噪音。
 - **限制**：响应体 ≤5MB；输出截断为 2000 行 / 50KB（与其它工具一致）；超时默认 30 秒、
+- **大页面落盘（2026-10-27）**：转换后正文 **>32KB** 时不再整页灌入上下文——写入
+  `data/tmp/skynet-web-<hash8>.<md|txt|html>`（首行为 `<!-- source: URL -->`），
+  工具只返回瘦身回执：路径、大小/行数、标题、h1-h3 大纲（带**文件行号**，直接对应
+  `read(offset=...)`），以及恒定提示 `hint: use read(offset/limit) or grep`。
+  同一 URL+格式重复抓取覆盖同一文件（幂等）；`format=html` 不给大纲（原始 HTML）；
+  无标题的纯代码/纯文本会注明"no outline"；落盘失败自动回退内联
+- `data/tmp/` 也是 bash 超长输出的落盘目录（`skynet-bash-*.txt`），启动时自动清理 7 天前的
+  `skynet-*` 文件；该目录可随时整体删除
   （超时覆盖 DNS/连接与传输全过程——实际请求走系统 curl 的 `--max-time`/`--connect-timeout`；
   仅在系统无 curl、回退内置网络栈时，连接阶段的超时不受该参数约束）
   上限 120 秒（`timeout` 参数，单位秒）。只读。

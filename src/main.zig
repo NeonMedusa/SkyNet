@@ -962,6 +962,8 @@ const StreamJob = struct {
     tool_allow_proxy: bool = false,
     /// 用户是否允许抓取证书无效的站点（webfetch 遇证书失败自动 -k 重试）
     tool_allow_insecure: bool = false,
+    /// 工具临时目录（<data>/tmp；null = 回退系统 TEMP）
+    tool_tmp_dir: ?[]const u8 = null,
     /// AI 请求专用环境（注入代理；null = 用 environ_map）
     ai_environ_map: ?*const std.process.Environ.Map = null,
     /// 数据库路径（工作线程实时落库/中途压缩时自建连接用；arena 所有，含终止符）
@@ -1060,6 +1062,8 @@ const AppState = struct {
     /// 工具/AI 的基础环境：程序自身环境**剔除所有代理变量**
     /// （确保 use_proxy=false / for_ai=false 真实直连，不受 shell 里 HTTP_PROXY 干扰）
     tool_env: ?*std.process.Environ.Map = null,
+    /// 工具临时目录（<data>/tmp：bash 全文、webfetch 落盘页；空 = 回退系统 TEMP）
+    tool_tmp_dir: []u8 = &.{},
     /// 设置页滚动偏移（顶部行号）与最近一次绘制的可视行数（滚动跟随用）
     settings_scroll: usize = 0,
     settings_visible_rows: usize = 16,
@@ -4566,6 +4570,13 @@ const AppState = struct {
         if (settings.for_ai) self.ai_env = buildEnvWithProxy(a, base, url) catch null;
     }
 
+    /// 解析工具临时目录 <data>/tmp（数据目录不可解析时 null，工具回退系统 TEMP）
+    fn resolveToolTmpDir(allocator: Allocator, io: Io) ?[]u8 {
+        const data = paths.resolveDataDir(io, allocator) orelse return null;
+        defer allocator.free(data.path);
+        return paths.join(allocator, data.path, "tmp") catch null;
+    }
+
     /// 测试收尾：释放全部代理相关环境（生产路径不调用，进程退出即回收）
     fn freeAllProxyEnvs(self: *AppState) void {
         self.freeProxyEnv(&self.ai_env);
@@ -4793,6 +4804,7 @@ const AppState = struct {
         job.tool_proxy_env = self.toolProxyEnviron();
         job.tool_allow_proxy = self.config.proxy_allow_tools;
         job.tool_allow_insecure = self.config.allow_insecure_cert;
+        job.tool_tmp_dir = if (self.tool_tmp_dir.len > 0) self.tool_tmp_dir else null;
         job.ai_environ_map = self.aiEnviron();
         // worker 自建连接时用实际打开的库路径（测试/CLI 可能不是默认路径）
         const db_path: []const u8 = if (self.db) |*d| d.path else self.db_path;
@@ -8059,6 +8071,7 @@ fn cmdCompact(init: std.process.Init, opt: CliOptions) u8 {
     state.input.allocator = allocator;
     state.dialog_input.allocator = allocator;
     state.environ_map = init.environ_map;
+    state.tool_tmp_dir = AppState.resolveToolTmpDir(allocator, io) orelse &.{};
     // 启动目录：会话 work_dir 为空/失效时的回退基准（工具 cwd 的默认值）
     state.default_cwd = blk: {
         const z = std.process.currentPathAlloc(io, allocator) catch break :blk allocator.dupe(u8, ".") catch &.{};
@@ -8179,6 +8192,7 @@ fn cmdAsk(init: std.process.Init, opt: CliOptions) u8 {
     state.input.allocator = allocator;
     state.dialog_input.allocator = allocator;
     state.environ_map = init.environ_map;
+    state.tool_tmp_dir = AppState.resolveToolTmpDir(allocator, io) orelse &.{};
     // 启动目录：会话 work_dir 为空/失效时的回退基准（工具 cwd 的默认值）
     state.default_cwd = blk: {
         const z = std.process.currentPathAlloc(io, allocator) catch break :blk allocator.dupe(u8, ".") catch &.{};
@@ -8863,6 +8877,7 @@ pub fn main(init: std.process.Init) !u8 {
     state.input.allocator = allocator;
     state.dialog_input.allocator = allocator;
     state.environ_map = init.environ_map;
+    state.tool_tmp_dir = AppState.resolveToolTmpDir(allocator, io) orelse &.{};
     // 启动目录：会话 work_dir 为空/失效时的回退基准（工具 cwd 的默认值）
     state.default_cwd = blk: {
         const z = std.process.currentPathAlloc(io, allocator) catch break :blk allocator.dupe(u8, ".") catch &.{};
@@ -8911,9 +8926,10 @@ pub fn main(init: std.process.Init) !u8 {
         state.config.current_model,
     });
 
-    // 清理过期的 bash 截断临时文件（保留最近 7 天：会话历史里的 stub 可能仍引用）
-    _ = tools_mod.cleanupStaleBashTempFiles(
+    // 清理过期的工具临时文件（保留最近 7 天：会话历史里的 stub 可能仍引用）
+    _ = tools_mod.cleanupStaleTempFiles(
         io,
+        if (state.tool_tmp_dir.len > 0) state.tool_tmp_dir else null,
         init.environ_map,
         std.Io.Timestamp.now(io, .awake).toMilliseconds(),
         7 * 24 * 60 * 60 * 1000,
@@ -10337,6 +10353,7 @@ fn streamWorker(job: *StreamJob) void {
                 .with_proxy = job.tool_proxy_env,
                 .allow_tools = job.tool_allow_proxy,
                 .allow_insecure = job.tool_allow_insecure,
+                .tmp_dir = job.tool_tmp_dir,
             }) catch |e| blk: {
                     const msg = std.fmt.allocPrint(arena, "Tool execution failed: {s}", .{@errorName(e)}) catch "Tool execution failed";
                     break :blk tools_mod.Result{ .content = @constCast(msg), .is_error = true };

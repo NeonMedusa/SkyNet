@@ -82,6 +82,7 @@ zig-out\bin\SkyNet.exe
 zig-out\bin\data\config.json      ← 配置
 zig-out\bin\data\skynet.db        ← 数据库
 zig-out\bin\data\logs\            ← 日志
+zig-out\bin\data\tmp\             ← 工具临时文件（bash 全文/webfetch 落盘页，可随时删）
 ```
 
 Scoop 安装时 `data` 是指向 `scoop\persist\skynet\data` 的 junction——升级/卸载（默认）都不动数据。
