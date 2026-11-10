@@ -57,10 +57,21 @@ const FoldScanner = context_mod.FoldScanner;
 const system_prompt =
     "You are SkyNet, a helpful AI coding assistant with access to tools for file operations and shell commands.\n" ++
     "Guidelines:\n" ++
-    "- Use the read tool to examine files instead of cat or sed.\n" ++
-    "- Use write only for new files or complete rewrites; use edit for targeted changes.\n" ++
-    "- Use grep to search file contents, find to locate files by name, and ls to list directories.\n" ++
+    "- File operations must use the built-in tools (read/write/edit/grep/find/ls), never shell commands\n" ++
+    "  or scripts: scripted replacement can work, but a non-matching pattern fails SILENTLY (no error,\n" ++
+    "  no diff) and you may believe a change landed when nothing happened; encoding/quoting traps are\n" ++
+    "  easy to miss. Tools give structured failures and a diff in the UI. Shell is for deleting, moving\n" ++
+    "  or renaming files (no dedicated tool) and for running commands.\n" ++
+    "- Edit workflow: grep to locate (prints file:line; find matches filenames, ls lists directories) ->\n" ++
+    "  read(offset/limit) around those lines -> edit with exact old_text. Strip the \"N: \" prefix that\n" ++
+    "  read adds before using text as old_text; one edit call edits exactly ONE file but may carry\n" ++
+    "  several edits[] entries. Use write for new files or full rewrites, edit for targeted changes.\n" ++
     "- Prefer non-interactive shell commands; avoid commands that wait for input.\n" ++
+    "- Context is managed automatically by the runtime: when it approaches the limit the history is\n" ++
+    "  summarized and compressed, and usage drops back down. Do not estimate or announce your own\n" ++
+    "  token/context budget, and never stop early or deliver half-finished work out of concern about context.\n" ++
+    "- Finish the whole requested change before reporting back; do not pause for confirmation after every\n" ++
+    "  small step (only when a semantic decision truly needs the user's call).\n" ++
     "- Be concise in your responses; show file paths clearly when working with files.";
 
 /// TUI 程序：禁止标准库向终端输出日志/调试信息（否则会破坏全屏界面）
@@ -728,7 +739,7 @@ const PartPos = struct {
 
 fn partLess(a: PartPos, b: PartPos) bool {
     if (a.msg != b.msg) return a.msg < b.msg;
-    return @intFromEnum(a.source) < @intFromEnum(b.source);
+    return @backingInt(a.source) < @backingInt(b.source);
 }
 
 fn partEql(a: PartPos, b: PartPos) bool {
@@ -1069,7 +1080,7 @@ const AppState = struct {
     settings_visible_rows: usize = 16,
 
     // 流式回复状态
-    stream_status: std.atomic.Value(u8) = .init(@intFromEnum(StreamStatus.idle)),
+    stream_status: std.atomic.Value(u8) = .init(@backingInt(StreamStatus.idle)),
     stream_cancel: std.atomic.Value(bool) = .init(false),
     stream_thread: ?std.Thread = null,
     stream_job: ?*StreamJob = null,
@@ -4658,11 +4669,11 @@ const AppState = struct {
     }
 
     fn streamStatus(self: *AppState) StreamStatus {
-        return @enumFromInt(self.stream_status.load(.acquire));
+        return @fromBackingInt(@intCast(self.stream_status.load(.acquire)));
     }
 
     fn setStreamStatus(self: *AppState, s: StreamStatus) void {
-        self.stream_status.store(@intFromEnum(s), .release);
+        self.stream_status.store(@backingInt(s), .release);
     }
 
     fn isStreaming(self: *AppState) bool {
@@ -7184,12 +7195,12 @@ fn compactionExecute(plan: *CompactionPlan) void {
     var beh = plan.behavior;
     beh.cache_key = false;
     beh.retention = .none;
-        // 压缩时思考档（设置页；"" = follow）
-        if (plan.compaction_effort.len > 0) beh.reasoning_effort = plan.compaction_effort;
-        var client = ai.AI.init(app.allocator, plan.io, .{
-            .api_key = plan.api_key,
-            .endpoint = plan.endpoint,
-            .model = plan.model,
+    // 压缩时思考档（设置页；"" = follow）
+    if (plan.compaction_effort.len > 0) beh.reasoning_effort = plan.compaction_effort;
+    var client = ai.AI.init(app.allocator, plan.io, .{
+        .api_key = plan.api_key,
+        .endpoint = plan.endpoint,
+        .model = plan.model,
         .session_id = &fresh_hex,
         .behavior = beh,
     });
@@ -9125,8 +9136,8 @@ fn handleTerminalEvent(state: *AppState, terminal: *Terminal, event: tui.Event) 
                 .provider_confirm => state.handleProviderConfirmKey(key),
                 .compact_confirm => state.handleCompactConfirmKey(key),
                 .thinking_select => state.handleThinkingSelectKey(key),
-                 .settings => state.handleSettingsKey(key),
-                 .settings_reset_confirm => state.handleSettingsResetConfirmKey(key),
+                .settings => state.handleSettingsKey(key),
+                .settings_reset_confirm => state.handleSettingsResetConfirmKey(key),
                 .preset_select => state.handlePresetSelectKey(key),
                 .session_select => state.handleSessionSelectKey(key),
                 .session_confirm => state.handleSessionConfirmKey(key),
@@ -10349,12 +10360,12 @@ fn streamWorker(job: *StreamJob) void {
                 tools_mod.bash_cancel_flag = &job.app.stream_cancel;
                 defer tools_mod.bash_cancel_flag = null;
                 break :blk2 tools_mod.executeWithEnv(arena, job.io, job.cwd, tc.name, tc.arguments, .{
-                .plain = job.environ_map,
-                .with_proxy = job.tool_proxy_env,
-                .allow_tools = job.tool_allow_proxy,
-                .allow_insecure = job.tool_allow_insecure,
-                .tmp_dir = job.tool_tmp_dir,
-            }) catch |e| blk: {
+                    .plain = job.environ_map,
+                    .with_proxy = job.tool_proxy_env,
+                    .allow_tools = job.tool_allow_proxy,
+                    .allow_insecure = job.tool_allow_insecure,
+                    .tmp_dir = job.tool_tmp_dir,
+                }) catch |e| blk: {
                     const msg = std.fmt.allocPrint(arena, "Tool execution failed: {s}", .{@errorName(e)}) catch "Tool execution failed";
                     break :blk tools_mod.Result{ .content = @constCast(msg), .is_error = true };
                 };
@@ -10536,12 +10547,12 @@ fn drawFrame(state: *AppState, buf: *Buffer) void {
             drawCompactConfirmOverlay(state, area, buf);
         },
         .thinking_select => drawOverlayMenu(state, area, buf, thinkingMenuRows(state), drawThinkingSelect),
-         .settings => drawOverlayMenu(state, area, buf, settingsMenuRows(state), drawSettings),
-         .settings_reset_confirm => {
-             // 设置页在下，确认对话框叠在上面
-             drawOverlayMenu(state, area, buf, settingsMenuRows(state), drawSettings);
-             drawSettingsResetConfirmOverlay(state, area, buf);
-         },
+        .settings => drawOverlayMenu(state, area, buf, settingsMenuRows(state), drawSettings),
+        .settings_reset_confirm => {
+            // 设置页在下，确认对话框叠在上面
+            drawOverlayMenu(state, area, buf, settingsMenuRows(state), drawSettings);
+            drawSettingsResetConfirmOverlay(state, area, buf);
+        },
         .preset_select => drawOverlayMenu(state, area, buf, config_mod.presets.len + 1, drawPresetSelect),
         .session_select => drawOverlayMenu(state, area, buf, state.session_list.len + 1, drawSessionSelect),
         .session_confirm => {

@@ -104,7 +104,8 @@ const TableState = struct {
 const skip_tags = [_][]const u8{ "script", "style", "noscript", "iframe", "object", "embed", "template", "svg", "math", "head" };
 const block_tags = [_][]const u8{
     "address", "article", "aside", "details", "dialog", "div", "dl", "fieldset", "figcaption",
-    "figure", "footer", "form", "header", "main", "nav", "p", "section", "summary", "body", "html",
+    "figure",  "footer",  "form",  "header",  "main",   "nav", "p",  "section",  "summary",
+    "body",    "html",
 };
 
 const State = struct {
@@ -680,7 +681,7 @@ const State = struct {
             }
             return;
         }
-                if (std.mem.eql(u8, name, "code") and !self.pre) {
+        if (std.mem.eql(u8, name, "code") and !self.pre) {
             if (self.mode == .markdown) {
                 if (self.code > 0) self.code -= 1;
                 try self.appendMark("`");

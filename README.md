@@ -96,6 +96,8 @@ Scoop 安装时 `data` 是指向 `scoop\persist\skynet\data` 的 junction——�
 - CLI 子命令与参数（`ask` / `new` / `sessions` / `messages` / `stats` / `compact`）；
 - 状态栏读数、`ambiguous_width` / `width_overrides`（调整 `①②③`、`—→` 等字符显示宽度）。
 
+多 AI/多会话协作（跨会话侦察与留言）见 [`docs/ai-collaboration.md`](docs/ai-collaboration.md)。
+
 约定：CLI 的 stdout = 最终回答，stderr = 工具活动；退出码 0 成功 / 2 参数错误 /
 3 无可用提供商或模型 / 4 请求或数据库失败。
 

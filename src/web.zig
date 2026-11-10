@@ -154,7 +154,7 @@ pub fn fetch(
     return error.NetworkError;
 }
 
-const internal = error{ HttpStatusRetry };
+const internal = error{HttpStatusRetry};
 
 /// curl 参数表（定长，零分配）
 const Argv = struct {
@@ -381,7 +381,7 @@ fn attemptFetch(
     // 重定向可能换连接：刷新句柄（std.http 在 receiveHead 内部跟随）
     wd.publishConnection(request.connection);
 
-    const status = @intFromEnum(response.head.status);
+    const status = @backingInt(response.head.status);
     out_status.* = @as(u16, @intCast(status));
     if (status == 403 and isCloudflareChallenge(response.head.bytes)) {
         return internal.HttpStatusRetry;

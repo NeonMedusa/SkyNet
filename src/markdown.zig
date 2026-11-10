@@ -1265,7 +1265,6 @@ test "末尾空行裁剪：尾随换行不产生多余空行，中间空行保�
     try testing.expectEqual(@as(usize, 1), l5.len);
 }
 
-
 test "首尾空行裁剪：正文内部保留" {
     const md = try parse(std.testing.allocator, "\n\n正文\n\n段落二\n\n", default_styles);
     defer free(std.testing.allocator, md);

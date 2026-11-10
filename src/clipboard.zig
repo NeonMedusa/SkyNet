@@ -70,7 +70,7 @@ fn setTextPosix(io: Io, text: []const u8) bool {
         "$txt=[Text.Encoding]::UTF8.GetString($ms.ToArray());" ++
         "Set-Clipboard -Value $txt";
     const candidates = [_][]const []const u8{
-        &.{ "wl-copy" },
+        &.{"wl-copy"},
         &.{ "xclip", "-selection", "clipboard" },
         &.{ "xsel", "--input", "--clipboard" },
         &.{ "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script },

@@ -968,8 +968,8 @@ pub const Config = struct {
                     .for_ai = self.proxy_for_ai,
                     .allow_tools = self.proxy_allow_tools,
                 }
-        else
-            null,
+            else
+                null,
             .width_overrides = if (self.width_overrides_wide.len > 0 or self.width_overrides_narrow.len > 0)
                 .{
                     .wide = if (self.width_overrides_wide.len > 0) self.width_overrides_wide else null,

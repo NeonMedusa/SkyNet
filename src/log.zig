@@ -45,7 +45,7 @@ pub fn enabled() bool {
 }
 
 pub fn setModule(mod: Module, on: bool) void {
-    const bit = @as(u64, 1) << @intFromEnum(mod);
+    const bit = @as(u64, 1) << @backingInt(mod);
     if (on) mod_enabled |= bit else mod_enabled &= ~bit;
 }
 
@@ -99,7 +99,7 @@ pub fn initPath(io: Io, dir: []const u8, name: []const u8, level_str: []const u8
     const perms: std.Io.File.Permissions = if (std.Io.File.Permissions == void) {} else if (@import("builtin").os.tag == .windows)
         .default_file
     else
-        @enumFromInt(0o600);
+        @fromBackingInt(@intCast(0o600));
     file = d.createFile(io, name, .{ .truncate = true, .permissions = perms }) catch null;
     io_g = io;
 }
@@ -141,8 +141,8 @@ fn pruneOldLogs(io: Io, allocator: Allocator, dir: []const u8, keep: usize) void
 pub fn logFn(comptime mod: Module, comptime level: Level, comptime fmt: []const u8, args: anytype) void {
     const io = io_g orelse return;
     if (file == null) return;
-    if (@intFromEnum(level) < @intFromEnum(min_level)) return;
-    if ((mod_enabled >> @intFromEnum(mod)) & 1 == 0) return;
+    if (@backingInt(level) < @backingInt(min_level)) return;
+    if ((mod_enabled >> @backingInt(mod)) & 1 == 0) return;
 
     const label = comptime switch (level) {
         .debug => "DEBG",

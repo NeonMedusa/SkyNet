@@ -2067,7 +2067,6 @@ fn persistBashFullOutput(
     return writeToolTempFile(allocator, io, tmp_dir, environ_map, name, data);
 }
 
-
 /// 删除过期的工具临时文件（skynet-* 前缀：bash 全文 + webfetch 落盘页，按 mtime 判定）。
 /// 保留 max_age_ms 内的文件——会话历史里的 stub 仍可能引用它们；
 /// 更早的按"临时"语义回收（用户重读旧会话时该路径可能已失效，属预期）。
@@ -2096,7 +2095,6 @@ pub fn cleanupStaleTempFiles(
     }
     return removed;
 }
-
 
 // ── 目录遍历与通配符 ──
 

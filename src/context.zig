@@ -174,7 +174,10 @@ pub fn simulateFold(history_oldest_first: []const ai.Message) FoldSim {
 
 /// checkpoint 伪消息的固定包装（发送与解析共用，避免格式漂移）
 pub const checkpoint_tag = "<conversation-checkpoint>";
-pub const checkpoint_desc = "（更早的对话已压缩，以下为摘要；需要细节时读取相关文件或询问用户）";
+/// Markdown 章节顺序固定（摘要器提示词里也要求这个顺序）
+pub const checkpoint_desc = "(Earlier conversation was compressed. THIS message IS the summary; the conversation " ++
+    "continues in the messages after it. Context usage dropped back to near zero, so you never need to " ++
+    "track a budget. Read the relevant files or ask the user when details matter.)";
 
 /// 是否为压缩 checkpoint 伪消息
 pub fn isCheckpointMessage(m: ai.Message) bool {
@@ -271,6 +274,9 @@ pub const compaction_system_prompt =
     "if you must reference tool-call or tool-result text, put it inside code blocks or inline code. " ++
     "Summarize the conversation segment so the work can be picked up later without the original messages. " ++
     "Keep concrete facts: the user's goal, what was done, key decisions, file paths, commands, errors and outcomes, and next steps. " ++
+    "Do not record meta-statements about context capacity, compression, or about the assistant being\n" ++
+    "unable/willing to continue (from either side of the conversation): they are noise. " ++
+    "Keep only the concrete goal, what was actually verified (files, commands, results) and next steps. " ++
     "Write in the same language as the conversation. Use short markdown sections: " ++
     "## Goal / ## Progress / ## Key decisions / ## Files / ## Next steps.";
 
@@ -596,6 +602,15 @@ test "压缩提示词：禁止继续 + 只输出摘要 + 工具禁用（对齐 p
     try std.testing.expect(std.mem.indexOf(u8, compaction_system_prompt, "Tools are disabled") != null);
     try std.testing.expect(std.mem.indexOf(u8, compaction_system_prompt, "bare text") != null);
     try std.testing.expect(std.mem.indexOf(u8, compaction_system_prompt, "continue working") == null);
+    // 不把“上下文不够/不想继续”这类元信息写进摘要（否则会被下一轮读回当作事实）
+    try std.testing.expect(std.mem.indexOf(u8, compaction_system_prompt, "meta-statements about context capacity") != null);
+}
+
+test "checkpoint 包装语：声明“本消息即摘要”且不制造预算恐慌" {
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint_desc, "IS the summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint_desc, "never need to") != null);
+    // 不得出现“可能是最后一次/即将超限”这类恐吓式词汇
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint_desc, "cannot continue") == null);
 }
 
 test "摘要垃圾校验：续写垃圾拒绝 / 引用式摘要通过 / 阈值 ≥3 次" {
